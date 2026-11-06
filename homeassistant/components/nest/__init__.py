@@ -1,354 +1,516 @@
-"""
-Support for Nest devices.
+"""Support for Nest devices."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/nest/
-"""
+from abc import ABC, abstractmethod
+import asyncio
+from http import HTTPStatus
 import logging
-import socket
-from datetime import datetime, timedelta
-import threading
+from typing import override
 
-import voluptuous as vol
+from aiohttp import web
+from google_nest_sdm.camera_traits import CameraClipPreviewTrait
+from google_nest_sdm.device import Device
+from google_nest_sdm.device_manager import DeviceManager
+from google_nest_sdm.event import EventMessage
+from google_nest_sdm.event_media import Media
+from google_nest_sdm.exceptions import (
+    ApiException,
+    AuthException,
+    ConfigurationException,
+    DecodeException,
+    SubscriberException,
+    SubscriberTimeoutException,
+)
+from google_nest_sdm.traits import TraitType
+import probatio
 
-from homeassistant import config_entries
+from homeassistant.auth.permissions.const import POLICY_READ
+from homeassistant.components.camera import Image, img_util
+from homeassistant.components.http import KEY_HASS_USER, HomeAssistantView
 from homeassistant.const import (
-    CONF_STRUCTURE, CONF_FILENAME, CONF_BINARY_SENSORS, CONF_SENSORS,
+    CONF_BINARY_SENSORS,
+    CONF_CLIENT_ID,
+    CONF_CLIENT_SECRET,
     CONF_MONITORED_CONDITIONS,
-    EVENT_HOMEASSISTANT_START, EVENT_HOMEASSISTANT_STOP)
-from homeassistant.core import callback
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.dispatcher import dispatcher_send, \
-    async_dispatcher_connect
-from homeassistant.helpers.entity import Entity
+    CONF_SENSORS,
+    CONF_STRUCTURE,
+    EVENT_HOMEASSISTANT_STOP,
+    Platform,
+)
+from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryError,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+    Unauthorized,
+)
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+    issue_registry as ir,
+)
+from homeassistant.helpers.entity_registry import async_entries_for_device
+from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN
-from . import local_auth
+from . import api
+from .const import (
+    CONF_CLOUD_PROJECT_ID,
+    CONF_PROJECT_ID,
+    CONF_SUBSCRIBER_ID,
+    CONF_SUBSCRIBER_ID_IMPORTED,
+    CONF_SUBSCRIPTION_NAME,
+    CONF_TOPIC_NAME,
+    DATA_SDM,
+    DOMAIN,
+    LEGACY_TOPIC_ISSUE_ID,
+    PUBSUB_LEARN_MORE_URL,
+    SUBSCRIPTION_NOT_FOUND_ISSUE_ID,
+)
+from .events import EVENT_NAME_MAP, NEST_EVENT
+from .media_source import (
+    EVENT_MEDIA_API_URL_FORMAT,
+    EVENT_THUMBNAIL_URL_FORMAT,
+    async_get_media_event_store,
+    async_get_media_source_devices,
+    async_get_transcoder,
+)
+from .services import async_setup_services
+from .types import DevicesAddedListener, NestConfigEntry, NestData
 
-REQUIREMENTS = ['python-nest==4.0.3']
-
-_CONFIGURING = {}
 _LOGGER = logging.getLogger(__name__)
 
 
-DATA_NEST = 'nest'
-DATA_NEST_CONFIG = 'nest_config'
+SENSOR_SCHEMA = probatio.Schema(
+    {probatio.Optional(CONF_MONITORED_CONDITIONS): probatio.All(probatio.EnsureList())}
+)
 
-SIGNAL_NEST_UPDATE = 'nest_update'
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        DOMAIN: probatio.Schema(
+            {
+                probatio.Required(CONF_CLIENT_ID): cv.string,
+                probatio.Required(probatio.Secret(CONF_CLIENT_SECRET)): cv.string,
+                # Required to use the new API (optional for compatibility)
+                probatio.Optional(CONF_PROJECT_ID): cv.string,
+                probatio.Optional(CONF_SUBSCRIBER_ID): cv.string,
+                # Config that only currently works on the old API
+                probatio.Optional(CONF_STRUCTURE): probatio.All(
+                    probatio.EnsureList(), [cv.string]
+                ),
+                probatio.Optional(CONF_SENSORS): SENSOR_SCHEMA,
+                probatio.Optional(CONF_BINARY_SENSORS): SENSOR_SCHEMA,
+            }
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
+)
 
-NEST_CONFIG_FILE = 'nest.conf'
-CONF_CLIENT_ID = 'client_id'
-CONF_CLIENT_SECRET = 'client_secret'
+# Platforms for SDM API
+PLATFORMS = [Platform.CAMERA, Platform.CLIMATE, Platform.EVENT, Platform.SENSOR]
 
-ATTR_HOME_MODE = 'home_mode'
-ATTR_STRUCTURE = 'structure'
-ATTR_TRIP_ID = 'trip_id'
-ATTR_ETA = 'eta'
-ATTR_ETA_WINDOW = 'eta_window'
+# Fetch media events with a disk backed cache, with a limit for each camera
+# device. The largest media items are mp4 clips at ~450kb each, and we target
+# ~125MB of storage per camera to try to balance a reasonable user experience
+# for event history not not filling the disk.
+EVENT_MEDIA_CACHE_SIZE = 256  # number of events
 
-HOME_MODE_AWAY = 'away'
-HOME_MODE_HOME = 'home'
-
-SENSOR_SCHEMA = vol.Schema({
-    vol.Optional(CONF_MONITORED_CONDITIONS): vol.All(cv.ensure_list)
-})
-
-AWAY_SCHEMA = vol.Schema({
-    vol.Required(ATTR_HOME_MODE): vol.In([HOME_MODE_AWAY, HOME_MODE_HOME]),
-    vol.Optional(ATTR_STRUCTURE): vol.All(cv.ensure_list, cv.string),
-    vol.Optional(ATTR_TRIP_ID): cv.string,
-    vol.Optional(ATTR_ETA): cv.time_period,
-    vol.Optional(ATTR_ETA_WINDOW): cv.time_period
-})
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: vol.Schema({
-        vol.Required(CONF_CLIENT_ID): cv.string,
-        vol.Required(CONF_CLIENT_SECRET): cv.string,
-        vol.Optional(CONF_STRUCTURE): vol.All(cv.ensure_list, cv.string),
-        vol.Optional(CONF_SENSORS): SENSOR_SCHEMA,
-        vol.Optional(CONF_BINARY_SENSORS): SENSOR_SCHEMA
-    })
-}, extra=vol.ALLOW_EXTRA)
+THUMBNAIL_SIZE_PX = 175
 
 
-def nest_update_event_broker(hass, nest):
-    """
-    Dispatch SIGNAL_NEST_UPDATE to devices when nest stream API received data.
-
-    Runs in its own thread.
-    """
-    _LOGGER.debug("listening nest.update_event")
-
-    while hass.is_running:
-        nest.update_event.wait()
-
-        if not hass.is_running:
-            break
-
-        nest.update_event.clear()
-        _LOGGER.debug("dispatching nest data update")
-        dispatcher_send(hass, SIGNAL_NEST_UPDATE)
-
-    _LOGGER.debug("stop listening nest.update_event")
-
-
-async def async_setup(hass, config):
-    """Set up Nest components."""
-    if DOMAIN not in config:
-        return True
-
-    conf = config[DOMAIN]
-
-    local_auth.initialize(hass, conf[CONF_CLIENT_ID], conf[CONF_CLIENT_SECRET])
-
-    filename = config.get(CONF_FILENAME, NEST_CONFIG_FILE)
-    access_token_cache_file = hass.config.path(filename)
-
-    hass.async_create_task(hass.config_entries.flow.async_init(
-        DOMAIN, context={'source': config_entries.SOURCE_IMPORT},
-        data={
-            'nest_conf_path': access_token_cache_file,
-        }
-    ))
-
-    # Store config to be used during entry setup
-    hass.data[DATA_NEST_CONFIG] = conf
-
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up Nest components with dispatch between old/new flows."""
+    hass.http.register_view(NestEventMediaView(hass))
+    hass.http.register_view(NestEventMediaThumbnailView(hass))
+    async_setup_services(hass)
     return True
 
 
-async def async_setup_entry(hass, entry):
-    """Set up Nest from a config entry."""
-    from nest import Nest
+class SignalUpdateCallback:
+    """An EventCallback invoked when new events arrive from subscriber."""
 
-    nest = Nest(access_token=entry.data['tokens']['access_token'])
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: NestConfigEntry,
+    ) -> None:
+        """Initialize EventCallback."""
+        self._hass = hass
+        self._config_entry = config_entry
+        self._device_listeners: list[DevicesAddedListener] = []
+        self._known_devices: dict[str, Device] = {}
+        self._device_manager: DeviceManager | None = None
 
-    _LOGGER.debug("proceeding with setup")
-    conf = hass.data.get(DATA_NEST_CONFIG, {})
-    hass.data[DATA_NEST] = NestDevice(hass, conf, nest)
-    if not await hass.async_add_job(hass.data[DATA_NEST].initialize):
-        return False
+    async def async_handle_event(self, event_message: EventMessage) -> None:
+        """Process an incoming EventMessage."""
+        if not event_message.resource_update_name:
+            return
+        device_id = event_message.resource_update_name
+        if not (events := event_message.resource_update_events):
+            return
+        _LOGGER.debug("Event Update %s", events.keys())
+        device_registry = dr.async_get(self._hass)
+        device_entry = device_registry.async_get_device_by_identifier(
+            (DOMAIN, device_id), self._config_entry.entry_id
+        )
+        if not device_entry:
+            return
+        supported_traits = self._supported_traits(device_id)
+        for api_event_type, image_event in events.items():
+            if not (event_type := EVENT_NAME_MAP.get(api_event_type)):
+                continue
+            nest_event_id = image_event.event_token
+            message = {
+                "device_id": device_entry.id,
+                "type": event_type,
+                "timestamp": event_message.timestamp,
+                "nest_event_id": nest_event_id,
+            }
+            if (
+                TraitType.CAMERA_EVENT_IMAGE in supported_traits
+                or TraitType.CAMERA_CLIP_PREVIEW in supported_traits
+            ):
+                attachment = {
+                    "image": EVENT_THUMBNAIL_URL_FORMAT.format(
+                        device_id=device_entry.id, event_token=image_event.event_token
+                    )
+                }
+                if TraitType.CAMERA_CLIP_PREVIEW in supported_traits:
+                    attachment["video"] = EVENT_MEDIA_API_URL_FORMAT.format(
+                        device_id=device_entry.id, event_token=image_event.event_token
+                    )
+                message["attachment"] = attachment
+            if image_event.zones:
+                message["zones"] = image_event.zones
+            self._hass.bus.async_fire(NEST_EVENT, message)
 
-    for component in 'climate', 'camera', 'sensor', 'binary_sensor':
-        hass.async_create_task(hass.config_entries.async_forward_entry_setup(
-            entry, component))
+    def _supported_traits(self, device_id: str) -> list[str]:
+        if (
+            not self._config_entry.runtime_data
+            or not (device_manager := self._config_entry.runtime_data.device_manager)
+            or not (device := device_manager.devices.get(device_id))
+        ):
+            return []
+        return list(device.traits)
 
-    def set_mode(service):
+    def set_device_manager(self, device_manager: DeviceManager) -> None:
+        """Set the device manager and register for device changes."""
+        self._device_manager = device_manager
+        device_manager.set_change_callback(self._devices_updated_cb)
+        self._update_devices(self._device_manager.devices)
+
+    async def _devices_updated_cb(self) -> None:
+        """Handle callback when devices are updated."""
+        _LOGGER.debug("Devices updated callback invoked")
+        if self._device_manager is None:
+            _LOGGER.debug("No device manager available")
+            return
+        self._update_devices(self._device_manager.devices)
+
+    def register_devices_listener(self, listener: DevicesAddedListener) -> None:
+        """Add a listener for device changes."""
+        self._device_listeners.append(listener)
+        # Immediately notify about existing devices
+        listener(list(self._known_devices.values()))
+
+    def _update_devices(self, devices: dict[str, Device]) -> None:
+        """Update the set of devices and notify listeners of changes.
+
+        This is invoked when the set of devices changes with the entire set of
+        devices, and will notify listeners about any newly added devices and
+        remove devices from the device registry that are no longer present.
         """
-        Set the home/away mode for a Nest structure.
+        added_devices = []
+        for device_id, device in devices.items():
+            if device_id in self._known_devices:
+                continue
+            added_devices.append(device)
+            self._known_devices[device_id] = device
+        if added_devices:
+            _LOGGER.debug("Adding new devices: %s", added_devices)
+            for listener in self._device_listeners:
+                listener(added_devices)
 
-        You can set optional eta information when set mode to away.
-        """
-        if ATTR_STRUCTURE in service.data:
-            structures = service.data[ATTR_STRUCTURE]
-        else:
-            structures = hass.data[DATA_NEST].local_structure
+        # Remove any device entries that are no longer present
+        device_registry = dr.async_get(self._hass)
+        device_entries = dr.async_entries_for_config_entry(
+            device_registry, self._config_entry.entry_id
+        )
+        for device_entry in device_entries:
+            device_id = next(iter(device_entry.identifiers))[1]
+            if device_id in devices:
+                continue
+            _LOGGER.info("Removing stale device entry '%s'", device_id)
+            device_registry.async_remove_device(device_entry.id)
 
-        for structure in nest.structures:
-            if structure.name in structures:
-                _LOGGER.info("Setting mode for %s", structure.name)
-                structure.away = service.data[ATTR_HOME_MODE]
 
-                if service.data[ATTR_HOME_MODE] == HOME_MODE_AWAY \
-                        and ATTR_ETA in service.data:
-                    now = datetime.utcnow()
-                    eta_begin = now + service.data[ATTR_ETA]
-                    eta_window = service.data.get(ATTR_ETA_WINDOW,
-                                                  timedelta(minutes=1))
-                    eta_end = eta_begin + eta_window
-                    trip_id = service.data.get(
-                        ATTR_TRIP_ID, "trip_{}".format(int(now.timestamp())))
-                    _LOGGER.info("Setting eta for %s, eta window starts at "
-                                 "%s ends at %s", trip_id, eta_begin, eta_end)
-                    structure.set_eta(trip_id, eta_begin, eta_end)
-            else:
-                _LOGGER.error("Invalid structure %s",
-                              service.data[ATTR_STRUCTURE])
+async def async_setup_entry(hass: HomeAssistant, entry: NestConfigEntry) -> None:
+    """Set up Nest from a config entry with dispatch between old/new flows."""
+    if DATA_SDM not in entry.data:
+        hass.async_create_task(hass.config_entries.async_remove(entry.entry_id))
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="legacy_entry",
+        )
 
-    hass.services.async_register(
-        DOMAIN, 'set_mode', set_mode, schema=AWAY_SCHEMA)
+    if entry.unique_id != entry.data[CONF_PROJECT_ID]:
+        hass.config_entries.async_update_entry(
+            entry, unique_id=entry.data[CONF_PROJECT_ID]
+        )
+
+    _async_check_pubsub_topic(hass, entry)
+
+    auth = await api.new_auth(hass, entry)
+    await auth.async_get_access_token()
+
+    subscriber = await api.new_subscriber(hass, entry, auth)
+    if not subscriber:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="subscriber_create_failed",
+        )
+    # Keep media for last N events in memory
+    subscriber.cache_policy.event_cache_size = EVENT_MEDIA_CACHE_SIZE
+    subscriber.cache_policy.fetch = True
+    # Use disk backed event media store
+    subscriber.cache_policy.store = await async_get_media_event_store(
+        hass, entry, subscriber
+    )
+    subscriber.cache_policy.transcoder = await async_get_transcoder(hass)
+
+    # The device manager has a single change callback. When the change
+    # callback is invoked, we update the DeviceListener with the current
+    # set of devices which will notify any registered listeners with the
+    # changes.
+    update_callback = SignalUpdateCallback(hass, entry)
+    subscriber.set_update_callback(update_callback.async_handle_event)
+    subscription_issue_id = SUBSCRIPTION_NOT_FOUND_ISSUE_ID.format(
+        entry_id=entry.entry_id
+    )
+    try:
+        unsub = await subscriber.start_async()
+    except AuthException as err:
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN,
+            translation_key="reauth_required",
+        ) from err
+    except ConfigurationException as err:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            subscription_issue_id,
+            config_entry_id=entry.entry_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.ERROR,
+            learn_more_url=PUBSUB_LEARN_MORE_URL,
+            translation_key="pubsub_subscription_not_found",
+            translation_placeholders={"entry_title": entry.title},
+        )
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="subscriber_configuration_error",
+        ) from err
+    except SubscriberTimeoutException as err:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="subscriber_timeout",
+        ) from err
+    except SubscriberException as err:
+        # pylint: disable-next=home-assistant-log-and-raise
+        _LOGGER.error("Subscriber error: %s", err)
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="subscriber_error",
+        ) from err
+    ir.async_delete_issue(hass, DOMAIN, subscription_issue_id)
+
+    try:
+        device_manager = await subscriber.async_get_device_manager()
+    except ApiException as err:
+        unsub()
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="device_api_error",
+        ) from err
 
     @callback
-    def start_up(event):
-        """Start Nest update event listener."""
-        threading.Thread(
-            name='Nest update listener',
-            target=nest_update_event_broker,
-            args=(hass, nest)
-        ).start()
+    def on_hass_stop(_: Event) -> None:
+        """Close connection when hass stops."""
+        unsub()
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, start_up)
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_hass_stop)
+    )
 
-    @callback
-    def shut_down(event):
-        """Stop Nest update event listener."""
-        nest.update_event.set()
+    update_callback.set_device_manager(device_manager)
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, shut_down)
+    entry.async_on_unload(unsub)
+    entry.runtime_data = NestData(
+        subscriber=subscriber,
+        device_manager=device_manager,
+        register_devices_listener=update_callback.register_devices_listener,
+    )
 
-    _LOGGER.debug("async_setup_nest is done")
-
-    return True
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
 
-class NestDevice:
-    """Structure Nest functions for hass."""
+async def async_unload_entry(hass: HomeAssistant, entry: NestConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
-    def __init__(self, hass, conf, nest):
-        """Init Nest Devices."""
+
+async def async_remove_entry(hass: HomeAssistant, entry: NestConfigEntry) -> None:
+    """Handle removal of pubsub subscriptions created during config flow."""
+    if (
+        DATA_SDM not in entry.data
+        or not (
+            CONF_SUBSCRIPTION_NAME in entry.data or CONF_SUBSCRIBER_ID in entry.data
+        )
+        or CONF_SUBSCRIBER_ID_IMPORTED in entry.data
+    ):
+        return
+    if (subscription_name := entry.data.get(CONF_SUBSCRIPTION_NAME)) is None:
+        subscription_name = entry.data[CONF_SUBSCRIBER_ID]
+    admin_client = api.new_pubsub_admin_client(
+        hass,
+        access_token=entry.data["token"]["access_token"],
+        cloud_project_id=entry.data[CONF_CLOUD_PROJECT_ID],
+    )
+    await api.async_delete_subscription(admin_client, subscription_name)
+
+
+@callback
+def _async_check_pubsub_topic(hass: HomeAssistant, entry: NestConfigEntry) -> None:
+    """Create a repair issue if the entry uses a Google-hosted Pub/Sub topic."""
+    issue_id = LEGACY_TOPIC_ISSUE_ID.format(entry_id=entry.entry_id)
+    # Entries without a topic were created before self-hosted topics were supported
+    if (topic_name := entry.data.get(CONF_TOPIC_NAME)) is not None and (
+        not api.is_legacy_topic(topic_name)
+    ):
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+        return
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        issue_id,
+        config_entry_id=entry.entry_id,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        learn_more_url=PUBSUB_LEARN_MORE_URL,
+        translation_key="legacy_pubsub_topic",
+        translation_placeholders={"entry_title": entry.title},
+    )
+
+
+class NestEventViewBase(HomeAssistantView, ABC):
+    """Base class for media event APIs."""
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize NestEventViewBase."""
         self.hass = hass
-        self.nest = nest
-        self.local_structure = conf.get(CONF_STRUCTURE)
 
-    def initialize(self):
-        """Initialize Nest."""
-        from nest.nest import AuthorizationError, APIError
+    async def get(
+        self, request: web.Request, device_id: str, event_token: str
+    ) -> web.StreamResponse:
+        """Start a GET request."""
+        user = request[KEY_HASS_USER]
+        entity_registry = er.async_get(self.hass)
+        for entry in async_entries_for_device(entity_registry, device_id):
+            if not user.permissions.check_entity(entry.entity_id, POLICY_READ):
+                raise Unauthorized(entity_id=entry.entity_id)
+
+        devices = async_get_media_source_devices(self.hass)
+        if not (nest_device := devices.get(device_id)):
+            return self._json_error(
+                f"No Nest Device found for '{device_id}'", HTTPStatus.NOT_FOUND
+            )
         try:
-            # Do not optimize next statement, it is here for initialize
-            # persistence Nest API connection.
-            structure_names = [s.name for s in self.nest.structures]
-            if self.local_structure is None:
-                self.local_structure = structure_names
+            media = await self.load_media(nest_device, event_token)
+        except DecodeException:
+            return self._json_error(
+                f"Event token was invalid '{event_token}'", HTTPStatus.NOT_FOUND
+            )
+        except ApiException as err:
+            raise HomeAssistantError("Unable to fetch media for event") from err
+        if not media:
+            return self._json_error(
+                f"No event found for event_id '{event_token}'", HTTPStatus.NOT_FOUND
+            )
+        return await self.handle_media(media)
 
-        except (AuthorizationError, APIError, socket.error) as err:
-            _LOGGER.error(
-                "Connection error while access Nest web service: %s", err)
-            return False
-        return True
+    @abstractmethod
+    async def load_media(self, nest_device: Device, event_token: str) -> Media | None:
+        """Load the specified media."""
 
-    def structures(self):
-        """Generate a list of structures."""
-        from nest.nest import AuthorizationError, APIError
-        try:
-            for structure in self.nest.structures:
-                if structure.name not in self.local_structure:
-                    _LOGGER.debug("Ignoring structure %s, not in %s",
-                                  structure.name, self.local_structure)
-                    continue
-                yield structure
+    @abstractmethod
+    async def handle_media(self, media: Media) -> web.StreamResponse:
+        """Process the specified media."""
 
-        except (AuthorizationError, APIError, socket.error) as err:
-            _LOGGER.error(
-                "Connection error while access Nest web service: %s", err)
-
-    def thermostats(self):
-        """Generate a list of thermostats."""
-        return self._devices('thermostats')
-
-    def smoke_co_alarms(self):
-        """Generate a list of smoke co alarms."""
-        return self._devices('smoke_co_alarms')
-
-    def cameras(self):
-        """Generate a list of cameras."""
-        return self._devices('cameras')
-
-    def _devices(self, device_type):
-        """Generate a list of Nest devices."""
-        from nest.nest import AuthorizationError, APIError
-        try:
-            for structure in self.nest.structures:
-                if structure.name not in self.local_structure:
-                    _LOGGER.debug("Ignoring structure %s, not in %s",
-                                  structure.name, self.local_structure)
-                    continue
-
-                for device in getattr(structure, device_type, []):
-                    try:
-                        # Do not optimize next statement,
-                        # it is here for verify Nest API permission.
-                        device.name_long
-                    except KeyError:
-                        _LOGGER.warning("Cannot retrieve device name for [%s]"
-                                        ", please check your Nest developer "
-                                        "account permission settings.",
-                                        device.serial)
-                        continue
-                    yield (structure, device)
-
-        except (AuthorizationError, APIError, socket.error) as err:
-            _LOGGER.error(
-                "Connection error while access Nest web service: %s", err)
+    def _json_error(self, message: str, status: HTTPStatus) -> web.StreamResponse:
+        """Return a json error message with additional logging."""
+        _LOGGER.debug(message)
+        return self.json_message(message, status)
 
 
-class NestSensorDevice(Entity):
-    """Representation of a Nest sensor."""
+class NestEventMediaView(NestEventViewBase):
+    """Returns media for related to events for a specific device.
 
-    def __init__(self, structure, device, variable):
-        """Initialize the sensor."""
-        self.structure = structure
-        self.variable = variable
+    This is primarily used to render media for events for MediaSource. The media type
+    depends on the specific device e.g. an image, or a movie clip preview.
+    """
 
-        if device is not None:
-            # device specific
-            self.device = device
-            self._name = "{} {}".format(self.device.name_long,
-                                        self.variable.replace('_', ' '))
-        else:
-            # structure only
-            self.device = structure
-            self._name = "{} {}".format(self.structure.name,
-                                        self.variable.replace('_', ' '))
+    url = "/api/nest/event_media/{device_id}/{event_token}"
+    name = "api:nest:event_media"
 
-        self._state = None
-        self._unit = None
+    @override
+    async def load_media(self, nest_device: Device, event_token: str) -> Media | None:
+        """Load the specified media."""
+        return await nest_device.event_media_manager.get_media_from_token(event_token)
 
-    @property
-    def name(self):
-        """Return the name of the nest, if any."""
-        return self._name
+    @override
+    async def handle_media(self, media: Media) -> web.StreamResponse:
+        """Process the specified media."""
+        return web.Response(body=media.contents, content_type=media.content_type)
 
-    @property
-    def unit_of_measurement(self):
-        """Return the unit the value is expressed in."""
-        return self._unit
 
-    @property
-    def should_poll(self):
-        """Do not need poll thanks using Nest streaming API."""
-        return False
+class NestEventMediaThumbnailView(NestEventViewBase):
+    """Returns media for related to events for a specific device.
 
-    @property
-    def unique_id(self):
-        """Return unique id based on device serial and variable."""
-        return "{}-{}".format(self.device.serial, self.variable)
+    This is primarily used to render media for events for MediaSource. The media type
+    depends on the specific device e.g. an image, or a movie clip preview.
 
-    @property
-    def device_info(self):
-        """Return information about the device."""
-        if not hasattr(self.device, 'name_long'):
-            name = self.structure.name
-            model = "Structure"
-        else:
-            name = self.device.name_long
-            if self.device.is_thermostat:
-                model = 'Thermostat'
-            elif self.device.is_camera:
-                model = 'Camera'
-            elif self.device.is_smoke_co_alarm:
-                model = 'Nest Protect'
-            else:
-                model = None
+    mp4 clips are transcoded and thumbnailed by the SDM transcoder. jpgs are thumbnailed
+    from the original in this view.
+    """
 
-        return {
-            'identifiers': {
-                (DOMAIN, self.device.serial)
-            },
-            'name': name,
-            'manufacturer': 'Nest Labs',
-            'model': model,
-        }
+    url = "/api/nest/event_media/{device_id}/{event_token}/thumbnail"
+    name = "api:nest:event_media"
 
-    def update(self):
-        """Do not use NestSensorDevice directly."""
-        raise NotImplementedError
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize NestEventMediaThumbnailView."""
+        super().__init__(hass)
+        self._lock = asyncio.Lock()
+        self.hass = hass
 
-    async def async_added_to_hass(self):
-        """Register update signal handler."""
-        async def async_update_state():
-            """Update sensor state."""
-            await self.async_update_ha_state(True)
+    @override
+    async def load_media(self, nest_device: Device, event_token: str) -> Media | None:
+        """Load the specified media."""
+        if CameraClipPreviewTrait.NAME in nest_device.traits:
+            async with self._lock:  # Only one transcode subprocess at a time
+                return (
+                    await nest_device.event_media_manager.get_clip_thumbnail_from_token(
+                        event_token
+                    )
+                )
+        return await nest_device.event_media_manager.get_media_from_token(event_token)
 
-        async_dispatcher_connect(self.hass, SIGNAL_NEST_UPDATE,
-                                 async_update_state)
+    @override
+    async def handle_media(self, media: Media) -> web.StreamResponse:
+        """Start a GET request."""
+        contents = media.contents
+        if (content_type := media.content_type) == "image/jpeg":
+            image = Image(media.event_image_type.content_type, contents)
+            contents = img_util.scale_jpeg_camera_image(
+                image, THUMBNAIL_SIZE_PX, THUMBNAIL_SIZE_PX
+            )
+        return web.Response(body=contents, content_type=content_type)

@@ -1,247 +1,109 @@
-"""
-Support for UV data from openuv.io.
+"""Support for UV data from openuv.io."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/openuv/
-"""
-import logging
-from datetime import timedelta
+import asyncio
+from typing import Any
 
-import voluptuous as vol
+from pyopenuv.client import Client
 
-from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
-    ATTR_ATTRIBUTION, CONF_API_KEY, CONF_BINARY_SENSORS, CONF_ELEVATION,
-    CONF_LATITUDE, CONF_LONGITUDE, CONF_MONITORED_CONDITIONS,
-    CONF_SCAN_INTERVAL, CONF_SENSORS)
-from homeassistant.helpers import aiohttp_client, config_validation as cv
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.event import async_track_time_interval
+    CONF_API_KEY,
+    CONF_BINARY_SENSORS,
+    CONF_ELEVATION,
+    CONF_LATITUDE,
+    CONF_LOCATION,
+    CONF_LONGITUDE,
+    CONF_SENSORS,
+    Platform,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import aiohttp_client
 
-from .config_flow import configured_instances
-from .const import DOMAIN
+from .const import (
+    CONF_FROM_WINDOW,
+    CONF_TO_WINDOW,
+    DATA_PROTECTION_WINDOW,
+    DATA_UV,
+    DEFAULT_FROM_WINDOW,
+    DEFAULT_TO_WINDOW,
+    LOGGER,
+)
+from .coordinator import (
+    OpenUvConfigEntry,
+    OpenUvCoordinator,
+    OpenUvProtectionWindowCoordinator,
+)
 
-REQUIREMENTS = ['pyopenuv==1.0.4']
-_LOGGER = logging.getLogger(__name__)
-
-DATA_OPENUV_CLIENT = 'data_client'
-DATA_OPENUV_LISTENER = 'data_listener'
-DATA_PROTECTION_WINDOW = 'protection_window'
-DATA_UV = 'uv'
-
-DEFAULT_ATTRIBUTION = 'Data provided by OpenUV'
-DEFAULT_SCAN_INTERVAL = timedelta(minutes=30)
-
-NOTIFICATION_ID = 'openuv_notification'
-NOTIFICATION_TITLE = 'OpenUV Component Setup'
-
-TOPIC_UPDATE = '{0}_data_update'.format(DOMAIN)
-
-TYPE_CURRENT_OZONE_LEVEL = 'current_ozone_level'
-TYPE_CURRENT_UV_INDEX = 'current_uv_index'
-TYPE_CURRENT_UV_LEVEL = 'current_uv_level'
-TYPE_MAX_UV_INDEX = 'max_uv_index'
-TYPE_PROTECTION_WINDOW = 'uv_protection_window'
-TYPE_SAFE_EXPOSURE_TIME_1 = 'safe_exposure_time_type_1'
-TYPE_SAFE_EXPOSURE_TIME_2 = 'safe_exposure_time_type_2'
-TYPE_SAFE_EXPOSURE_TIME_3 = 'safe_exposure_time_type_3'
-TYPE_SAFE_EXPOSURE_TIME_4 = 'safe_exposure_time_type_4'
-TYPE_SAFE_EXPOSURE_TIME_5 = 'safe_exposure_time_type_5'
-TYPE_SAFE_EXPOSURE_TIME_6 = 'safe_exposure_time_type_6'
-
-BINARY_SENSORS = {
-    TYPE_PROTECTION_WINDOW: ('Protection Window', 'mdi:sunglasses')
-}
-
-BINARY_SENSOR_SCHEMA = vol.Schema({
-    vol.Optional(CONF_MONITORED_CONDITIONS, default=list(BINARY_SENSORS)):
-        vol.All(cv.ensure_list, [vol.In(BINARY_SENSORS)])
-})
-
-SENSORS = {
-    TYPE_CURRENT_OZONE_LEVEL: (
-        'Current Ozone Level', 'mdi:vector-triangle', 'du'),
-    TYPE_CURRENT_UV_INDEX: ('Current UV Index', 'mdi:weather-sunny', 'index'),
-    TYPE_CURRENT_UV_LEVEL: ('Current UV Level', 'mdi:weather-sunny', None),
-    TYPE_MAX_UV_INDEX: ('Max UV Index', 'mdi:weather-sunny', 'index'),
-    TYPE_SAFE_EXPOSURE_TIME_1: (
-        'Skin Type 1 Safe Exposure Time', 'mdi:timer', 'minutes'),
-    TYPE_SAFE_EXPOSURE_TIME_2: (
-        'Skin Type 2 Safe Exposure Time', 'mdi:timer', 'minutes'),
-    TYPE_SAFE_EXPOSURE_TIME_3: (
-        'Skin Type 3 Safe Exposure Time', 'mdi:timer', 'minutes'),
-    TYPE_SAFE_EXPOSURE_TIME_4: (
-        'Skin Type 4 Safe Exposure Time', 'mdi:timer', 'minutes'),
-    TYPE_SAFE_EXPOSURE_TIME_5: (
-        'Skin Type 5 Safe Exposure Time', 'mdi:timer', 'minutes'),
-    TYPE_SAFE_EXPOSURE_TIME_6: (
-        'Skin Type 6 Safe Exposure Time', 'mdi:timer', 'minutes'),
-}
-
-SENSOR_SCHEMA = vol.Schema({
-    vol.Optional(CONF_MONITORED_CONDITIONS, default=list(SENSORS)):
-        vol.All(cv.ensure_list, [vol.In(SENSORS)])
-})
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN:
-        vol.Schema({
-            vol.Required(CONF_API_KEY): cv.string,
-            vol.Optional(CONF_ELEVATION): float,
-            vol.Optional(CONF_LATITUDE): cv.latitude,
-            vol.Optional(CONF_LONGITUDE): cv.longitude,
-            vol.Optional(CONF_BINARY_SENSORS, default={}):
-                BINARY_SENSOR_SCHEMA,
-            vol.Optional(CONF_SENSORS, default={}): SENSOR_SCHEMA,
-            vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL):
-                cv.time_period,
-        })
-}, extra=vol.ALLOW_EXTRA)
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 
-async def async_setup(hass, config):
-    """Set up the OpenUV component."""
-    hass.data[DOMAIN] = {}
-    hass.data[DOMAIN][DATA_OPENUV_CLIENT] = {}
-    hass.data[DOMAIN][DATA_OPENUV_LISTENER] = {}
-
-    if DOMAIN not in config:
-        return True
-
-    conf = config[DOMAIN]
-    latitude = conf.get(CONF_LATITUDE, hass.config.latitude)
-    longitude = conf.get(CONF_LONGITUDE, hass.config.longitude)
-    elevation = conf.get(CONF_ELEVATION, hass.config.elevation)
-
-    identifier = '{0}, {1}'.format(latitude, longitude)
-
-    if identifier not in configured_instances(hass):
-        hass.async_add_job(
-            hass.config_entries.flow.async_init(
-                DOMAIN,
-                context={'source': SOURCE_IMPORT},
-                data={
-                    CONF_API_KEY: conf[CONF_API_KEY],
-                    CONF_LATITUDE: latitude,
-                    CONF_LONGITUDE: longitude,
-                    CONF_ELEVATION: elevation,
-                    CONF_BINARY_SENSORS: conf[CONF_BINARY_SENSORS],
-                    CONF_SENSORS: conf[CONF_SENSORS],
-                }))
-
-    hass.data[DOMAIN][CONF_SCAN_INTERVAL] = conf[CONF_SCAN_INTERVAL]
-
-    return True
-
-
-async def async_setup_entry(hass, config_entry):
+async def async_setup_entry(hass: HomeAssistant, entry: OpenUvConfigEntry) -> None:
     """Set up OpenUV as config entry."""
-    from pyopenuv import Client
-    from pyopenuv.errors import OpenUvError
+    websession = aiohttp_client.async_get_clientsession(hass)
+    client = Client(
+        entry.data[CONF_API_KEY],
+        entry.data[CONF_LOCATION][CONF_LATITUDE],
+        entry.data[CONF_LOCATION][CONF_LONGITUDE],
+        altitude=entry.data.get(CONF_ELEVATION, hass.config.elevation),
+        session=websession,
+        check_status_before_request=True,
+    )
 
-    try:
-        websession = aiohttp_client.async_get_clientsession(hass)
-        openuv = OpenUV(
-            Client(
-                config_entry.data[CONF_API_KEY],
-                config_entry.data.get(CONF_LATITUDE, hass.config.latitude),
-                config_entry.data.get(CONF_LONGITUDE, hass.config.longitude),
-                websession,
-                altitude=config_entry.data.get(
-                    CONF_ELEVATION, hass.config.elevation)),
-            config_entry.data.get(CONF_BINARY_SENSORS, {}).get(
-                CONF_MONITORED_CONDITIONS, list(BINARY_SENSORS)),
-            config_entry.data.get(CONF_SENSORS, {}).get(
-                CONF_MONITORED_CONDITIONS, list(SENSORS)))
-        await openuv.async_update()
-        hass.data[DOMAIN][DATA_OPENUV_CLIENT][config_entry.entry_id] = openuv
-    except OpenUvError as err:
-        _LOGGER.error('An error occurred: %s', str(err))
-        hass.components.persistent_notification.create(
-            'Error: {0}<br />'
-            'You will need to restart hass after fixing.'
-            ''.format(err),
-            title=NOTIFICATION_TITLE,
-            notification_id=NOTIFICATION_ID)
-        return False
+    async def async_update_protection_data() -> dict[str, Any]:
+        """Update binary sensor (protection window) data."""
+        low = entry.options.get(CONF_FROM_WINDOW, DEFAULT_FROM_WINDOW)
+        high = entry.options.get(CONF_TO_WINDOW, DEFAULT_TO_WINDOW)
+        return await client.uv_protection_window(low=low, high=high)
 
-    for component in ('binary_sensor', 'sensor'):
-        hass.async_create_task(hass.config_entries.async_forward_entry_setup(
-            config_entry, component))
+    coordinators: dict[str, OpenUvCoordinator] = {
+        coordinator_name: coordinator_cls(
+            hass,
+            entry=entry,
+            name=coordinator_name,
+            latitude=client.latitude,
+            longitude=client.longitude,
+            update_method=update_method,
+        )
+        for coordinator_cls, coordinator_name, update_method in (
+            (OpenUvCoordinator, DATA_UV, client.uv_index),
+            (
+                OpenUvProtectionWindowCoordinator,
+                DATA_PROTECTION_WINDOW,
+                async_update_protection_data,
+            ),
+        )
+    }
 
-    async def refresh_sensors(event_time):
-        """Refresh OpenUV data."""
-        _LOGGER.debug('Refreshing OpenUV data')
-        await openuv.async_update()
-        async_dispatcher_send(hass, TOPIC_UPDATE)
+    init_tasks = [
+        coordinator.async_config_entry_first_refresh()
+        for coordinator in coordinators.values()
+    ]
+    await asyncio.gather(*init_tasks)
 
-    hass.data[DOMAIN][DATA_OPENUV_LISTENER][
-        config_entry.entry_id] = async_track_time_interval(
-            hass, refresh_sensors,
-            hass.data[DOMAIN].get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL))
+    entry.runtime_data = coordinators
 
-    return True
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
 
-async def async_unload_entry(hass, config_entry):
+async def async_unload_entry(hass: HomeAssistant, entry: OpenUvConfigEntry) -> None:
     """Unload an OpenUV config entry."""
-    for component in ('binary_sensor', 'sensor'):
-        await hass.config_entries.async_forward_entry_unload(
-            config_entry, component)
-
-    hass.data[DOMAIN][DATA_OPENUV_CLIENT].pop(config_entry.entry_id)
-
-    remove_listener = hass.data[DOMAIN][DATA_OPENUV_LISTENER].pop(
-        config_entry.entry_id)
-    remove_listener()
-
-    return True
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
 
-class OpenUV:
-    """Define a generic OpenUV object."""
+async def async_migrate_entry(hass: HomeAssistant, entry: OpenUvConfigEntry) -> None:
+    """Migrate the config entry upon new versions."""
+    LOGGER.debug("Migrating from version %s", entry.version)
 
-    def __init__(self, client, binary_sensor_conditions, sensor_conditions):
-        """Initialize."""
-        self.binary_sensor_conditions = binary_sensor_conditions
-        self.client = client
-        self.data = {}
-        self.sensor_conditions = sensor_conditions
-
-    async def async_update(self):
-        """Update sensor/binary sensor data."""
-        if TYPE_PROTECTION_WINDOW in self.binary_sensor_conditions:
-            resp = await self.client.uv_protection_window()
-            data = resp['result']
-
-            if data.get('from_time') and data.get('to_time'):
-                self.data[DATA_PROTECTION_WINDOW] = data
-            else:
-                _LOGGER.error(
-                    'No valid protection window data for this location')
-                self.data[DATA_PROTECTION_WINDOW] = {}
-
-        if any(c in self.sensor_conditions for c in SENSORS):
-            data = await self.client.uv_index()
-            self.data[DATA_UV] = data
-
-
-class OpenUvEntity(Entity):
-    """Define a generic OpenUV entity."""
-
-    def __init__(self, openuv):
-        """Initialize."""
-        self._attrs = {ATTR_ATTRIBUTION: DEFAULT_ATTRIBUTION}
-        self._name = None
-        self.openuv = openuv
-
-    @property
-    def device_state_attributes(self):
-        """Return the state attributes."""
-        return self._attrs
-
-    @property
-    def name(self):
-        """Return the name of the entity."""
-        return self._name
+    # 1 -> 2: Remove unused condition data:
+    if entry.version < 2:
+        data = dict(entry.data)
+        data.pop(CONF_BINARY_SENSORS, None)
+        data.pop(CONF_SENSORS, None)
+        hass.config_entries.async_update_entry(entry, data=data, version=2)
+        LOGGER.debug("Migration to version %s successful", 2)
+    if entry.version < 3:
+        data = dict(entry.data)
+        long = data.pop(CONF_LONGITUDE, hass.config.longitude)
+        lat = data.pop(CONF_LATITUDE, hass.config.latitude)
+        data[CONF_LOCATION] = {CONF_LATITUDE: lat, CONF_LONGITUDE: long}
+        hass.config_entries.async_update_entry(entry, data=data, version=3)
+        LOGGER.debug("Migration to version %s successful", 3)

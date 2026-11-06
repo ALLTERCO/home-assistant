@@ -1,0 +1,62 @@
+"""The Smart Meter Texas integration."""
+
+from smart_meter_texas import Account
+from smart_meter_texas.exceptions import SmartMeterTexasAuthError
+
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+
+from .const import DOMAIN
+from .coordinator import (
+    SmartMeterTexasConfigEntry,
+    SmartMeterTexasCoordinator,
+    SmartMeterTexasData,
+)
+
+PLATFORMS = [Platform.SENSOR]
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, entry: SmartMeterTexasConfigEntry
+) -> None:
+    """Set up Smart Meter Texas from a config entry."""
+
+    username = entry.data[CONF_USERNAME]
+    password = entry.data[CONF_PASSWORD]
+
+    account = Account(username, password)
+
+    smart_meter_texas_data = SmartMeterTexasData(hass, account)
+    try:
+        await smart_meter_texas_data.client.authenticate()
+    except SmartMeterTexasAuthError as error:
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN,
+            translation_key="invalid_auth",
+        ) from error
+    except TimeoutError as error:
+        raise ConfigEntryNotReady from error
+
+    await smart_meter_texas_data.setup()
+
+    # Use a DataUpdateCoordinator to manage the updates. This is due to the
+    # Smart Meter Texas API which takes around 30 seconds to read a meter.
+    # This avoids Home Assistant from complaining about the component taking
+    # too long to update.
+    coordinator = SmartMeterTexasCoordinator(hass, entry, smart_meter_texas_data)
+
+    entry.runtime_data = coordinator
+
+    entry.async_create_background_task(
+        hass, coordinator.async_refresh(), "smart_meter_texas-coordinator-refresh"
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, entry: SmartMeterTexasConfigEntry
+) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

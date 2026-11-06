@@ -1,69 +1,67 @@
-"""
-Geo Location component.
+"""Support for Geolocation."""
 
-This component covers platforms that deal with external events that contain
-a geo location related to the installed HA instance.
-
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/geo_location/
-"""
-import logging
 from datetime import timedelta
-from typing import Optional
+import logging
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_LATITUDE, ATTR_LONGITUDE
-from homeassistant.helpers.entity import Entity
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.helpers.config_validation import PLATFORM_SCHEMA  # noqa
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util.hass_dict import HassKey
+
+from .const import DOMAIN, GeolocationEntityStateAttribute
+from .entity import GeolocationEvent
 
 _LOGGER = logging.getLogger(__name__)
 
-ATTR_DISTANCE = 'distance'
-DOMAIN = 'geo_location'
-ENTITY_ID_FORMAT = DOMAIN + '.{}'
-GROUP_NAME_ALL_EVENTS = 'All Geo Location Events'
+DATA_COMPONENT: HassKey[EntityComponent[GeolocationEvent]] = HassKey(DOMAIN)
+ENTITY_ID_FORMAT = DOMAIN + ".{}"
+PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA
+PLATFORM_SCHEMA_BASE = cv.PLATFORM_SCHEMA_BASE
 SCAN_INTERVAL = timedelta(seconds=60)
 
+ATTR_DISTANCE = "distance"
+ATTR_SOURCE = "source"
 
-async def async_setup(hass, config):
-    """Set up this component."""
-    component = EntityComponent(
-        _LOGGER, DOMAIN, hass, SCAN_INTERVAL, GROUP_NAME_ALL_EVENTS)
+
+__all__ = [
+    "ATTR_DISTANCE",
+    "ATTR_LATITUDE",
+    "ATTR_LONGITUDE",
+    "ATTR_SOURCE",
+    "DOMAIN",
+    "ENTITY_ID_FORMAT",
+    "PLATFORM_SCHEMA",
+    "PLATFORM_SCHEMA_BASE",
+    "GeolocationEntityStateAttribute",
+    "GeolocationEvent",
+]
+
+# mypy: disallow-any-generics
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Geolocation component."""
+    component = hass.data[DATA_COMPONENT] = EntityComponent[GeolocationEvent](
+        _LOGGER, DOMAIN, hass, SCAN_INTERVAL
+    )
     await component.async_setup(config)
     return True
 
 
-class GeoLocationEvent(Entity):
-    """This represents an external event with an associated geo location."""
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Set up a config entry."""
+    if not await hass.data[DATA_COMPONENT].async_setup_entry(entry):
+        raise ConfigEntryError(
+            translation_domain=HOMEASSISTANT_DOMAIN,
+            translation_key="platform_setup_failed",
+            translation_placeholders={"platform": entry.domain, "domain": DOMAIN},
+        )
 
-    @property
-    def state(self):
-        """Return the state of the sensor."""
-        if self.distance is not None:
-            return round(self.distance, 1)
-        return None
 
-    @property
-    def distance(self) -> Optional[float]:
-        """Return distance value of this external event."""
-        return None
-
-    @property
-    def latitude(self) -> Optional[float]:
-        """Return latitude value of this external event."""
-        return None
-
-    @property
-    def longitude(self) -> Optional[float]:
-        """Return longitude value of this external event."""
-        return None
-
-    @property
-    def state_attributes(self):
-        """Return the state attributes of this external event."""
-        data = {}
-        if self.latitude is not None:
-            data[ATTR_LATITUDE] = round(self.latitude, 5)
-        if self.longitude is not None:
-            data[ATTR_LONGITUDE] = round(self.longitude, 5)
-        return data
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.data[DATA_COMPONENT].async_unload_entry(entry)

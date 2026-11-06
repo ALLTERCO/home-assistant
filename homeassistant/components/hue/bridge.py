@@ -1,94 +1,160 @@
 """Code to handle a Hue bridge."""
+
 import asyncio
+from collections.abc import Callable
+import logging
+from typing import Any
 
-import async_timeout
-import voluptuous as vol
+import aiohttp
+from aiohttp import client_exceptions
+from aiohue import HueBridgeV1, HueBridgeV2, LinkButtonNotPressed, Unauthorized
+from aiohue.errors import AiohueException, BridgeBusy
+from aiohue.v2.scene_activity import SceneActivityTracker
 
-from homeassistant import config_entries
-from homeassistant.helpers import aiohttp_client, config_validation as cv
+from homeassistant import core
+from homeassistant.components import persistent_notification
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
+from homeassistant.const import CONF_API_KEY, CONF_API_VERSION, CONF_HOST, Platform
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import aiohttp_client, device_registry as dr
 
-from .const import DOMAIN, LOGGER
-from .errors import AuthenticationRequired, CannotConnect
+from .const import DOMAIN
+from .v1.sensor_base import SensorManager
+from .v2.device import async_setup_devices
+from .v2.hue_event import async_setup_hue_events
 
-SERVICE_HUE_SCENE = "hue_activate_scene"
-ATTR_GROUP_NAME = "group_name"
-ATTR_SCENE_NAME = "scene_name"
-SCENE_SCHEMA = vol.Schema({
-    vol.Required(ATTR_GROUP_NAME): cv.string,
-    vol.Required(ATTR_SCENE_NAME): cv.string,
-})
+# How long should we sleep if the hub is busy
+HUB_BUSY_SLEEP = 0.5
+
+PLATFORMS_v1 = [Platform.BINARY_SENSOR, Platform.LIGHT, Platform.SENSOR]
+PLATFORMS_v2 = [
+    Platform.BINARY_SENSOR,
+    Platform.EVENT,
+    Platform.LIGHT,
+    Platform.SCENE,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
+
+type HueConfigEntry = ConfigEntry[HueBridge]
 
 
 class HueBridge:
     """Manages a single Hue bridge."""
 
-    def __init__(self, hass, config_entry, allow_unreachable, allow_groups):
+    def __init__(self, hass: core.HomeAssistant, config_entry: HueConfigEntry) -> None:
         """Initialize the system."""
         self.config_entry = config_entry
         self.hass = hass
-        self.allow_unreachable = allow_unreachable
-        self.allow_groups = allow_groups
-        self.available = True
-        self.api = None
-        self._cancel_retry_setup = None
+        self.authorized = False
+        # Jobs to be executed when API is reset.
+        self.reset_jobs: list[core.CALLBACK_TYPE] = []
+        self.sensor_manager: SensorManager | None = None
+        self.scene_activity_tracker: SceneActivityTracker | None = None
+        self.logger = logging.getLogger(__name__)
+        # store actual api connection to bridge as api
+        app_key: str = self.config_entry.data[CONF_API_KEY]
+        if self.api_version == 1:
+            self.api = HueBridgeV1(
+                self.host, app_key, aiohttp_client.async_get_clientsession(hass)
+            )
+        else:
+            self.api = HueBridgeV2(self.host, app_key)
+        # store (this) bridge object in hass data
+        self.config_entry.runtime_data = self
 
     @property
-    def host(self):
+    def host(self) -> str:
         """Return the host of this bridge."""
-        return self.config_entry.data['host']
+        return self.config_entry.data[CONF_HOST]
 
-    async def async_setup(self, tries=0):
-        """Set up a phue bridge based on host parameter."""
-        host = self.host
-        hass = self.hass
+    @property
+    def api_version(self) -> int:
+        """Return api version we're set-up for."""
+        return self.config_entry.data[CONF_API_VERSION]
 
+    async def async_initialize_bridge(self) -> bool:
+        """Initialize Connection with the Hue API."""
+        setup_ok = False
         try:
-            self.api = await get_bridge(
-                hass, host, self.config_entry.data['username'])
-        except AuthenticationRequired:
-            # usernames can become invalid if hub is reset or user removed.
+            async with asyncio.timeout(10):
+                await self.api.initialize()
+            setup_ok = True
+        except LinkButtonNotPressed, Unauthorized:
+            # Usernames can become invalid if hub is reset or user removed.
             # We are going to fail the config entry setup and initiate a new
             # linking procedure. When linking succeeds, it will remove the
             # old config entry.
-            hass.async_create_task(hass.config_entries.flow.async_init(
-                DOMAIN, context={'source': config_entries.SOURCE_IMPORT},
-                data={
-                    'host': host,
-                }
-            ))
+            create_config_flow(self.hass, self.host)
             return False
-
-        except CannotConnect:
-            retry_delay = 2 ** (tries + 1)
-            LOGGER.error("Error connecting to the Hue bridge at %s. Retrying "
-                         "in %d seconds", host, retry_delay)
-
-            async def retry_setup(_now):
-                """Retry setup."""
-                if await self.async_setup(tries + 1):
-                    # This feels hacky, we should find a better way to do this
-                    self.config_entry.state = config_entries.ENTRY_STATE_LOADED
-
-            self._cancel_retry_setup = hass.helpers.event.async_call_later(
-                retry_delay, retry_setup)
-
+        except (
+            TimeoutError,
+            client_exceptions.ClientOSError,
+            client_exceptions.ServerDisconnectedError,
+            client_exceptions.ContentTypeError,
+            BridgeBusy,
+        ) as err:
+            raise ConfigEntryNotReady(
+                f"Error connecting to the Hue bridge at {self.host}"
+            ) from err
+        except Exception:
+            self.logger.exception("Unknown error connecting to Hue bridge")
             return False
+        finally:
+            if not setup_ok:
+                await self.api.close()
 
-        except Exception:  # pylint: disable=broad-except
-            LOGGER.exception('Unknown error connecting with Hue bridge at %s',
-                             host)
-            return False
+        # v1 specific initialization/setup code here
+        if self.api_version == 1:
+            if self.api.sensors is not None:
+                self.sensor_manager = SensorManager(self)
+            # Register the bridge device before forwarding the platforms so the
+            # light and sensor entities can resolve it as their via_device parent
+            # while they are being added.
+            if self.hass.config_entries.async_get_entry(self.config_entry.entry_id):
+                _async_register_bridge_device(
+                    self.hass, self.config_entry, self.api, self.api_version
+                )
+            await self.hass.config_entries.async_forward_entry_setups(
+                self.config_entry, PLATFORMS_v1
+            )
 
-        hass.async_create_task(hass.config_entries.async_forward_entry_setup(
-            self.config_entry, 'light'))
+        # v2 specific initialization/setup code here
+        else:
+            await async_setup_devices(self)
+            await async_setup_hue_events(self)
+            self.scene_activity_tracker = SceneActivityTracker(self.api.scenes)
+            self.scene_activity_tracker.start()
+            self.reset_jobs.append(self.scene_activity_tracker.stop)
+            await self.hass.config_entries.async_forward_entry_setups(
+                self.config_entry, PLATFORMS_v2
+            )
 
-        hass.services.async_register(
-            DOMAIN, SERVICE_HUE_SCENE, self.hue_activate_scene,
-            schema=SCENE_SCHEMA)
-
+        # add listener for config entry updates.
+        self.reset_jobs.append(self.config_entry.add_update_listener(_update_listener))
+        self.authorized = True
         return True
 
-    async def async_reset(self):
+    async def async_request_call(self, task: Callable, *args, **kwargs) -> Any:
+        """Send request to the Hue bridge."""
+        try:
+            return await task(*args, **kwargs)
+        except AiohueException as err:
+            # The (new) Hue api can be a bit fanatic with throwing errors so
+            # we have some logic to treat some responses as warning only.
+            msg = f"Request failed: {err}"
+            if "may not have effect" in str(err):
+                # log only
+                self.logger.debug(msg)
+                return None
+            raise HomeAssistantError(msg) from err
+        except aiohttp.ClientError as err:
+            raise HomeAssistantError(
+                f"Request failed due connection error: {err}"
+            ) from err
+
+    async def async_reset(self) -> bool:
         """Reset this bridge to default state.
 
         Will cancel any scheduled setup retry and will unload
@@ -97,84 +163,97 @@ class HueBridge:
         # The bridge can be in 3 states:
         #  - Setup was successful, self.api is not None
         #  - Authentication was wrong, self.api is None, not retrying setup.
-        #  - Host was down. self.api is None, we're retrying setup
-
-        # If we have a retry scheduled, we were never setup.
-        if self._cancel_retry_setup is not None:
-            self._cancel_retry_setup()
-            self._cancel_retry_setup = None
-            return True
 
         # If the authentication was wrong.
         if self.api is None:
             return True
 
-        self.hass.services.async_remove(DOMAIN, SERVICE_HUE_SCENE)
+        while self.reset_jobs:
+            self.reset_jobs.pop()()
 
-        # If setup was successful, we set api variable, forwarded entry and
-        # register service
-        return await self.hass.config_entries.async_forward_entry_unload(
-            self.config_entry, 'light')
+        # Unload platforms
+        unload_success = await self.hass.config_entries.async_unload_platforms(
+            self.config_entry, PLATFORMS_v1 if self.api_version == 1 else PLATFORMS_v2
+        )
 
-    async def hue_activate_scene(self, call, updated=False):
-        """Service to call directly into bridge to set scenes."""
-        group_name = call.data[ATTR_GROUP_NAME]
-        scene_name = call.data[ATTR_SCENE_NAME]
+        if unload_success:
+            delattr(self.config_entry, "runtime_data")
 
-        group = next(
-            (group for group in self.api.groups.values()
-             if group.name == group_name), None)
+        return unload_success
 
-        # Additional scene logic to handle duplicate scene names across groups
-        scene = next(
-            (scene for scene in self.api.scenes.values()
-             if scene.name == scene_name
-             and group is not None
-             and sorted(scene.lights) == sorted(group.lights)),
-            None)
-
-        # If we can't find it, fetch latest info.
-        if not updated and (group is None or scene is None):
-            await self.api.groups.update()
-            await self.api.scenes.update()
-            await self.hue_activate_scene(call, updated=True)
+    async def handle_unauthorized_error(self) -> None:
+        """Create a new config flow when the authorization is no longer valid."""
+        if not self.authorized:
+            # we already created a new config flow, no need to do it again
             return
-
-        if group is None:
-            LOGGER.warning('Unable to find group %s', group_name)
-            return
-
-        if scene is None:
-            LOGGER.warning('Unable to find scene %s', scene_name)
-            return
-
-        await group.set_action(scene=scene.id)
+        self.logger.error(
+            "Unable to authorize to bridge %s, setup the linking again", self.host
+        )
+        self.authorized = False
+        create_config_flow(self.hass, self.host)
 
 
-async def get_bridge(hass, host, username=None):
-    """Create a bridge object and verify authentication."""
-    import aiohue
+@core.callback
+def _async_register_bridge_device(
+    hass: core.HomeAssistant,
+    config_entry: HueConfigEntry,
+    api: HueBridgeV1 | HueBridgeV2,
+    api_version: int,
+) -> None:
+    """Add the bridge device to the device registry."""
+    device_registry = dr.async_get(hass)
+    if api_version == 1:
+        device_registry.async_get_or_create(
+            config_entry_id=config_entry.entry_id,
+            connections={(dr.CONNECTION_NETWORK_MAC, api.config.mac_address)},
+            identifiers={(DOMAIN, api.config.bridge_id)},
+            manufacturer="Signify",
+            name=api.config.name,
+            model_id=api.config.model_id,
+            sw_version=api.config.software_version,
+        )
+        # create persistent notification if we found a bridge version
+        # with security vulnerability
+        if (
+            api.config.model_id == "BSB002"
+            and api.config.software_version < "1935144040"
+        ):
+            persistent_notification.async_create(
+                hass,
+                (
+                    "Your Hue hub has a known security vulnerability ([CVE-2020-6007] "
+                    "(https://cve.circl.lu/cve/CVE-2020-6007)). "
+                    "Go to the Hue app and check for software updates."
+                ),
+                "Signify Hue",
+                "hue_hub_firmware",
+            )
+    else:
+        device_registry.async_get_or_create(
+            config_entry_id=config_entry.entry_id,
+            connections={(dr.CONNECTION_NETWORK_MAC, api.config.mac_address)},
+            identifiers={
+                (DOMAIN, api.config.bridge_id),
+                (DOMAIN, api.config.bridge_device.id),
+            },
+            manufacturer=api.config.bridge_device.product_data.manufacturer_name,
+            name=api.config.name,
+            model_id=api.config.model_id,
+            sw_version=api.config.software_version,
+        )
 
-    bridge = aiohue.Bridge(
-        host, username=username,
-        websession=aiohttp_client.async_get_clientsession(hass)
+
+async def _update_listener(hass: core.HomeAssistant, entry: HueConfigEntry) -> None:
+    """Handle ConfigEntry options update."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+def create_config_flow(hass: core.HomeAssistant, host: str) -> None:
+    """Start a config flow."""
+    hass.async_create_task(
+        hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_IMPORT},
+            data={"host": host},
+        )
     )
-
-    try:
-        with async_timeout.timeout(5):
-            # Create username if we don't have one
-            if not username:
-                await bridge.create_user('home-assistant')
-            # Initialize bridge (and validate our username)
-            await bridge.initialize()
-
-        return bridge
-    except (aiohue.LinkButtonNotPressed, aiohue.Unauthorized):
-        LOGGER.warning("Connected to Hue at %s but not registered.", host)
-        raise AuthenticationRequired
-    except (asyncio.TimeoutError, aiohue.RequestError):
-        LOGGER.error("Error connecting to the Hue bridge at %s", host)
-        raise CannotConnect
-    except aiohue.AiohueException:
-        LOGGER.exception('Unknown Hue linking error occurred')
-        raise AuthenticationRequired

@@ -1,0 +1,199 @@
+"""Tests for Fritz!Tools."""
+
+import re
+from unittest.mock import patch
+from xml.etree.ElementTree import ParseError
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+
+from homeassistant import core
+from homeassistant.components.device_tracker import (
+    CONF_CONSIDER_HOME,
+    DEFAULT_CONSIDER_HOME,
+)
+from homeassistant.components.fritz.const import (
+    DOMAIN,
+    FRITZ_AUTH_EXCEPTIONS,
+    FRITZ_EXCEPTIONS,
+)
+from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF
+from homeassistant.core import HomeAssistant
+
+from .const import MOCK_USER_DATA
+
+
+async def test_setup(
+    hass: HomeAssistant,
+    fc_class_mock,
+    fh_class_mock,
+    fs_class_mock,
+) -> None:
+    """Test setup and unload of Fritz!Tools."""
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_DATA)
+    entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_options_reload(
+    hass: HomeAssistant,
+    fc_class_mock,
+    fh_class_mock,
+    fs_class_mock,
+) -> None:
+    """Test reload of Fritz!Tools, when options changed."""
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=MOCK_USER_DATA,
+        options={CONF_CONSIDER_HOME: DEFAULT_CONSIDER_HOME.total_seconds()},
+    )
+    entry.add_to_hass(hass)
+
+    with patch(
+        "homeassistant.config_entries.ConfigEntries.async_reload",
+        return_value=None,
+    ) as mock_reload:
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert entry.state is ConfigEntryState.LOADED
+
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={CONF_CONSIDER_HOME: 60},
+        )
+        await hass.async_block_till_done()
+        mock_reload.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "error",
+    FRITZ_AUTH_EXCEPTIONS,
+)
+async def test_setup_auth_fail(hass: HomeAssistant, error) -> None:
+    """Test starting a flow by user with an already configured device."""
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_DATA)
+    entry.add_to_hass(hass)
+
+    with patch(
+        "homeassistant.components.fritz.coordinator.FritzConnectionCached",
+        side_effect=error,
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+
+
+@pytest.mark.parametrize(
+    "error",
+    FRITZ_EXCEPTIONS,
+)
+async def test_setup_fail(hass: HomeAssistant, error) -> None:
+    """Test starting a flow by user with an already configured device."""
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_DATA)
+    entry.add_to_hass(hass)
+
+    with patch(
+        "homeassistant.components.fritz.coordinator.FritzConnectionCached",
+        side_effect=error,
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    assert entry.state.recoverable is True
+    assert entry.error_reason_translation_key == "error_connecting"
+
+
+async def test_setup_fail_parse_error(hass: HomeAssistant, fc_class_mock) -> None:
+    """Test setup failure due to parse error while fetching device data."""
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_DATA)
+    entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "homeassistant.components.fritz.coordinator.FritzStatus.get_device_info"
+        ) as fs_mock,
+    ):
+        fs_mock.side_effect = ParseError("boom")
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    assert entry.error_reason_translation_key == "error_parse_device_info"
+
+
+@pytest.mark.parametrize(
+    "upnp_config",
+    [
+        pytest.param({"NewEnable": False}, id="disabled"),
+        pytest.param({}, id="missing_key"),
+    ],
+)
+async def test_upnp_missing(
+    hass: HomeAssistant,
+    fc_class_mock,
+    fh_class_mock,
+    fs_class_mock,
+    upnp_config: dict[str, bool],
+) -> None:
+    """Test UPNP configuration is missing."""
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_DATA)
+    entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "homeassistant.components.fritz.coordinator.AvmWrapper.async_get_upnp_configuration",
+            return_value=upnp_config,
+        ),
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    assert entry.state.recoverable is True
+    assert entry.error_reason_translation_key == "error_upnp_disabled"
+
+
+async def test_execute_action_while_shutdown(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    fc_class_mock,
+    fh_class_mock,
+    fs_class_mock,
+) -> None:
+    """Test Fritz!Tools actions executed during shutdown of HomeAssistant."""
+
+    entry = MockConfigEntry(domain=DOMAIN, data=MOCK_USER_DATA)
+    entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+
+    hass.set_state(core.CoreState.stopping)
+    await hass.services.async_call(
+        SWITCH_DOMAIN,
+        SERVICE_TURN_OFF,
+        {ATTR_ENTITY_ID: "switch.mock_title_wi_fi_guest"},
+        blocking=True,
+    )
+
+    assert re.search(
+        r"Cannot execute (.+): HomeAssistant is shutting down", caplog.text
+    )

@@ -1,0 +1,1485 @@
+"""Tests for the LaMetric config flow."""
+
+from http import HTTPStatus
+from typing import Any
+from unittest.mock import MagicMock
+
+from demetriek import (
+    AuthChallenge,
+    LaMetricAuthenticationError,
+    LaMetricConnectionError,
+    LaMetricConnectionTimeoutError,
+    LaMetricError,
+    LaMetricUnsupportedError,
+    Notification,
+    NotificationSound,
+    Sound,
+)
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+from pytest_homeassistant.typing import ClientSessionGenerator
+
+from homeassistant.components.lametric import config_flow
+from homeassistant.components.lametric.const import DOMAIN
+from homeassistant.config_entries import SOURCE_DHCP, SOURCE_SSDP, SOURCE_USER
+from homeassistant.const import CONF_API_KEY, CONF_DEVICE, CONF_HOST, CONF_MAC
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
+from homeassistant.helpers.service_info.ssdp import (
+    ATTR_UPNP_FRIENDLY_NAME,
+    ATTR_UPNP_SERIAL,
+    SsdpServiceInfo,
+)
+
+SSDP_DISCOVERY_INFO = SsdpServiceInfo(
+    ssdp_usn="mock_usn",
+    ssdp_st="mock_st",
+    ssdp_location="http://127.0.0.1:44057/465d585b-1c05-444a-b14e-6ffb875b46a6/device_description.xml",
+    upnp={
+        ATTR_UPNP_FRIENDLY_NAME: "LaMetric Time (LM1245)",
+        ATTR_UPNP_SERIAL: "SA110405124500W00BS9",
+    },
+)
+
+
+@pytest.mark.usefixtures("current_request_with_host", "mock_setup_entry")
+async def test_full_cloud_import_flow_multiple_devices(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+    mock_lametric_cloud: MagicMock,
+    mock_lametric: MagicMock,
+) -> None:
+    """Check a full flow importing from cloud, with multiple devices."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "choice_enter_manual_or_fetch_cloud"
+    assert result["menu_options"] == [
+        "press_button",
+        "pick_implementation",
+        "manual_entry",
+    ]
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "pick_implementation"}
+    )
+
+    state = config_entry_oauth2_flow._encode_jwt(
+        hass,
+        {
+            "flow_id": result["flow_id"],
+            "redirect_uri": "https://example.com/auth/external/callback",
+        },
+    )
+
+    assert result["type"] is FlowResultType.EXTERNAL_STEP
+    assert result["url"] == (
+        "https://developer.lametric.com/api/v2/oauth2/authorize"
+        "?response_type=code&client_id=client"
+        "&redirect_uri=https://example.com/auth/external/callback"
+        f"&state={state}"
+        "&scope=basic+devices_read"
+    )
+
+    client = await hass_client_no_auth()
+    resp = await client.get(f"/auth/external/callback?code=abcd&state={state}")
+    assert resp.status == HTTPStatus.OK
+    assert resp.headers["content-type"] == "text/html; charset=utf-8"
+
+    aioclient_mock.post(
+        "https://developer.lametric.com/api/v2/oauth2/token",
+        json={
+            "refresh_token": "mock-refresh-token",
+            "access_token": "mock-access-token",
+            "type": "Bearer",
+            "expires_in": 60,
+        },
+    )
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "cloud_select_device"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_DEVICE: "SA110405124500W00BS9"}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    config_entry = result["result"]
+    assert config_entry.title == "Frenck's LaMetric"
+    assert config_entry.unique_id == "SA110405124500W00BS9"
+    assert config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+    assert not config_entry.options
+
+    assert len(mock_lametric_cloud.devices.mock_calls) == 1
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("current_request_with_host", "mock_setup_entry")
+async def test_full_cloud_import_flow_single_device(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+    mock_lametric_cloud: MagicMock,
+    mock_lametric: MagicMock,
+) -> None:
+    """Check a full flow importing from cloud, with a single device."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "choice_enter_manual_or_fetch_cloud"
+    assert result["menu_options"] == [
+        "press_button",
+        "pick_implementation",
+        "manual_entry",
+    ]
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "pick_implementation"}
+    )
+
+    state = config_entry_oauth2_flow._encode_jwt(
+        hass,
+        {
+            "flow_id": result["flow_id"],
+            "redirect_uri": "https://example.com/auth/external/callback",
+        },
+    )
+
+    assert result["type"] is FlowResultType.EXTERNAL_STEP
+    assert result["url"] == (
+        "https://developer.lametric.com/api/v2/oauth2/authorize"
+        "?response_type=code&client_id=client"
+        "&redirect_uri=https://example.com/auth/external/callback"
+        f"&state={state}"
+        "&scope=basic+devices_read"
+    )
+
+    client = await hass_client_no_auth()
+    resp = await client.get(f"/auth/external/callback?code=abcd&state={state}")
+    assert resp.status == HTTPStatus.OK
+    assert resp.headers["content-type"] == "text/html; charset=utf-8"
+
+    aioclient_mock.post(
+        "https://developer.lametric.com/api/v2/oauth2/token",
+        json={
+            "refresh_token": "mock-refresh-token",
+            "access_token": "mock-access-token",
+            "type": "Bearer",
+            "expires_in": 60,
+        },
+    )
+
+    # Stage a single device
+    # Should skip step that ask for device selection
+    mock_lametric_cloud.devices.return_value = [
+        mock_lametric_cloud.devices.return_value[0]
+    ]
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    config_entry = result["result"]
+    assert config_entry.title == "Frenck's LaMetric"
+    assert config_entry.unique_id == "SA110405124500W00BS9"
+    assert config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+    assert not config_entry.options
+
+    assert len(mock_lametric_cloud.devices.mock_calls) == 1
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_full_manual(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+) -> None:
+    """Check a full flow manual entry."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "choice_enter_manual_or_fetch_cloud"
+    assert result["menu_options"] == [
+        "press_button",
+        "pick_implementation",
+        "manual_entry",
+    ]
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "manual_entry"}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "manual_entry"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "127.0.0.1", CONF_API_KEY: "mock-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    config_entry = result["result"]
+
+    assert config_entry.title == "Frenck's LaMetric"
+    assert config_entry.unique_id == "SA110405124500W00BS9"
+    assert config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+    assert not config_entry.options
+
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+    notification: Notification = mock_lametric.notify.mock_calls[0][2]["notification"]
+    assert notification.model.sound == Sound(sound=NotificationSound.WIN)
+
+
+@pytest.mark.usefixtures("current_request_with_host", "mock_setup_entry")
+async def test_full_ssdp_with_cloud_import(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+    mock_lametric_cloud: MagicMock,
+    mock_lametric: MagicMock,
+    mock_lametric_local_auth: MagicMock,
+) -> None:
+    """Check a full flow triggered by SSDP, importing from cloud."""
+    # A device without the button press, like an LM 37X8, gets the menu.
+    mock_lametric_local_auth.supported.return_value = False
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_SSDP}, data=SSDP_DISCOVERY_INFO
+    )
+
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "choice_enter_manual_or_fetch_cloud"
+    assert result["menu_options"] == ["pick_implementation", "manual_entry"]
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "pick_implementation"}
+    )
+
+    state = config_entry_oauth2_flow._encode_jwt(
+        hass,
+        {
+            "flow_id": result["flow_id"],
+            "redirect_uri": "https://example.com/auth/external/callback",
+        },
+    )
+
+    assert result["type"] is FlowResultType.EXTERNAL_STEP
+    assert result["url"] == (
+        "https://developer.lametric.com/api/v2/oauth2/authorize"
+        "?response_type=code&client_id=client"
+        "&redirect_uri=https://example.com/auth/external/callback"
+        f"&state={state}"
+        "&scope=basic+devices_read"
+    )
+
+    client = await hass_client_no_auth()
+    resp = await client.get(f"/auth/external/callback?code=abcd&state={state}")
+    assert resp.status == HTTPStatus.OK
+    assert resp.headers["content-type"] == "text/html; charset=utf-8"
+
+    aioclient_mock.post(
+        "https://developer.lametric.com/api/v2/oauth2/token",
+        json={
+            "refresh_token": "mock-refresh-token",
+            "access_token": "mock-access-token",
+            "type": "Bearer",
+            "expires_in": 60,
+        },
+    )
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    config_entry = result["result"]
+    assert config_entry.title == "Frenck's LaMetric"
+    assert config_entry.unique_id == "SA110405124500W00BS9"
+    assert config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+
+    assert len(mock_lametric_cloud.devices.mock_calls) == 1
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_full_ssdp_manual_entry(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_lametric_local_auth: MagicMock,
+) -> None:
+    """Check a full flow triggered by SSDP, with manual API key entry."""
+    # A device without the button press, like an LM 37X8, gets the menu.
+    mock_lametric_local_auth.supported.return_value = False
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_SSDP}, data=SSDP_DISCOVERY_INFO
+    )
+
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "choice_enter_manual_or_fetch_cloud"
+    assert result["menu_options"] == ["pick_implementation", "manual_entry"]
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "manual_entry"}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "manual_entry"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_API_KEY: "mock-api-key"}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    config_entry = result["result"]
+    assert config_entry.title == "Frenck's LaMetric"
+    assert config_entry.unique_id == "SA110405124500W00BS9"
+    assert config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+    assert not config_entry.options
+
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("data", "reason"),
+    [
+        (
+            SsdpServiceInfo(ssdp_usn="mock_usn", ssdp_st="mock_st", upnp={}),
+            "invalid_discovery_info",
+        ),
+        (
+            SsdpServiceInfo(
+                ssdp_usn="mock_usn",
+                ssdp_st="mock_st",
+                ssdp_location="http://169.254.0.1:44057/465d585b-1c05-444a-b14e-6ffb875b46a6/device_description.xml",
+                upnp={
+                    ATTR_UPNP_SERIAL: "SA110405124500W00BS9",
+                },
+            ),
+            "link_local_address",
+        ),
+    ],
+)
+async def test_ssdp_abort_invalid_discovery(
+    hass: HomeAssistant, data: SsdpServiceInfo, reason: str
+) -> None:
+    """Check a full flow triggered by SSDP, with manual API key entry."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_SSDP}, data=data
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == reason
+
+
+@pytest.mark.usefixtures("current_request_with_host")
+async def test_cloud_import_updates_existing_entry(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+    mock_lametric_cloud: MagicMock,
+    mock_lametric: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test cloud importing existing device updates existing entry."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "pick_implementation"}
+    )
+
+    state = config_entry_oauth2_flow._encode_jwt(
+        hass,
+        {
+            "flow_id": result["flow_id"],
+            "redirect_uri": "https://example.com/auth/external/callback",
+        },
+    )
+    client = await hass_client_no_auth()
+    await client.get(f"/auth/external/callback?code=abcd&state={state}")
+    aioclient_mock.post(
+        "https://developer.lametric.com/api/v2/oauth2/token",
+        json={
+            "refresh_token": "mock-refresh-token",
+            "access_token": "mock-access-token",
+            "type": "Bearer",
+            "expires_in": 60,
+        },
+    )
+    await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_DEVICE: "SA110405124500W00BS9"}
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert mock_config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+
+    assert len(mock_lametric_cloud.devices.mock_calls) == 1
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 0
+
+
+async def test_manual_updates_existing_entry(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test adding existing device updates existing entry."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "manual_entry"}
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "127.0.0.1", CONF_API_KEY: "mock-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert mock_config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 0
+
+
+async def test_discovery_updates_existing_entry(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Test discovery of existing device updates entry."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_SSDP}, data=SSDP_DISCOVERY_INFO
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert mock_config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-from-fixture",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+
+
+@pytest.mark.usefixtures("current_request_with_host")
+async def test_cloud_abort_no_devices(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+    mock_lametric_cloud: MagicMock,
+) -> None:
+    """Test cloud importing aborts when account has no devices."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "pick_implementation"}
+    )
+
+    state = config_entry_oauth2_flow._encode_jwt(
+        hass,
+        {
+            "flow_id": result["flow_id"],
+            "redirect_uri": "https://example.com/auth/external/callback",
+        },
+    )
+    client = await hass_client_no_auth()
+    await client.get(f"/auth/external/callback?code=abcd&state={state}")
+    aioclient_mock.post(
+        "https://developer.lametric.com/api/v2/oauth2/token",
+        json={
+            "refresh_token": "mock-refresh-token",
+            "access_token": "mock-access-token",
+            "type": "Bearer",
+            "expires_in": 60,
+        },
+    )
+
+    # Stage there are no devices
+    mock_lametric_cloud.devices.return_value = []
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "no_devices"
+
+    assert len(mock_lametric_cloud.devices.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+@pytest.mark.parametrize(
+    ("side_effect", "reason"),
+    [
+        (LaMetricAuthenticationError, "invalid_auth"),
+        (LaMetricConnectionTimeoutError, "cannot_connect"),
+        (LaMetricConnectionError, "cannot_connect"),
+        (LaMetricError, "unknown"),
+        (RuntimeError, "unknown"),
+    ],
+)
+async def test_manual_errors(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    side_effect: Exception,
+    reason: str,
+) -> None:
+    """Test adding existing device updates existing entry."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "manual_entry"}
+    )
+
+    mock_lametric.device.side_effect = side_effect
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "127.0.0.1", CONF_API_KEY: "mock-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "manual_entry"
+    assert result["errors"] == {"base": reason}
+
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 0
+
+    mock_lametric.device.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "127.0.0.1", CONF_API_KEY: "mock-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    config_entry = result["result"]
+    assert config_entry.title == "Frenck's LaMetric"
+    assert config_entry.unique_id == "SA110405124500W00BS9"
+    assert config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+    assert not config_entry.options
+
+    assert len(mock_lametric.device.mock_calls) == 2
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("current_request_with_host", "mock_setup_entry")
+@pytest.mark.parametrize(
+    ("side_effect", "reason"),
+    [
+        (LaMetricAuthenticationError, "invalid_auth"),
+        (LaMetricConnectionTimeoutError, "cannot_connect"),
+        (LaMetricConnectionError, "cannot_connect"),
+        (LaMetricError, "unknown"),
+        (RuntimeError, "unknown"),
+    ],
+)
+async def test_cloud_errors(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+    mock_lametric_cloud: MagicMock,
+    mock_lametric: MagicMock,
+    side_effect: Exception,
+    reason: str,
+) -> None:
+    """Test adding existing device updates existing entry."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "pick_implementation"}
+    )
+
+    state = config_entry_oauth2_flow._encode_jwt(
+        hass,
+        {
+            "flow_id": result["flow_id"],
+            "redirect_uri": "https://example.com/auth/external/callback",
+        },
+    )
+    client = await hass_client_no_auth()
+    await client.get(f"/auth/external/callback?code=abcd&state={state}")
+    aioclient_mock.post(
+        "https://developer.lametric.com/api/v2/oauth2/token",
+        json={
+            "refresh_token": "mock-refresh-token",
+            "access_token": "mock-access-token",
+            "type": "Bearer",
+            "expires_in": 60,
+        },
+    )
+    await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    mock_lametric.device.side_effect = side_effect
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_DEVICE: "SA110405124500W00BS9"}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "cloud_select_device"
+    assert result["errors"] == {"base": reason}
+
+    assert len(mock_lametric_cloud.devices.mock_calls) == 1
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 0
+
+    mock_lametric.device.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_DEVICE: "SA110405124500W00BS9"}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    config_entry = result["result"]
+    assert config_entry.title == "Frenck's LaMetric"
+    assert config_entry.unique_id == "SA110405124500W00BS9"
+    assert config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+    assert not config_entry.options
+
+    assert len(mock_lametric_cloud.devices.mock_calls) == 1
+    assert len(mock_lametric.device.mock_calls) == 2
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_dhcp_discovery_updates_entry(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Test DHCP discovery updates config entries."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DhcpServiceInfo(
+            hostname="lametric",
+            ip="127.0.0.42",
+            macaddress="aabbccddeeff",
+        ),
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert mock_config_entry.data == {
+        CONF_API_KEY: "mock-from-fixture",
+        CONF_HOST: "127.0.0.42",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+
+
+async def test_dhcp_unknown_device(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test unknown DHCP discovery aborts flow."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DhcpServiceInfo(
+            hostname="lametric",
+            ip="127.0.0.42",
+            macaddress="aabbccddee00",
+        ),
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unknown"
+
+
+async def test_dhcp_entry_without_mac(hass: HomeAssistant) -> None:
+    """Test DHCP discovery skips an entry set up without a MAC.
+
+    A device still connecting to its Wi-Fi does not report its MAC.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: "127.0.0.2",
+            CONF_API_KEY: "mock-from-fixture",
+            CONF_MAC: None,
+        },
+        unique_id="SA110405124500W00BS9",
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_DHCP},
+        data=DhcpServiceInfo(
+            hostname="lametric",
+            ip="127.0.0.42",
+            macaddress="aabbccddeeff",
+        ),
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unknown"
+    assert entry.data[CONF_HOST] == "127.0.0.2"
+
+
+@pytest.mark.usefixtures("current_request_with_host", "mock_setup_entry")
+async def test_reauth_cloud_import(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+    mock_lametric_cloud: MagicMock,
+    mock_lametric: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    mock_lametric_local_auth: MagicMock,
+) -> None:
+    """Test reauth flow importing api keys from the cloud."""
+    # A device without the button press, like an LM 37X8, gets the menu.
+    mock_lametric_local_auth.supported.return_value = False
+    mock_config_entry.add_to_hass(hass)
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "pick_implementation"}
+    )
+
+    state = config_entry_oauth2_flow._encode_jwt(
+        hass,
+        {
+            "flow_id": result["flow_id"],
+            "redirect_uri": "https://example.com/auth/external/callback",
+        },
+    )
+
+    client = await hass_client_no_auth()
+    await client.get(f"/auth/external/callback?code=abcd&state={state}")
+    aioclient_mock.post(
+        "https://developer.lametric.com/api/v2/oauth2/token",
+        json={
+            "refresh_token": "mock-refresh-token",
+            "access_token": "mock-access-token",
+            "type": "Bearer",
+            "expires_in": 60,
+        },
+    )
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert mock_config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+
+    assert len(mock_lametric_cloud.devices.mock_calls) == 1
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("current_request_with_host", "mock_setup_entry")
+async def test_reauth_cloud_abort_device_not_found(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    aioclient_mock: AiohttpClientMocker,
+    mock_lametric_cloud: MagicMock,
+    mock_lametric: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    mock_lametric_local_auth: MagicMock,
+) -> None:
+    """Test reauth flow importing api keys from the cloud."""
+    # A device without the button press, like an LM 37X8, gets the menu.
+    mock_lametric_local_auth.supported.return_value = False
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(mock_config_entry, unique_id="UKNOWN_DEVICE")
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "pick_implementation"}
+    )
+
+    state = config_entry_oauth2_flow._encode_jwt(
+        hass,
+        {
+            "flow_id": result["flow_id"],
+            "redirect_uri": "https://example.com/auth/external/callback",
+        },
+    )
+
+    client = await hass_client_no_auth()
+    await client.get(f"/auth/external/callback?code=abcd&state={state}")
+    aioclient_mock.post(
+        "https://developer.lametric.com/api/v2/oauth2/token",
+        json={
+            "refresh_token": "mock-refresh-token",
+            "access_token": "mock-access-token",
+            "type": "Bearer",
+            "expires_in": 60,
+        },
+    )
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_device_not_found"
+
+    assert len(mock_lametric_cloud.devices.mock_calls) == 1
+    assert len(mock_lametric.device.mock_calls) == 0
+    assert len(mock_lametric.notify.mock_calls) == 0
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reauth_manual(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    mock_lametric_local_auth: MagicMock,
+) -> None:
+    """Test reauth flow with manual entry."""
+    # A device without the button press, like an LM 37X8, gets the menu.
+    mock_lametric_local_auth.supported.return_value = False
+    mock_config_entry.add_to_hass(hass)
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "manual_entry"}
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_API_KEY: "mock-api-key"}
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert mock_config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+@pytest.mark.parametrize("device_fixture", ["device_sa5"])
+async def test_reauth_manual_sky(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    mock_lametric_local_auth: MagicMock,
+) -> None:
+    """Test reauth flow with manual entry for LaMetric Sky."""
+    # A device without the button press, like an LM 37X8, gets the menu.
+    mock_lametric_local_auth.supported.return_value = False
+    mock_config_entry.add_to_hass(hass)
+    # The entry belongs to the SKY the reauthentication talks to.
+    hass.config_entries.async_update_entry(
+        mock_config_entry, unique_id="SA52100000123TBNC"
+    )
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "manual_entry"}
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_API_KEY: "mock-api-key"}
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert mock_config_entry.data == {
+        CONF_HOST: "127.0.0.1",
+        CONF_API_KEY: "mock-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+    notification: Notification = mock_lametric.notify.mock_calls[0][2]["notification"]
+    assert notification.model.sound is None
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reconfigure(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test changing the host and API key of a configured device."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "127.0.0.42", CONF_API_KEY: "new-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert mock_config_entry.data == {
+        CONF_HOST: "127.0.0.42",
+        CONF_API_KEY: "new-api-key",
+        CONF_MAC: "AA:BB:CC:DD:EE:FF",
+    }
+
+    # Reconfiguring only checks the device, it does not send a notification.
+    assert len(mock_lametric.device.mock_calls) == 1
+    assert len(mock_lametric.notify.mock_calls) == 0
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reconfigure_other_device(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reconfiguring towards another device is refused."""
+    mock_config_entry.add_to_hass(hass)
+    mock_lametric.device.return_value.serial_number = "SA000000000000000000"
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "127.0.0.42", CONF_API_KEY: "new-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unique_id_mismatch"
+    assert mock_config_entry.data[CONF_HOST] == "127.0.0.2"
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+@pytest.mark.parametrize(
+    ("side_effect", "error"),
+    [
+        (LaMetricAuthenticationError, "invalid_auth"),
+        (LaMetricConnectionError, "cannot_connect"),
+        (Exception, "unknown"),
+    ],
+)
+async def test_reconfigure_errors(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    side_effect: type[Exception],
+    error: str,
+) -> None:
+    """Test errors while reconfiguring, and recovering from them."""
+    mock_config_entry.add_to_hass(hass)
+    device = mock_lametric.device.return_value
+    mock_lametric.device.side_effect = side_effect
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "127.0.0.42", CONF_API_KEY: "new-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
+
+    mock_lametric.device.side_effect = None
+    mock_lametric.device.return_value = device
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "127.0.0.42", CONF_API_KEY: "new-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_full_press_button(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_lametric_local_auth: MagicMock,
+) -> None:
+    """Check a full flow getting the API key with a press on the button."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "press_button"}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "press_button"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.1"}
+    )
+
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    assert result["step_id"] == "press_button_wait"
+    assert result["description_placeholders"] == {"duration": "60"}
+
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    assert result["result"].unique_id == "SA110405124500W00BS9"
+
+    # The device is set up with the API key it handed out.
+    assert config_flow.LaMetricDevice.call_args.kwargs["api_key"] == (
+        "mock-local-api-key"
+    )
+    mock_lametric_local_auth.challenge.assert_called_once_with(
+        challenge_id="mock-challenge"
+    )
+    mock_lametric_local_auth.api_key.assert_called_once_with(
+        challenge_id="mock-challenge"
+    )
+    assert len(mock_lametric.notify.mock_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "error"),
+    [
+        (LaMetricUnsupportedError, "button_not_supported"),
+        (LaMetricConnectionError, "cannot_connect"),
+        (LaMetricError, "unknown"),
+        # Like a URL entered as the host, which demetriek refuses.
+        (ValueError, "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry", "mock_lametric")
+async def test_press_button_request_errors(
+    hass: HomeAssistant,
+    mock_lametric_local_auth: MagicMock,
+    side_effect: type[Exception],
+    error: str,
+) -> None:
+    """Test a device that cannot be asked for a button press says why."""
+    mock_lametric_local_auth.request_challenge.side_effect = side_effect
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "press_button"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.1"}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "press_button"
+    assert result["errors"] == {"base": error}
+
+    # Once the problem is gone, the same flow still finishes the setup.
+    mock_lametric_local_auth.request_challenge.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.1"}
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["result"].unique_id == "SA110405124500W00BS9"
+    assert config_flow.LaMetricDevice.call_args.kwargs["api_key"] == (
+        "mock-local-api-key"
+    )
+
+
+@pytest.mark.usefixtures("mock_setup_entry", "mock_lametric")
+async def test_press_button_closed_while_requesting(
+    hass: HomeAssistant,
+    mock_lametric_local_auth: MagicMock,
+) -> None:
+    """Test closing the flow while the device answers does not wait for a press."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "press_button"}
+    )
+    flow_id = result["flow_id"]
+    challenge = mock_lametric_local_auth.request_challenge.return_value
+
+    async def close_flow_while_answering() -> AuthChallenge:
+        hass.config_entries.flow.async_abort(flow_id)
+        return challenge
+
+    mock_lametric_local_auth.request_challenge.side_effect = close_flow_while_answering
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, user_input={CONF_HOST: "127.0.0.1"}
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+
+    mock_lametric_local_auth.challenge.assert_not_called()
+    mock_lametric_local_auth.api_key.assert_not_called()
+
+
+@pytest.mark.usefixtures("mock_setup_entry", "mock_lametric")
+async def test_press_button_not_in_time(
+    hass: HomeAssistant,
+    mock_lametric_local_auth: MagicMock,
+) -> None:
+    """Test the button not pressed in time offers to try again."""
+    mock_lametric_local_auth.challenge.return_value = AuthChallenge(
+        challenge_id="mock-challenge", duration=60, state="expired"
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "press_button"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.1"}
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "press_button_timeout"
+    mock_lametric_local_auth.api_key.assert_not_called()
+
+    # Trying again asks the same device for a button press right away.
+    mock_lametric_local_auth.challenge.return_value = AuthChallenge(
+        challenge_id="mock-challenge", duration=60, state="resolved"
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
+
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    assert result["step_id"] == "press_button_wait"
+    assert mock_lametric_local_auth.request_challenge.call_count == 2
+
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["result"].unique_id == "SA110405124500W00BS9"
+    assert config_flow.LaMetricDevice.call_args.kwargs["api_key"] == (
+        "mock-local-api-key"
+    )
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "error"),
+    [
+        (LaMetricConnectionError, "cannot_connect"),
+        (LaMetricError, "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry", "mock_lametric")
+async def test_press_button_api_key_errors(
+    hass: HomeAssistant,
+    mock_lametric_local_auth: MagicMock,
+    side_effect: type[Exception],
+    error: str,
+) -> None:
+    """Test an error getting the API key after the press returns to the form."""
+    mock_lametric_local_auth.api_key.side_effect = side_effect
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "press_button"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.1"}
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "press_button"
+    assert result["errors"] == {"base": error}
+
+    # Once the problem is gone, the same flow still finishes the setup.
+    mock_lametric_local_auth.api_key.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.1"}
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["result"].unique_id == "SA110405124500W00BS9"
+    assert config_flow.LaMetricDevice.call_args.kwargs["api_key"] == (
+        "mock-local-api-key"
+    )
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "error"),
+    [
+        (LaMetricConnectionError, "cannot_connect"),
+        (RuntimeError, "unknown"),
+    ],
+)
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_press_button_setup_errors(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_lametric_local_auth: MagicMock,
+    side_effect: type[Exception],
+    error: str,
+) -> None:
+    """Test an error setting up the device with its key returns to the form."""
+    mock_lametric.device.side_effect = side_effect
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "press_button"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.1"}
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "press_button"
+    assert result["errors"] == {"base": error}
+
+    # Once the problem is gone, the same flow still finishes the setup.
+    mock_lametric.device.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.1"}
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["result"].unique_id == "SA110405124500W00BS9"
+    assert config_flow.LaMetricDevice.call_args.kwargs["api_key"] == (
+        "mock-local-api-key"
+    )
+
+
+@pytest.mark.usefixtures("mock_setup_entry", "mock_lametric")
+async def test_press_button_discovered(
+    hass: HomeAssistant,
+    mock_lametric_local_auth: MagicMock,
+) -> None:
+    """Test a discovered device with the button press goes straight to it."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_SSDP}, data=SSDP_DISCOVERY_INFO
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "press_button"
+    schema = result["data_schema"].schema
+    host_key = next(key for key in schema if key == CONF_HOST)
+    assert host_key.description == {"suggested_value": "127.0.0.1"}
+
+    # Checking for the button press is no reason to ask for one.
+    mock_lametric_local_auth.request_challenge.assert_not_called()
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.1"}
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["result"].unique_id == "SA110405124500W00BS9"
+    assert config_flow.LaMetricDevice.call_args.kwargs["api_key"] == (
+        "mock-local-api-key"
+    )
+
+
+@pytest.mark.parametrize(
+    ("supported", "menu_options"),
+    [
+        ({"return_value": False}, ["pick_implementation", "manual_entry"]),
+        (
+            {"side_effect": LaMetricConnectionError},
+            ["press_button", "pick_implementation", "manual_entry"],
+        ),
+    ],
+    ids=["not_supported", "cannot_tell"],
+)
+@pytest.mark.usefixtures("mock_setup_entry", "mock_lametric")
+async def test_press_button_discovered_menu(
+    hass: HomeAssistant,
+    mock_lametric_local_auth: MagicMock,
+    supported: dict[str, Any],
+    menu_options: list[str],
+) -> None:
+    """Test a discovered device only offers the button press when it can."""
+    mock_lametric_local_auth.supported.configure_mock(**supported)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_SSDP}, data=SSDP_DISCOVERY_INFO
+    )
+
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "choice_enter_manual_or_fetch_cloud"
+    assert result["menu_options"] == menu_options
+
+
+@pytest.mark.usefixtures("mock_setup_entry")
+async def test_reauth_press_button(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_lametric_local_auth: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reauthenticating with a press on the button."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "press_button"
+
+    schema = result["data_schema"].schema
+    host_key = next(key for key in schema if key == CONF_HOST)
+    assert host_key.description == {"suggested_value": "127.0.0.2"}
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.2"}
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert config_flow.LaMetricDevice.call_args.kwargs["api_key"] == (
+        "mock-local-api-key"
+    )
+
+
+@pytest.mark.usefixtures(
+    "mock_setup_entry", "mock_lametric", "mock_lametric_local_auth"
+)
+async def test_press_button_existing_device(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test pressing the button for a device that is set up already."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={"next_step_id": "press_button"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.1"}
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+
+
+@pytest.mark.usefixtures("mock_setup_entry", "mock_lametric_local_auth")
+async def test_reauth_press_button_other_device(
+    hass: HomeAssistant,
+    mock_lametric: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reauthenticating against another device is refused.
+
+    The host can be changed when pressing the button, so it could point at
+    another LaMetric device than the one set up.
+    """
+    mock_config_entry.add_to_hass(hass)
+    mock_lametric.device.return_value.serial_number = "SA000000000000000000"
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "press_button"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "127.0.0.42"}
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unique_id_mismatch"
+    assert mock_config_entry.data[CONF_HOST] == "127.0.0.2"
+    assert mock_config_entry.data[CONF_API_KEY] == "mock-from-fixture"
+    mock_lametric.notify.assert_not_called()

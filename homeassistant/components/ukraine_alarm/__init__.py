@@ -1,0 +1,95 @@
+"""The ukraine_alarm component."""
+
+import logging
+from typing import TYPE_CHECKING
+
+import aiohttp
+from uasiren.client import Client
+
+from homeassistant.const import CONF_NAME, CONF_REGION
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from .const import DOMAIN, PLATFORMS
+from .coordinator import UkraineAlarmConfigEntry, UkraineAlarmDataUpdateCoordinator
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, entry: UkraineAlarmConfigEntry
+) -> None:
+    """Set up Ukraine Alarm as config entry."""
+    websession = async_get_clientsession(hass)
+
+    coordinator = UkraineAlarmDataUpdateCoordinator(hass, entry, websession)
+    await coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = coordinator
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, entry: UkraineAlarmConfigEntry
+) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: UkraineAlarmConfigEntry
+) -> None:
+    """Migrate old entry."""
+    _LOGGER.debug("Migrating from version %s", config_entry.version)
+
+    if config_entry.version == 1:
+        # Version 1 had states as first-class selections
+        # Version 2 only allows states w/o districts, districts and communities
+        region_id = config_entry.data[CONF_REGION]
+
+        websession = async_get_clientsession(hass)
+        try:
+            regions_data = await Client(websession).get_regions()
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+            ) from err
+
+        if TYPE_CHECKING:
+            assert isinstance(regions_data, dict)
+
+        state_with_districts = None
+        for state in regions_data["states"]:
+            if state["regionId"] == region_id and state.get("regionChildIds"):
+                state_with_districts = state
+                break
+
+        if state_with_districts:
+            ir.async_create_issue(
+                hass,
+                DOMAIN,
+                f"deprecated_state_region_{config_entry.entry_id}",
+                config_entry_id=config_entry.entry_id,
+                is_fixable=False,
+                issue_domain=DOMAIN,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key="deprecated_state_region",
+                translation_placeholders={
+                    "region_name": config_entry.data.get(CONF_NAME, region_id),
+                },
+            )
+
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="deprecated_state_region",
+                translation_placeholders={
+                    "region_name": config_entry.data.get(CONF_NAME, region_id),
+                },
+            )
+
+        hass.config_entries.async_update_entry(config_entry, version=2)
+        _LOGGER.info("Migration to version %s successful", 2)

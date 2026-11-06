@@ -1,238 +1,244 @@
-"""
-Support for RainMachine devices.
+"""Support for RainMachine devices."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/rainmachine/
-"""
-import logging
+from dataclasses import dataclass
 from datetime import timedelta
+from functools import partial
+from typing import Any
 
-import voluptuous as vol
+from regenmaschine import Client
+from regenmaschine.controller import Controller
+from regenmaschine.errors import RainMachineError, UnknownAPICallError
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    ATTR_ATTRIBUTION, CONF_BINARY_SENSORS, CONF_IP_ADDRESS, CONF_PASSWORD,
-    CONF_PORT, CONF_SCAN_INTERVAL, CONF_SENSORS, CONF_SSL,
-    CONF_MONITORED_CONDITIONS, CONF_SWITCHES)
+    CONF_IP_ADDRESS,
+    CONF_PASSWORD,
+    CONF_PORT,
+    CONF_SSL,
+    Platform,
+)
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import (
-    aiohttp_client, config_validation as cv, discovery)
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.event import async_track_time_interval
+    aiohttp_client,
+    config_validation as cv,
+    entity_registry as er,
+)
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.util.network import is_ip_address
 
-REQUIREMENTS = ['regenmaschine==1.0.2']
+from .const import (
+    CONF_ALLOW_INACTIVE_ZONES_TO_RUN,
+    CONF_DEFAULT_ZONE_RUN_TIME,
+    CONF_USE_APP_RUN_TIMES,
+    DATA_API_VERSIONS,
+    DATA_MACHINE_FIRMWARE_UPDATE_STATUS,
+    DATA_PROGRAMS,
+    DATA_PROVISION_SETTINGS,
+    DATA_RESTRICTIONS_CURRENT,
+    DATA_RESTRICTIONS_UNIVERSAL,
+    DATA_ZONES,
+    DEFAULT_ZONE_RUN,
+    DOMAIN,
+    LOGGER,
+)
+from .coordinator import RainMachineDataUpdateCoordinator
+from .services import async_setup_services
+from .util import get_client_controller
 
-_LOGGER = logging.getLogger(__name__)
-
-DATA_RAINMACHINE = 'data_rainmachine'
-DOMAIN = 'rainmachine'
-
-NOTIFICATION_ID = 'rainmachine_notification'
-NOTIFICATION_TITLE = 'RainMachine Component Setup'
-
-PROGRAM_UPDATE_TOPIC = '{0}_program_update'.format(DOMAIN)
-SENSOR_UPDATE_TOPIC = '{0}_data_update'.format(DOMAIN)
-ZONE_UPDATE_TOPIC = '{0}_zone_update'.format(DOMAIN)
-
-CONF_PROGRAM_ID = 'program_id'
-CONF_ZONE_ID = 'zone_id'
-CONF_ZONE_RUN_TIME = 'zone_run_time'
-
-DEFAULT_ATTRIBUTION = 'Data provided by Green Electronics LLC'
-DEFAULT_ICON = 'mdi:water'
-DEFAULT_PORT = 8080
-DEFAULT_SCAN_INTERVAL = timedelta(seconds=60)
 DEFAULT_SSL = True
-DEFAULT_ZONE_RUN = 60 * 10
 
-TYPE_FREEZE = 'freeze'
-TYPE_FREEZE_PROTECTION = 'freeze_protection'
-TYPE_FREEZE_TEMP = 'freeze_protect_temp'
-TYPE_HOT_DAYS = 'extra_water_on_hot_days'
-TYPE_HOURLY = 'hourly'
-TYPE_MONTH = 'month'
-TYPE_RAINDELAY = 'raindelay'
-TYPE_RAINSENSOR = 'rainsensor'
-TYPE_WEEKDAY = 'weekday'
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.UPDATE,
+]
 
-BINARY_SENSORS = {
-    TYPE_FREEZE: ('Freeze Restrictions', 'mdi:cancel'),
-    TYPE_FREEZE_PROTECTION: ('Freeze Protection', 'mdi:weather-snowy'),
-    TYPE_HOT_DAYS: ('Extra Water on Hot Days', 'mdi:thermometer-lines'),
-    TYPE_HOURLY: ('Hourly Restrictions', 'mdi:cancel'),
-    TYPE_MONTH: ('Month Restrictions', 'mdi:cancel'),
-    TYPE_RAINDELAY: ('Rain Delay Restrictions', 'mdi:cancel'),
-    TYPE_RAINSENSOR: ('Rain Sensor Restrictions', 'mdi:cancel'),
-    TYPE_WEEKDAY: ('Weekday Restrictions', 'mdi:cancel'),
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+COORDINATOR_UPDATE_INTERVAL_MAP = {
+    DATA_API_VERSIONS: timedelta(minutes=1),
+    DATA_MACHINE_FIRMWARE_UPDATE_STATUS: timedelta(seconds=15),
+    DATA_PROGRAMS: timedelta(seconds=30),
+    DATA_PROVISION_SETTINGS: timedelta(minutes=1),
+    DATA_RESTRICTIONS_CURRENT: timedelta(minutes=1),
+    DATA_RESTRICTIONS_UNIVERSAL: timedelta(minutes=1),
+    DATA_ZONES: timedelta(seconds=15),
 }
 
-SENSORS = {
-    TYPE_FREEZE_TEMP: ('Freeze Protect Temperature', 'mdi:thermometer', '°C'),
-}
 
-BINARY_SENSOR_SCHEMA = vol.Schema({
-    vol.Optional(CONF_MONITORED_CONDITIONS, default=list(BINARY_SENSORS)):
-        vol.All(cv.ensure_list, [vol.In(BINARY_SENSORS)])
-})
-
-SENSOR_SCHEMA = vol.Schema({
-    vol.Optional(CONF_MONITORED_CONDITIONS, default=list(SENSORS)):
-        vol.All(cv.ensure_list, [vol.In(SENSORS)])
-})
-
-SERVICE_START_PROGRAM_SCHEMA = vol.Schema({
-    vol.Required(CONF_PROGRAM_ID): cv.positive_int,
-})
-
-SERVICE_START_ZONE_SCHEMA = vol.Schema({
-    vol.Required(CONF_ZONE_ID): cv.positive_int,
-    vol.Optional(CONF_ZONE_RUN_TIME, default=DEFAULT_ZONE_RUN):
-        cv.positive_int,
-})
-
-SERVICE_STOP_PROGRAM_SCHEMA = vol.Schema({
-    vol.Required(CONF_PROGRAM_ID): cv.positive_int,
-})
-
-SERVICE_STOP_ZONE_SCHEMA = vol.Schema({
-    vol.Required(CONF_ZONE_ID): cv.positive_int,
-})
-
-SWITCH_SCHEMA = vol.Schema({vol.Optional(CONF_ZONE_RUN_TIME): cv.positive_int})
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN:
-        vol.Schema({
-            vol.Required(CONF_IP_ADDRESS): cv.string,
-            vol.Required(CONF_PASSWORD): cv.string,
-            vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-            vol.Optional(CONF_SSL, default=DEFAULT_SSL): cv.boolean,
-            vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL):
-                cv.time_period,
-            vol.Optional(CONF_BINARY_SENSORS, default={}):
-                BINARY_SENSOR_SCHEMA,
-            vol.Optional(CONF_SENSORS, default={}): SENSOR_SCHEMA,
-            vol.Optional(CONF_SWITCHES, default={}): SWITCH_SCHEMA,
-        })
-    },
-    extra=vol.ALLOW_EXTRA)
+type RainMachineConfigEntry = ConfigEntry[RainMachineData]
 
 
-async def async_setup(hass, config):
-    """Set up the RainMachine component."""
-    from regenmaschine import Client
-    from regenmaschine.errors import RequestError
+@dataclass
+class RainMachineData:
+    """Define an object to be stored in `entry.runtime_data`."""
 
-    conf = config[DOMAIN]
-    ip_address = conf[CONF_IP_ADDRESS]
-    password = conf[CONF_PASSWORD]
-    port = conf[CONF_PORT]
-    ssl = conf[CONF_SSL]
+    controller: Controller
+    coordinators: dict[str, RainMachineDataUpdateCoordinator]
 
-    try:
-        websession = aiohttp_client.async_get_clientsession(hass)
-        client = Client(ip_address, websession, port=port, ssl=ssl)
-        await client.authenticate(password)
-        rainmachine = RainMachine(client)
-        await rainmachine.async_update()
-        hass.data[DATA_RAINMACHINE] = rainmachine
-    except RequestError as err:
-        _LOGGER.error('An error occurred: %s', str(err))
-        hass.components.persistent_notification.create(
-            'Error: {0}<br />'
-            'You will need to restart hass after fixing.'
-            ''.format(err),
-            title=NOTIFICATION_TITLE,
-            notification_id=NOTIFICATION_ID)
-        return False
 
-    for component, schema in [
-            ('binary_sensor', conf[CONF_BINARY_SENSORS]),
-            ('sensor', conf[CONF_SENSORS]),
-            ('switch', conf[CONF_SWITCHES]),
-    ]:
-        hass.async_create_task(
-            discovery.async_load_platform(hass, component, DOMAIN, schema,
-                                          config))
-
-    async def refresh_sensors(event_time):
-        """Refresh RainMachine sensor data."""
-        _LOGGER.debug('Updating RainMachine sensor data')
-        await rainmachine.async_update()
-        async_dispatcher_send(hass, SENSOR_UPDATE_TOPIC)
-
-    async_track_time_interval(hass, refresh_sensors, conf[CONF_SCAN_INTERVAL])
-
-    async def start_program(service):
-        """Start a particular program."""
-        await rainmachine.client.programs.start(service.data[CONF_PROGRAM_ID])
-        async_dispatcher_send(hass, PROGRAM_UPDATE_TOPIC)
-
-    async def start_zone(service):
-        """Start a particular zone for a certain amount of time."""
-        await rainmachine.client.zones.start(service.data[CONF_ZONE_ID],
-                                             service.data[CONF_ZONE_RUN_TIME])
-        async_dispatcher_send(hass, ZONE_UPDATE_TOPIC)
-
-    async def stop_all(service):
-        """Stop all watering."""
-        await rainmachine.client.watering.stop_all()
-        async_dispatcher_send(hass, PROGRAM_UPDATE_TOPIC)
-
-    async def stop_program(service):
-        """Stop a program."""
-        await rainmachine.client.programs.stop(service.data[CONF_PROGRAM_ID])
-        async_dispatcher_send(hass, PROGRAM_UPDATE_TOPIC)
-
-    async def stop_zone(service):
-        """Stop a zone."""
-        await rainmachine.client.zones.stop(service.data[CONF_ZONE_ID])
-        async_dispatcher_send(hass, ZONE_UPDATE_TOPIC)
-
-    for service, method, schema in [
-            ('start_program', start_program, SERVICE_START_PROGRAM_SCHEMA),
-            ('start_zone', start_zone, SERVICE_START_ZONE_SCHEMA),
-            ('stop_all', stop_all, {}),
-            ('stop_program', stop_program, SERVICE_STOP_PROGRAM_SCHEMA),
-            ('stop_zone', stop_zone, SERVICE_STOP_ZONE_SCHEMA)
-    ]:
-        hass.services.async_register(DOMAIN, service, method, schema=schema)
-
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up RainMachine."""
+    async_setup_services(hass)
     return True
 
 
-class RainMachine:
-    """Define a generic RainMachine object."""
+async def async_setup_entry(hass: HomeAssistant, entry: RainMachineConfigEntry) -> None:
+    """Set up RainMachine as config entry."""
+    websession = aiohttp_client.async_get_clientsession(hass)
+    client = Client(session=websession)
+    ip_address = entry.data[CONF_IP_ADDRESS]
 
-    def __init__(self, client):
-        """Initialize."""
-        self.client = client
-        self.device_mac = self.client.mac
-        self.restrictions = {}
+    try:
+        await client.load_local(
+            ip_address,
+            entry.data[CONF_PASSWORD],
+            port=entry.data[CONF_PORT],
+            use_ssl=entry.data.get(CONF_SSL, DEFAULT_SSL),
+        )
+    except RainMachineError as err:
+        raise ConfigEntryNotReady from err
 
-    async def async_update(self):
-        """Update sensor/binary sensor data."""
-        self.restrictions.update({
-            'current': await self.client.restrictions.current(),
-            'global': await self.client.restrictions.universal()
-        })
+    # regenmaschine can load multiple controllers at once, but we only grab the one
+    # we loaded above:
+    controller = get_client_controller(client)
+
+    entry_updates: dict[str, Any] = {}
+    if not entry.unique_id or is_ip_address(entry.unique_id):
+        # If the config entry doesn't already have a unique ID, set one:
+        entry_updates["unique_id"] = controller.mac
+
+    if CONF_DEFAULT_ZONE_RUN_TIME in entry.data:
+        # If a zone run time exists in the config entry's data, pop it and move it to
+        # options:
+        data = {**entry.data}
+        entry_updates["data"] = data
+        entry_updates["options"] = {
+            **entry.options,
+            CONF_DEFAULT_ZONE_RUN_TIME: data.pop(CONF_DEFAULT_ZONE_RUN_TIME),
+        }
+    entry_updates["options"] = {**entry.options}
+    if CONF_USE_APP_RUN_TIMES not in entry.options:
+        entry_updates["options"][CONF_USE_APP_RUN_TIMES] = False
+    if CONF_DEFAULT_ZONE_RUN_TIME not in entry.options:
+        entry_updates["options"][CONF_DEFAULT_ZONE_RUN_TIME] = DEFAULT_ZONE_RUN
+    if CONF_ALLOW_INACTIVE_ZONES_TO_RUN not in entry.options:
+        entry_updates["options"][CONF_ALLOW_INACTIVE_ZONES_TO_RUN] = False
+    if entry_updates:
+        hass.config_entries.async_update_entry(entry, **entry_updates)
+
+    if entry.unique_id and controller.mac != entry.unique_id:
+        # If the mac address of the device does not match the unique_id
+        # of the config entry, it likely means the DHCP lease has expired
+        # and the device has been assigned a new IP address. We need to
+        # wait for the next discovery to find the device at its new address
+        # and update the config entry so we do not mix up devices.
+        raise ConfigEntryNotReady(
+            f"Unexpected device found at {ip_address}; expected {entry.unique_id}, "
+            f"found {controller.mac}"
+        )
+
+    async def async_update(api_category: str) -> dict:
+        """Update the appropriate API data based on a category."""
+        data: dict = {}
+
+        try:
+            if api_category == DATA_API_VERSIONS:
+                data = await controller.api.versions()
+            elif api_category == DATA_MACHINE_FIRMWARE_UPDATE_STATUS:
+                data = await controller.machine.get_firmware_update_status()
+            elif api_category == DATA_PROGRAMS:
+                data = await controller.programs.all(include_inactive=True)
+            elif api_category == DATA_PROVISION_SETTINGS:
+                data = await controller.provisioning.settings()
+            elif api_category == DATA_RESTRICTIONS_CURRENT:
+                data = await controller.restrictions.current()
+            elif api_category == DATA_RESTRICTIONS_UNIVERSAL:
+                data = await controller.restrictions.universal()
+            else:
+                data = await controller.zones.all(details=True, include_inactive=True)
+        except UnknownAPICallError:
+            LOGGER.warning(
+                "Skipping unsupported API call for controller %s: %s",
+                controller.name,
+                api_category,
+            )
+        except RainMachineError as err:
+            raise UpdateFailed(err) from err
+
+        return data
+
+    coordinators = {}
+    for api_category, update_interval in COORDINATOR_UPDATE_INTERVAL_MAP.items():
+        coordinator = coordinators[api_category] = RainMachineDataUpdateCoordinator(
+            hass,
+            entry=entry,
+            name=f'{controller.name} ("{api_category}")',
+            api_category=api_category,
+            update_interval=update_interval,
+            update_method=partial(async_update, api_category),
+        )
+        coordinator.async_initialize()
+        # Its generally faster not to gather here so we can
+        # reuse the connection instead of creating a new
+        # connection for each coordinator.
+        await coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = RainMachineData(
+        controller=controller, coordinators=coordinators
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
 
-class RainMachineEntity(Entity):
-    """Define a generic RainMachine entity."""
+async def async_unload_entry(
+    hass: HomeAssistant, entry: RainMachineConfigEntry
+) -> None:
+    """Unload an RainMachine config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
-    def __init__(self, rainmachine):
-        """Initialize."""
-        self._attrs = {ATTR_ATTRIBUTION: DEFAULT_ATTRIBUTION}
-        self._name = None
-        self.rainmachine = rainmachine
 
-    @property
-    def device_state_attributes(self) -> dict:
-        """Return the state attributes."""
-        return self._attrs
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: RainMachineConfigEntry
+) -> None:
+    """Migrate an old config entry."""
+    version = entry.version
 
-    @property
-    def name(self) -> str:
-        """Return the name of the entity."""
-        return self._name
+    LOGGER.debug("Migrating from version %s", version)
+
+    # 1 -> 2: Update unique IDs to be consistent across platform (including removing
+    # the silly removal of colons in the MAC address that was added originally):
+    if version == 1:
+        version = 2
+        hass.config_entries.async_update_entry(entry, version=version)
+
+        @callback
+        def migrate_unique_id(entity_entry: er.RegistryEntry) -> dict[str, Any]:
+            """Migrate the unique ID to a new format."""
+            unique_id_pieces = entity_entry.unique_id.split("_")
+            old_mac = unique_id_pieces[0]
+            new_mac = ":".join(old_mac[i : i + 2] for i in range(0, len(old_mac), 2))
+            unique_id_pieces[0] = new_mac
+
+            if entity_entry.entity_id.startswith("switch"):
+                unique_id_pieces[1] = unique_id_pieces[1][11:].lower()
+
+            return {"new_unique_id": "_".join(unique_id_pieces)}
+
+        await er.async_migrate_entries(hass, entry.entry_id, migrate_unique_id)
+
+    LOGGER.debug("Migration to version %s successful", version)
+
+
+async def async_reload_entry(
+    hass: HomeAssistant, entry: RainMachineConfigEntry
+) -> None:
+    """Handle an options update."""
+    await hass.config_entries.async_reload(entry.entry_id)

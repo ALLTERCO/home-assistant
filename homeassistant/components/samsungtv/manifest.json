@@ -1,0 +1,70 @@
+{
+  "domain": "samsungtv",
+  "name": "Samsung Smart TV",
+  "categories": ["media_entertainment.tv_streaming"],
+  "codeowners": ["@chemelli74"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dependencies": ["ssdp"],
+  "dhcp": [
+    {
+      "registered_devices": true
+    },
+    {
+      "hostname": "tizen*"
+    },
+    {
+      "macaddress": "4844F7*"
+    },
+    {
+      "macaddress": "606BBD*"
+    },
+    {
+      "macaddress": "641CB0*"
+    },
+    {
+      "macaddress": "8CC8CD*"
+    },
+    {
+      "macaddress": "8CEA48*"
+    },
+    {
+      "macaddress": "F47B5E*"
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/samsungtv",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "loggers": ["samsungctl", "samsungtvws"],
+  "quality_scale": "gold",
+  "requirements": [
+    "getmac==0.9.6",
+    "samsungctl[websocket]==0.7.1",
+    "samsungtvws[async,encrypted]==3.0.7",
+    "async-upnp-client==0.49.0"
+  ],
+  "ssdp": [
+    {
+      "st": "urn:samsung.com:device:RemoteControlReceiver:1"
+    },
+    {
+      "st": "urn:samsung.com:service:MainTVAgent2:1"
+    },
+    {
+      "manufacturer": "Samsung",
+      "st": "urn:schemas-upnp-org:service:RenderingControl:1"
+    },
+    {
+      "manufacturer": "Samsung Electronics",
+      "st": "urn:schemas-upnp-org:service:RenderingControl:1"
+    }
+  ],
+  "zeroconf": [
+    {
+      "properties": {
+        "manufacturer": "samsung*"
+      },
+      "type": "_airplay._tcp.local."
+    }
+  ]
+}

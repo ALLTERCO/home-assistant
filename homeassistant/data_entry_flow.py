@@ -1,20 +1,118 @@
 """Classes to help gather user submissions."""
+
+import abc
+import asyncio
+from collections import defaultdict
+from collections.abc import Callable, Container, Hashable, Iterable, Mapping
+from contextlib import suppress
+import copy
+from dataclasses import dataclass
+from enum import StrEnum
 import logging
-from typing import Dict, Any, Callable, Hashable, List, Optional  # noqa pylint: disable=unused-import
-import uuid
-import voluptuous as vol
-from .core import callback, HomeAssistant
+from types import MappingProxyType
+import typing
+from typing import Any, Generic, TypedDict, TypeVar, cast
+
+import probatio
+
+from .core import HomeAssistant, callback
 from .exceptions import HomeAssistantError
+from .helpers.deprecation import deprecated_function
+from .helpers.field_visibility import VISIBLE_SCHEMA, FieldCondition, get_hidden_fields
+from .helpers.frame import ReportBehavior, report_usage
+from .loader import async_suggest_report_issue
+from .util import uuid as uuid_util
 
 _LOGGER = logging.getLogger(__name__)
 
-RESULT_TYPE_FORM = 'form'
-RESULT_TYPE_CREATE_ENTRY = 'create_entry'
-RESULT_TYPE_ABORT = 'abort'
+
+class FlowResultType(StrEnum):
+    """Result type for a data entry flow."""
+
+    FORM = "form"
+    CREATE_ENTRY = "create_entry"
+    ABORT = "abort"
+    EXTERNAL_STEP = "external"
+    EXTERNAL_STEP_DONE = "external_done"
+    SHOW_PROGRESS = "progress"
+    SHOW_PROGRESS_DONE = "progress_done"
+    MENU = "menu"
+
+
+# Event that is fired when a flow is progressed via external or progress source.
+EVENT_DATA_ENTRY_FLOW_PROGRESSED = "data_entry_flow_progressed"
+EVENT_DATA_ENTRY_FLOW_PROGRESS_UPDATE = "data_entry_flow_progress_update"
+
+FLOW_NOT_COMPLETE_STEPS = {
+    FlowResultType.FORM,
+    FlowResultType.EXTERNAL_STEP,
+    FlowResultType.EXTERNAL_STEP_DONE,
+    FlowResultType.SHOW_PROGRESS,
+    FlowResultType.SHOW_PROGRESS_DONE,
+    FlowResultType.MENU,
+}
+
+
+STEP_ID_OPTIONAL_STEPS = {
+    FlowResultType.EXTERNAL_STEP,
+    FlowResultType.FORM,
+    FlowResultType.MENU,
+    FlowResultType.SHOW_PROGRESS,
+}
+
+
+class Required(probatio.Required):
+    """Required schema marker that can be conditionally shown.
+
+    Unless the ``visible`` condition matches the other fields, the field is not
+    rendered, is treated as optional, and its value is omitted from the
+    submitted data. A list of conditions is combined with AND.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        visible: bool | FieldCondition | list[FieldCondition] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize a required marker."""
+        super().__init__(*args, **kwargs)
+        self.visible = None if visible is None else VISIBLE_SCHEMA(visible)
+
+
+class Optional(probatio.Optional):
+    """Optional schema marker that can be conditionally shown.
+
+    Unless the ``visible`` condition matches the other fields, the field is not
+    rendered and its value is omitted from the submitted data. A list of
+    conditions is combined with AND.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        visible: bool | FieldCondition | list[FieldCondition] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize an optional marker."""
+        super().__init__(*args, **kwargs)
+        self.visible = None if visible is None else VISIBLE_SCHEMA(visible)
+
+
+_FlowContextT = TypeVar("_FlowContextT", bound="FlowContext", default="FlowContext")
+_FlowResultT = TypeVar(
+    "_FlowResultT", bound="FlowResult[Any, Any]", default="FlowResult"
+)
+_HandlerT = TypeVar("_HandlerT", default=str)
+
+
+@dataclass(slots=True)
+class BaseServiceInfo:
+    """Base class for discovery ServiceInfo."""
 
 
 class FlowError(HomeAssistantError):
-    """Error while configuring an account."""
+    """Base class for data entry errors."""
 
 
 class UnknownHandler(FlowError):
@@ -22,159 +120,1007 @@ class UnknownHandler(FlowError):
 
 
 class UnknownFlow(FlowError):
-    """Uknown flow specified."""
+    """Unknown flow specified."""
 
 
 class UnknownStep(FlowError):
     """Unknown step specified."""
 
 
-class FlowManager:
+class InvalidData(probatio.Invalid):
+    """Invalid data provided."""
+
+    def __init__(
+        self,
+        message: str,
+        path: list[Hashable] | None,
+        error_message: str | None,
+        schema_errors: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        """Initialize an invalid data exception."""
+        super().__init__(message, path, error_message, **kwargs)
+        self.schema_errors = schema_errors
+
+
+class AbortFlow(FlowError):
+    """Exception to indicate a flow needs to be aborted."""
+
+    def __init__(
+        self,
+        reason: str,
+        description_placeholders: Mapping[str, str] | None = None,
+        *,
+        translation_domain: str | None = None,
+    ) -> None:
+        """Initialize an abort flow exception."""
+        super().__init__(f"Flow aborted: {reason}")
+        self.reason = reason
+        self.description_placeholders = description_placeholders
+        self.translation_domain = translation_domain
+
+
+class FlowContext(TypedDict, total=False):
+    """Typed context dict."""
+
+    source: str
+
+
+class FlowResult(TypedDict, Generic[_FlowContextT, _HandlerT], total=False):
+    """Typed result dict."""
+
+    context: _FlowContextT
+    data_schema: probatio.Schema | None
+    data: Mapping[str, Any]
+    description_placeholders: Mapping[str, str] | None
+    description: str | None
+    errors: dict[str, str] | None
+    extra: str
+    flow_id: typing.Required[str]
+    handler: typing.Required[_HandlerT]
+    last_step: bool | None
+    menu_options: Container[str]
+    preview: str | None
+    progress_action: str
+    progress_task: asyncio.Task[Any] | None
+    reason: str
+    required: bool
+    sort: bool
+    step_id: str
+    title: str
+    translation_domain: str
+    type: FlowResultType
+    url: str
+
+
+def _map_error_to_schema_errors(
+    schema_errors: dict[str, Any],
+    error: probatio.Invalid,
+    data_schema: probatio.Schema,
+) -> None:
+    """Map an error to the correct position in the schema_errors.
+
+    Raises ValueError if the error path could not be found in the schema.
+    Limitation: Nested schemas are not supported and a ValueError will be raised.
+    """
+    schema = data_schema.schema
+    error_path = error.path
+    if not error_path or (path_part := error_path[0]) not in schema:
+        raise ValueError("Could not find path in schema")
+
+    if len(error_path) > 1:
+        raise ValueError("Nested schemas are not supported")
+
+    # path_part can also be probatio.Marker, but we need a string key
+    path_part_str = str(path_part)
+    schema_errors[path_part_str] = error.error_message
+
+
+class FlowManager(abc.ABC, Generic[_FlowContextT, _FlowResultT, _HandlerT]):
     """Manage all the flows that are in progress."""
 
-    def __init__(self, hass: HomeAssistant, async_create_flow: Callable,
-                 async_finish_flow: Callable) -> None:
+    _flow_result: type[_FlowResultT] = FlowResult  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+    ) -> None:
         """Initialize the flow manager."""
         self.hass = hass
-        self._progress = {}  # type: Dict[str, Any]
-        self._async_create_flow = async_create_flow
-        self._async_finish_flow = async_finish_flow
+        self._preview: set[_HandlerT] = set()
+        self._progress: dict[
+            str, FlowHandler[_FlowContextT, _FlowResultT, _HandlerT]
+        ] = {}
+        self._handler_progress_index: defaultdict[
+            _HandlerT, set[FlowHandler[_FlowContextT, _FlowResultT, _HandlerT]]
+        ] = defaultdict(set)
+        self._init_data_process_index: defaultdict[
+            type, set[FlowHandler[_FlowContextT, _FlowResultT, _HandlerT]]
+        ] = defaultdict(set)
+
+    @abc.abstractmethod
+    async def async_create_flow(
+        self,
+        handler_key: _HandlerT,
+        *,
+        context: _FlowContextT | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> FlowHandler[_FlowContextT, _FlowResultT, _HandlerT]:
+        """Create a flow for specified handler.
+
+        Handler key is the domain of the component that we want to set up.
+        """
 
     @callback
-    def async_progress(self) -> List[Dict]:
-        """Return the flows in progress."""
-        return [{
-            'flow_id': flow.flow_id,
-            'handler': flow.handler,
-            'context': flow.context,
-        } for flow in self._progress.values()]
+    def async_flow_removed(
+        self,
+        flow: FlowHandler[_FlowContextT, _FlowResultT, _HandlerT],
+    ) -> None:
+        """Handle a removed data entry flow."""
 
-    async def async_init(self, handler: Hashable, *,
-                         context: Optional[Dict] = None,
-                         data: Any = None) -> Any:
-        """Start a configuration flow."""
-        flow = await self._async_create_flow(
-            handler, context=context, data=data)
+    @abc.abstractmethod
+    async def async_finish_flow(
+        self,
+        flow: FlowHandler[_FlowContextT, _FlowResultT, _HandlerT],
+        result: _FlowResultT,
+    ) -> _FlowResultT:
+        """Finish a data entry flow.
+
+        This method is called when a flow step returns FlowResultType.ABORT or
+        FlowResultType.CREATE_ENTRY.
+        """
+
+    @callback
+    def async_get(self, flow_id: str) -> _FlowResultT:
+        """Return a flow in progress as a partial FlowResult."""
+        if (flow := self._progress.get(flow_id)) is None:
+            raise UnknownFlow
+        return self._async_flow_handler_to_flow_result([flow], False)[0]
+
+    @callback
+    def async_progress(self, include_uninitialized: bool = False) -> list[_FlowResultT]:
+        """Return the flows in progress as a partial FlowResult."""
+        return self._async_flow_handler_to_flow_result(
+            self._progress.values(), include_uninitialized
+        )
+
+    @callback
+    def async_progress_by_handler(
+        self,
+        handler: _HandlerT,
+        include_uninitialized: bool = False,
+        match_context: dict[str, Any] | None = None,
+    ) -> list[_FlowResultT]:
+        """Return the flows in progress by handler as a partial FlowResult.
+
+        If match_context is specified, only return flows with a context that
+        is a superset of match_context.
+        """
+        return self._async_flow_handler_to_flow_result(
+            self._async_progress_by_handler(handler, match_context),
+            include_uninitialized,
+        )
+
+    @callback
+    def async_progress_by_init_data_type(
+        self,
+        init_data_type: type,
+        matcher: Callable[[Any], bool],
+        include_uninitialized: bool = False,
+    ) -> list[_FlowResultT]:
+        """Return flows in progress matching by data type."""
+        return self._async_flow_handler_to_flow_result(
+            [
+                progress
+                for progress in self._init_data_process_index.get(init_data_type, ())
+                if matcher(progress.init_data)
+            ],
+            include_uninitialized,
+        )
+
+    @callback
+    def _async_progress_by_handler(
+        self, handler: _HandlerT, match_context: dict[str, Any] | None
+    ) -> list[FlowHandler[_FlowContextT, _FlowResultT, _HandlerT]]:
+        """Return the flows in progress by handler.
+
+        If match_context is specified, only return flows with a context that
+        is a superset of match_context.
+        """
+        if not match_context:
+            return list(self._handler_progress_index.get(handler, ()))
+        match_context_items = match_context.items()
+        return [
+            progress
+            for progress in self._handler_progress_index.get(handler, ())
+            if match_context_items <= progress.context.items()
+        ]
+
+    async def async_init(
+        self,
+        handler: _HandlerT,
+        *,
+        context: _FlowContextT | None = None,
+        data: Any = None,
+    ) -> _FlowResultT:
+        """Start a data entry flow."""
+        if context is None:
+            context = cast(_FlowContextT, {})
+        flow = await self.async_create_flow(handler, context=context, data=data)
+        if not flow:
+            raise UnknownFlow("Flow was not created")
         flow.hass = self.hass
         flow.handler = handler
-        flow.flow_id = uuid.uuid4().hex
+        flow.flow_id = uuid_util.random_uuid_hex()
         flow.context = context
-        self._progress[flow.flow_id] = flow
+        flow.init_data = data
+        self._async_add_flow_progress(flow)
 
         return await self._async_handle_step(flow, flow.init_step, data)
 
     async def async_configure(
-            self, flow_id: str, user_input: Optional[Dict] = None) -> Any:
-        """Continue a configuration flow."""
-        flow = self._progress.get(flow_id)
+        self, flow_id: str, user_input: dict | None = None
+    ) -> _FlowResultT:
+        """Continue a data entry flow."""
+        result: _FlowResultT | None = None
 
-        if flow is None:
+        # Workaround for flow handlers which have not been upgraded to pass a show
+        # progress task, needed because of the change to eager tasks in HA Core 2024.5,
+        # can be removed in HA Core 2024.8.
+        flow = self._progress.get(flow_id)
+        if flow and flow.deprecated_show_progress:
+            if (cur_step := flow.cur_step) and cur_step[
+                "type"
+            ] is FlowResultType.SHOW_PROGRESS:
+                # Allow the progress task to finish before we call the flow handler
+                await asyncio.sleep(0)
+
+        while not result or result["type"] is FlowResultType.SHOW_PROGRESS_DONE:
+            result = await self._async_configure(flow_id, user_input)
+            flow = self._progress.get(flow_id)
+            if flow and flow.deprecated_show_progress:
+                break
+        return result
+
+    async def _async_configure(
+        self, flow_id: str, user_input: dict | None = None
+    ) -> _FlowResultT:
+        """Continue a data entry flow."""
+        if (flow := self._progress.get(flow_id)) is None:
             raise UnknownFlow
 
-        step_id, data_schema = flow.cur_step
+        cur_step = flow.cur_step
+        assert cur_step is not None
 
-        if data_schema is not None and user_input is not None:
-            user_input = data_schema(user_input)
+        if (
+            data_schema := cur_step.get("data_schema")
+        ) is not None and user_input is not None:
+            data_schema = cast(probatio.Schema, data_schema)
+            validation_schema, validation_input = _strip_hidden_fields(
+                data_schema, user_input
+            )
+            try:
+                user_input = validation_schema(validation_input)
+            except probatio.Invalid as ex:
+                raised_errors = [ex]
+                if isinstance(ex, probatio.MultipleInvalid):
+                    raised_errors = ex.errors
 
-        return await self._async_handle_step(
-            flow, step_id, user_input)
+                schema_errors: dict[str, Any] = {}
+                for error in raised_errors:
+                    try:
+                        _map_error_to_schema_errors(schema_errors, error, data_schema)
+                    except ValueError:
+                        # If we get here, the path in the exception
+                        # does not exist in the schema.
+                        schema_errors.setdefault("base", []).append(str(error))
+                raise InvalidData(
+                    "Schema validation failed",
+                    path=ex.path,
+                    error_message=ex.error_message,
+                    schema_errors=schema_errors,
+                ) from ex
+
+        # Handle a menu navigation choice
+        if cur_step["type"] is FlowResultType.MENU and user_input:
+            result = await self._async_handle_step(
+                flow, user_input["next_step_id"], None
+            )
+        else:
+            result = await self._async_handle_step(
+                flow, cur_step["step_id"], user_input
+            )
+
+        if cur_step["type"] in (
+            FlowResultType.EXTERNAL_STEP,
+            FlowResultType.SHOW_PROGRESS,
+        ):
+            if cur_step["type"] is FlowResultType.EXTERNAL_STEP and result[
+                "type"
+            ] not in (
+                FlowResultType.EXTERNAL_STEP,
+                FlowResultType.EXTERNAL_STEP_DONE,
+            ):
+                raise ValueError(
+                    "External step can only transition to "
+                    "external step or external step done."
+                )
+            if cur_step["type"] is FlowResultType.SHOW_PROGRESS and result[
+                "type"
+            ] not in (
+                FlowResultType.SHOW_PROGRESS,
+                FlowResultType.SHOW_PROGRESS_DONE,
+            ):
+                raise ValueError(
+                    "Show progress can only transition to show progress or show"
+                    " progress done."
+                )
+
+            # If the result has changed from last result, fire event to update
+            # the frontend. The result is considered to have changed if:
+            # - The step has changed
+            # - The step is same but result type is SHOW_PROGRESS and progress_action
+            #   or description_placeholders has changed
+            if cur_step["step_id"] != result.get("step_id") or (
+                result["type"] is FlowResultType.SHOW_PROGRESS
+                and (
+                    cur_step["progress_action"] != result.get("progress_action")
+                    or cur_step["description_placeholders"]
+                    != result.get("description_placeholders")
+                )
+            ):
+                flow.async_notify_flow_changed()
+
+        return result
 
     @callback
     def async_abort(self, flow_id: str) -> None:
         """Abort a flow."""
-        if self._progress.pop(flow_id, None) is None:
+        self._async_remove_flow_progress(flow_id)
+
+    @callback
+    def _async_add_flow_progress(
+        self, flow: FlowHandler[_FlowContextT, _FlowResultT, _HandlerT]
+    ) -> None:
+        """Add a flow to in progress."""
+        if flow.init_data is not None:
+            self._init_data_process_index[type(flow.init_data)].add(flow)
+        self._progress[flow.flow_id] = flow
+        self._handler_progress_index[flow.handler].add(flow)
+
+    @callback
+    def _async_remove_flow_from_index(
+        self, flow: FlowHandler[_FlowContextT, _FlowResultT, _HandlerT]
+    ) -> None:
+        """Remove a flow from in progress."""
+        if flow.init_data is not None:
+            init_data_type = type(flow.init_data)
+            self._init_data_process_index[init_data_type].remove(flow)
+            if not self._init_data_process_index[init_data_type]:
+                del self._init_data_process_index[init_data_type]
+        handler = flow.handler
+        self._handler_progress_index[handler].remove(flow)
+        if not self._handler_progress_index[handler]:
+            del self._handler_progress_index[handler]
+
+    @callback
+    def _async_remove_flow_progress(self, flow_id: str) -> None:
+        """Remove a flow from in progress."""
+        if (flow := self._progress.pop(flow_id, None)) is None:
             raise UnknownFlow
+        self.async_flow_removed(flow)
+        self._async_remove_flow_from_index(flow)
+        flow.async_cancel_progress_task()
+        try:
+            flow.async_remove()
+        except Exception:
+            _LOGGER.exception("Error removing %s flow", flow.handler)
 
-    async def _async_handle_step(self, flow: Any, step_id: str,
-                                 user_input: Optional[Dict]) -> Dict:
+    def _abort_flow_result(
+        self,
+        flow: FlowHandler[_FlowContextT, _FlowResultT, _HandlerT],
+        err: AbortFlow,
+    ) -> _FlowResultT:
+        """Convert an AbortFlow exception into an abort result."""
+        result = self._flow_result(
+            type=FlowResultType.ABORT,
+            flow_id=flow.flow_id,
+            handler=flow.handler,
+            reason=err.reason,
+            description_placeholders=err.description_placeholders,
+        )
+        if err.translation_domain is not None:
+            result["translation_domain"] = err.translation_domain
+        return result
+
+    async def _async_handle_step(
+        self,
+        flow: FlowHandler[_FlowContextT, _FlowResultT, _HandlerT],
+        step_id: str,
+        user_input: dict | BaseServiceInfo | None,
+    ) -> _FlowResultT:
         """Handle a step of a flow."""
-        method = "async_step_{}".format(step_id)
+        self._raise_if_step_does_not_exist(flow, step_id)
 
-        if not hasattr(flow, method):
-            self._progress.pop(flow.flow_id)
-            raise UnknownStep("Handler {} doesn't support step {}".format(
-                flow.__class__.__name__, step_id))
+        method = f"async_step_{step_id}"
+        try:
+            result: _FlowResultT = await getattr(flow, method)(user_input)
+        except AbortFlow as err:
+            result = self._abort_flow_result(flow, err)
 
-        result = await getattr(flow, method)(user_input)  # type: Dict
+        # Reject before the result is used, a plain string type would bypass the
+        # handling and filtering of results that compare the type by identity
+        if not isinstance(result["type"], FlowResultType):
+            if flow.flow_id in self._progress:  # type: ignore[unreachable]
+                self._async_remove_flow_progress(flow.flow_id)
+            raise TypeError(
+                f"Flow step {step_id} of {flow.handler} returned result type "
+                f"{result['type']!r}, which is not a FlowResultType"
+            )
 
-        if result['type'] not in (RESULT_TYPE_FORM, RESULT_TYPE_CREATE_ENTRY,
-                                  RESULT_TYPE_ABORT):
-            raise ValueError(
-                'Handler returned incorrect type: {}'.format(result['type']))
-
-        if result['type'] == RESULT_TYPE_FORM:
-            flow.cur_step = (result['step_id'], result['data_schema'])
+        if flow.flow_id not in self._progress:
+            # The flow was removed during the step, raise UnknownFlow unless
+            # the result is an abort.
+            if result["type"] is not FlowResultType.ABORT:
+                raise UnknownFlow
             return result
 
-        # We pass a copy of the result because we're mutating our version
-        result = await self._async_finish_flow(flow, dict(result))
+        # Setup the flow handler's preview if needed
+        if result.get("preview") is not None:
+            await self._async_setup_preview(flow)
+
+        if (
+            result["type"] is FlowResultType.SHOW_PROGRESS
+            # Mypy does not agree with using pop on _FlowResultT
+            and (progress_task := result.pop("progress_task", None))  # type: ignore[arg-type]
+            and progress_task != flow.async_get_progress_task()
+        ):
+            # The flow's progress task was changed, register a callback on it
+            async def call_configure() -> None:
+                with suppress(UnknownFlow):
+                    await self._async_configure(flow.flow_id)
+
+            def schedule_configure(_: asyncio.Task) -> None:
+                self.hass.async_create_task(call_configure())
+
+            # The mypy ignores are a consequence of mypy not accepting the pop above
+            progress_task.add_done_callback(schedule_configure)  # type: ignore[attr-defined]
+            flow.async_set_progress_task(progress_task)  # type: ignore[arg-type]
+
+        elif result["type"] is not FlowResultType.SHOW_PROGRESS:
+            flow.async_cancel_progress_task()
+
+        if result["type"] in STEP_ID_OPTIONAL_STEPS:
+            if "step_id" not in result:
+                result["step_id"] = step_id
+
+        if result["type"] in FLOW_NOT_COMPLETE_STEPS:
+            self._raise_if_step_does_not_exist(flow, result["step_id"])
+            flow.cur_step = result
+            return result
+
+        try:
+            # We pass a copy of the result because we're mutating our version
+            result = await self.async_finish_flow(flow, result.copy())
+        except AbortFlow as err:
+            result = self._abort_flow_result(flow, err)
 
         # _async_finish_flow may change result type, check it again
-        if result['type'] == RESULT_TYPE_FORM:
-            flow.cur_step = (result['step_id'], result['data_schema'])
+        if result["type"] is FlowResultType.FORM:
+            flow.cur_step = result
             return result
 
-        # Abort and Success results both finish the flow
-        self._progress.pop(flow.flow_id)
+        # Abort and Success results both finish the flow.
+        self._async_remove_flow_progress(flow.flow_id)
 
         return result
 
+    def _raise_if_step_does_not_exist(
+        self, flow: FlowHandler[_FlowContextT, _FlowResultT, _HandlerT], step_id: str
+    ) -> None:
+        """Raise if the step does not exist."""
+        method = f"async_step_{step_id}"
 
-class FlowHandler:
-    """Handle the configuration flow of a component."""
+        if not hasattr(flow, method):
+            self._async_remove_flow_progress(flow.flow_id)
+            raise UnknownStep(
+                f"Handler {flow.__class__.__name__} doesn't support step {step_id}"
+            )
+
+    async def _async_setup_preview(
+        self, flow: FlowHandler[_FlowContextT, _FlowResultT, _HandlerT]
+    ) -> None:
+        """Set up preview for a flow handler."""
+        if flow.handler not in self._preview:
+            self._preview.add(flow.handler)
+            await flow.async_setup_preview(self.hass)
+
+    @callback
+    def _async_flow_handler_to_flow_result(
+        self,
+        flows: Iterable[FlowHandler[_FlowContextT, _FlowResultT, _HandlerT]],
+        include_uninitialized: bool,
+    ) -> list[_FlowResultT]:
+        """Convert a list of FlowHandler to a partial FlowResult."""
+        return [
+            self._flow_result(
+                flow_id=flow.flow_id,
+                handler=flow.handler,
+                context=flow.context,
+                step_id=flow.cur_step["step_id"],
+            )
+            if flow.cur_step
+            else self._flow_result(
+                flow_id=flow.flow_id,
+                handler=flow.handler,
+                context=flow.context,
+            )
+            for flow in flows
+            if include_uninitialized or flow.cur_step is not None
+        ]
+
+
+def _report_missing_step_id(method: str) -> None:
+    """Report a flow result built without a step id."""
+    report_usage(
+        f"calls {method} without passing a step_id",
+        core_integration_behavior=ReportBehavior.ERROR,
+        breaks_in_ha_version="2027.5.0",
+    )
+
+
+class FlowHandler(Generic[_FlowContextT, _FlowResultT, _HandlerT]):
+    """Handle a data entry flow."""
+
+    _flow_result: type[_FlowResultT] = FlowResult  # type: ignore[assignment]
 
     # Set by flow manager
-    flow_id = None
-    hass = None
-    handler = None
-    cur_step = None
-    context = None
+    cur_step: _FlowResultT | None = None
+
+    # While not purely typed, it makes typehinting more useful for us
+    # and removes the need for constant None checks or asserts.
+    flow_id: str = None  # type: ignore[assignment]
+    hass: HomeAssistant = None  # type: ignore[assignment]
+    handler: _HandlerT = None  # type: ignore[assignment]
+    # Ensure the attribute has a subscriptable, but immutable, default value.
+    context: _FlowContextT = MappingProxyType({})  # type: ignore[assignment]
 
     # Set by _async_create_flow callback
-    init_step = 'init'
+    init_step = "init"
+
+    # The initial data that was used to start the flow
+    init_data: Any = None
 
     # Set by developer
     VERSION = 1
+    MINOR_VERSION = 1
+
+    __progress_task: asyncio.Task[Any] | None = None
+    __no_progress_task_reported = False
+    deprecated_show_progress = False
+
+    @property
+    def source(self) -> str | None:
+        """Source that initialized the flow."""
+        return self.context.get("source", None)  # type: ignore[return-value]
+
+    @property
+    @deprecated_function(
+        "a user friendly way to present additional options in the UI, for example a section",
+        breaks_in_ha_version="2027.6",
+    )
+    def show_advanced_options(self) -> bool:
+        """If we should show advanced options.
+
+        During the deprecation period return True to not break existing flows that use
+        this property to determine whether to show additional options.
+        """
+        return True
+
+    def add_suggested_values_to_schema(
+        self, data_schema: probatio.Schema, suggested_values: Mapping[str, Any] | None
+    ) -> probatio.Schema:
+        """Make a copy of the schema, populated with suggested values.
+
+        For each schema marker matching items in `suggested_values`,
+        the `suggested_value` will be set. The existing `suggested_value` will
+        be left untouched if there is no matching item.
+        """
+        schema = {}
+        for key, val in data_schema.schema.items():
+            # Process the section schema options
+            if (
+                suggested_values is not None
+                and isinstance(val, section)
+                and key in suggested_values
+            ):
+                new_section_key = copy.copy(key)
+                new_val = copy.copy(val)
+                schema[new_section_key] = new_val
+                new_val.schema = self.add_suggested_values_to_schema(
+                    new_val.schema, suggested_values[key]
+                )
+                continue
+
+            new_key = key
+            if (
+                suggested_values
+                and key in suggested_values
+                and isinstance(key, probatio.Marker)
+            ):
+                # Copy the marker to not modify the flow schema
+                new_key = copy.copy(key)
+                new_key.description = {"suggested_value": suggested_values[key.schema]}
+            schema[new_key] = val
+        return probatio.Schema(schema)
 
     @callback
-    def async_show_form(self, *, step_id: str, data_schema: vol.Schema = None,
-                        errors: Optional[Dict] = None,
-                        description_placeholders: Optional[Dict] = None) \
-            -> Dict:
+    def async_show_form(
+        self,
+        *,
+        step_id: str | None = None,
+        data_schema: probatio.Schema | None = None,
+        errors: dict[str, str] | None = None,
+        description_placeholders: Mapping[str, str] | None = None,
+        last_step: bool | None = None,
+        preview: str | None = None,
+    ) -> _FlowResultT:
         """Return the definition of a form to gather user input."""
-        return {
-            'type': RESULT_TYPE_FORM,
-            'flow_id': self.flow_id,
-            'handler': self.handler,
-            'step_id': step_id,
-            'data_schema': data_schema,
-            'errors': errors,
-            'description_placeholders': description_placeholders,
-        }
+        flow_result = self._flow_result(
+            type=FlowResultType.FORM,
+            flow_id=self.flow_id,
+            handler=self.handler,
+            data_schema=data_schema,
+            errors=errors,
+            description_placeholders=description_placeholders,
+            last_step=last_step,  # Display next or submit button in frontend
+            preview=preview,  # Display preview component in frontend
+        )
+        if step_id is not None:
+            flow_result["step_id"] = step_id
+        else:
+            _report_missing_step_id("async_show_form")
+        return flow_result
 
     @callback
-    def async_create_entry(self, *, title: str, data: Dict,
-                           description: Optional[str] = None,
-                           description_placeholders: Optional[Dict] = None) \
-            -> Dict:
-        """Finish config flow and create a config entry."""
-        return {
-            'version': self.VERSION,
-            'type': RESULT_TYPE_CREATE_ENTRY,
-            'flow_id': self.flow_id,
-            'handler': self.handler,
-            'title': title,
-            'data': data,
-            'description': description,
-            'description_placeholders': description_placeholders,
-        }
+    def async_create_entry(
+        self,
+        *,
+        title: str | None = None,
+        data: Mapping[str, Any],
+        description: str | None = None,
+        description_placeholders: Mapping[str, str] | None = None,
+    ) -> _FlowResultT:
+        """Finish flow."""
+        flow_result = self._flow_result(
+            type=FlowResultType.CREATE_ENTRY,
+            flow_id=self.flow_id,
+            handler=self.handler,
+            data=data,
+            description=description,
+            description_placeholders=description_placeholders,
+            context=self.context,
+        )
+        if title is not None:
+            flow_result["title"] = title
+        return flow_result
 
     @callback
-    def async_abort(self, *, reason: str) -> Dict:
-        """Abort the config flow."""
-        return {
-            'type': RESULT_TYPE_ABORT,
-            'flow_id': self.flow_id,
-            'handler': self.handler,
-            'reason': reason
-        }
+    def async_abort(
+        self,
+        *,
+        reason: str,
+        description_placeholders: Mapping[str, str] | None = None,
+        translation_domain: str | None = None,
+    ) -> _FlowResultT:
+        """Abort the flow.
+
+        Pass `translation_domain` to resolve the reason from another integration's
+        translations instead of the one owning the flow.
+        """
+        flow_result = self._flow_result(
+            type=FlowResultType.ABORT,
+            flow_id=self.flow_id,
+            handler=self.handler,
+            reason=reason,
+            description_placeholders=description_placeholders,
+        )
+        if translation_domain is not None:
+            flow_result["translation_domain"] = translation_domain
+        return flow_result
+
+    @callback
+    def async_external_step(
+        self,
+        *,
+        step_id: str | None = None,
+        url: str,
+        description_placeholders: Mapping[str, str] | None = None,
+    ) -> _FlowResultT:
+        """Return the definition of an external step for the user to take."""
+        flow_result = self._flow_result(
+            type=FlowResultType.EXTERNAL_STEP,
+            flow_id=self.flow_id,
+            handler=self.handler,
+            url=url,
+            description_placeholders=description_placeholders,
+        )
+        if step_id is not None:
+            flow_result["step_id"] = step_id
+        else:
+            _report_missing_step_id("async_external_step")
+        return flow_result
+
+    @callback
+    def async_external_step_done(self, *, next_step_id: str) -> _FlowResultT:
+        """Return the definition of an external step for the user to take."""
+        return self._flow_result(
+            type=FlowResultType.EXTERNAL_STEP_DONE,
+            flow_id=self.flow_id,
+            handler=self.handler,
+            step_id=next_step_id,
+        )
+
+    @callback
+    def async_show_progress(
+        self,
+        *,
+        step_id: str | None = None,
+        progress_action: str,
+        description_placeholders: Mapping[str, str] | None = None,
+        progress_task: asyncio.Task[Any] | None = None,
+    ) -> _FlowResultT:
+        """Show a progress message to the user, without user input allowed."""
+        if progress_task is None and not self.__no_progress_task_reported:
+            self.__no_progress_task_reported = True
+            cls = self.__class__
+            report_issue = async_suggest_report_issue(self.hass, module=cls.__module__)
+            _LOGGER.warning(
+                (
+                    "%s::%s calls async_show_progress without passing a progress task, "
+                    "this is not valid and will break in Home Assistant Core 2024.8. "
+                    "Please %s"
+                ),
+                cls.__module__,
+                cls.__name__,
+                report_issue,
+            )
+
+        if progress_task is None:
+            self.deprecated_show_progress = True
+
+        flow_result = self._flow_result(
+            type=FlowResultType.SHOW_PROGRESS,
+            flow_id=self.flow_id,
+            handler=self.handler,
+            progress_action=progress_action,
+            description_placeholders=description_placeholders,
+            progress_task=progress_task,
+        )
+        if step_id is not None:
+            flow_result["step_id"] = step_id
+        else:
+            _report_missing_step_id("async_show_progress")
+        return flow_result
+
+    @callback
+    def async_update_progress(self, progress: float) -> None:
+        """Update the progress of a flow. `progress` must be between 0 and 1."""
+        self.hass.bus.async_fire_internal(
+            EVENT_DATA_ENTRY_FLOW_PROGRESS_UPDATE,
+            {"handler": self.handler, "flow_id": self.flow_id, "progress": progress},
+        )
+
+    @callback
+    def async_notify_flow_changed(self) -> None:
+        """Notify listeners that the flow has changed.
+
+        This notifies listeners (such as the frontend) to reload the flow state.
+        """
+        self.hass.bus.async_fire_internal(
+            EVENT_DATA_ENTRY_FLOW_PROGRESSED,
+            {"handler": self.handler, "flow_id": self.flow_id, "refresh": True},
+        )
+
+    @callback
+    def async_show_progress_done(self, *, next_step_id: str) -> _FlowResultT:
+        """Mark the progress done."""
+        return self._flow_result(
+            type=FlowResultType.SHOW_PROGRESS_DONE,
+            flow_id=self.flow_id,
+            handler=self.handler,
+            step_id=next_step_id,
+        )
+
+    @callback
+    def async_show_menu(
+        self,
+        *,
+        step_id: str | None = None,
+        menu_options: Container[str],
+        sort: bool = False,
+        description_placeholders: Mapping[str, str] | None = None,
+    ) -> _FlowResultT:
+        """Show a navigation menu to the user.
+
+        Options dict maps step_id => i18n label
+        """
+        flow_result = self._flow_result(
+            type=FlowResultType.MENU,
+            flow_id=self.flow_id,
+            handler=self.handler,
+            data_schema=probatio.Schema({"next_step_id": probatio.In(menu_options)}),
+            menu_options=menu_options,
+            description_placeholders=description_placeholders,
+        )
+        if sort:
+            flow_result["sort"] = sort
+        if step_id is not None:
+            flow_result["step_id"] = step_id
+        else:
+            _report_missing_step_id("async_show_menu")
+        return flow_result
+
+    @callback
+    def async_remove(self) -> None:
+        """Notification that the flow has been removed."""
+
+    @staticmethod
+    async def async_setup_preview(hass: HomeAssistant) -> None:
+        """Set up preview."""
+
+    @callback
+    def async_cancel_progress_task(self) -> None:
+        """Cancel in progress task."""
+        if self.__progress_task and not self.__progress_task.done():
+            self.__progress_task.cancel()
+        self.__progress_task = None
+
+    @callback
+    def async_get_progress_task(self) -> asyncio.Task[Any] | None:
+        """Get in progress task."""
+        return self.__progress_task
+
+    @callback
+    def async_set_progress_task(
+        self,
+        progress_task: asyncio.Task[Any],
+    ) -> None:
+        """Set in progress task."""
+        self.__progress_task = progress_task
+
+
+class SectionConfig(TypedDict, total=False):
+    """Class to represent a section config."""
+
+    collapsed: bool
+
+
+class section:
+    """Data entry flow section."""
+
+    CONFIG_SCHEMA = probatio.Schema(
+        {
+            probatio.Optional("collapsed", default=False): bool,
+        },
+    )
+
+    def __init__(
+        self, schema: probatio.Schema, options: SectionConfig | None = None
+    ) -> None:
+        """Initialize."""
+        self.schema = schema
+        self.options: SectionConfig = self.CONFIG_SCHEMA(options or {})
+
+    def __call__(self, value: Any) -> Any:
+        """Validate input."""
+        return self.schema(value)
+
+
+def _schema_has_visible(data_schema: probatio.Schema) -> bool:
+    """Return True if the schema (or a nested section) has a visible marker."""
+    if not isinstance(data_schema.schema, dict):
+        return False
+    for key, val in data_schema.schema.items():
+        if getattr(key, "visible", None) is not None:
+            return True
+        if isinstance(val, section) and _schema_has_visible(val.schema):
+            return True
+    return False
+
+
+def _strip_hidden_fields[_T: Mapping[str, Any]](
+    data_schema: probatio.Schema, user_input: _T
+) -> tuple[probatio.Schema, _T]:
+    """Remove currently hidden fields from the schema and the submitted input.
+
+    A field whose ``visible`` condition does not match is treated as optional and
+    its value is omitted, so a hidden required field must not fail validation and
+    a hidden field must not inject a default or keep a stale value. Conditions are
+    evaluated against the input with schema defaults applied, so a field omitted
+    by the client resolves the same as one that was submitted. Because a hidden
+    field holds no value, visibility is resolved until stable: once hidden, a
+    field reads as absent to the conditions of the other fields. Returns the
+    schema and input unchanged when every field is visible, leaving schemas
+    without visibility conditions untouched.
+    """
+    if not _schema_has_visible(data_schema):
+        return data_schema, user_input
+
+    eval_data = dict(user_input)
+    conditions: dict[Any, Any] = {}
+    for key in data_schema.schema:
+        name = key.schema if isinstance(key, probatio.Marker) else key
+        if (
+            isinstance(key, (probatio.Optional, probatio.Required))
+            and name not in eval_data
+            and not isinstance(key.default, probatio.Undefined)
+        ):
+            eval_data[name] = key.default()
+        if (visible_condition := getattr(key, "visible", None)) is not None:
+            conditions[name] = visible_condition
+
+    hidden_names = get_hidden_fields(conditions, eval_data)
+
+    new_schema: dict[Any, Any] = {}
+    new_input: dict[str, Any] | None = None
+    for key, val in data_schema.schema.items():
+        name = key.schema if isinstance(key, probatio.Marker) else key
+
+        if name in hidden_names:
+            if name in user_input:
+                if new_input is None:
+                    new_input = dict(user_input)
+                new_input.pop(name, None)
+            continue
+
+        if isinstance(val, section) and isinstance(
+            section_input := eval_data.get(name), Mapping
+        ):
+            inner_schema, inner_input = _strip_hidden_fields(val.schema, section_input)
+            if inner_schema is not val.schema:
+                new_val = copy.copy(val)
+                new_val.schema = inner_schema
+                new_schema[key] = new_val
+                if new_input is None:
+                    new_input = dict(user_input)
+                new_input[name] = inner_input
+                continue
+
+        new_schema[key] = val
+
+    if new_input is None and len(new_schema) == len(data_schema.schema):
+        return data_schema, user_input
+    return (
+        probatio.Schema(
+            new_schema, extra=data_schema.extra, required=data_schema.required
+        ),
+        cast(_T, new_input if new_input is not None else user_input),
+    )
+
+
+def add_visible_conditions_to_serialized_schema(
+    data_schema: probatio.Schema, serialized: list[dict[str, Any]]
+) -> None:
+    """Add `visible` conditions from schema markers to the serialized fields.
+
+    `probatio.to_field_list` does not emit marker metadata beyond `description`, so
+    a marker's `visible` argument is injected here after conversion.
+    Recurses into serialized sections.
+    """
+    if not isinstance(data_schema.schema, dict):
+        return
+
+    fields_by_name: dict[Any, tuple[Any, Any]] = {}
+    for key, val in data_schema.schema.items():
+        name = key.schema if isinstance(key, probatio.Marker) else key
+        fields_by_name[name] = (key, val)
+
+    for field in serialized:
+        if (entry := fields_by_name.get(field.get("name"))) is None:
+            continue
+        key, val = entry
+        if (visible_condition := getattr(key, "visible", None)) is not None:
+            field["visible"] = visible_condition
+        if isinstance(val, section) and isinstance(field.get("schema"), list):
+            add_visible_conditions_to_serialized_schema(val.schema, field["schema"])

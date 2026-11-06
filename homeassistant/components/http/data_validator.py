@@ -1,9 +1,16 @@
 """Decorator for view methods to help with data validation."""
 
+from collections.abc import Awaitable, Callable, Coroutine
 from functools import wraps
+from http import HTTPStatus
 import logging
+from typing import Any, Concatenate
 
-import voluptuous as vol
+from aiohttp import web
+import probatio
+
+from homeassistant.helpers.http import HomeAssistantView
+from homeassistant.helpers.typing import VolDictType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -11,40 +18,56 @@ _LOGGER = logging.getLogger(__name__)
 class RequestDataValidator:
     """Decorator that will validate the incoming data.
 
-    Takes in a voluptuous schema and adds 'post_data' as
+    Takes in a probatio schema and adds 'data' as
     keyword argument to the function call.
 
     Will return a 400 if no JSON provided or doesn't match schema.
     """
 
-    def __init__(self, schema, allow_empty=False):
+    def __init__(
+        self, schema: VolDictType | probatio.Schema, allow_empty: bool = False
+    ) -> None:
         """Initialize the decorator."""
+        if isinstance(schema, dict):
+            schema = probatio.Schema(schema)
+
         self._schema = schema
         self._allow_empty = allow_empty
 
-    def __call__(self, method):
+    def __call__[_HassViewT: HomeAssistantView, **_P](
+        self,
+        method: Callable[
+            Concatenate[_HassViewT, web.Request, dict[str, Any], _P],
+            Awaitable[web.Response],
+        ],
+    ) -> Callable[
+        Concatenate[_HassViewT, web.Request, _P],
+        Coroutine[Any, Any, web.Response],
+    ]:
         """Decorate a function."""
+
         @wraps(method)
-        async def wrapper(view, request, *args, **kwargs):
+        async def wrapper(
+            view: _HassViewT, request: web.Request, *args: _P.args, **kwargs: _P.kwargs
+        ) -> web.Response:
             """Wrap a request handler with data validation."""
-            data = None
+            raw_data = None
             try:
-                data = await request.json()
+                raw_data = await request.json()
             except ValueError:
-                if not self._allow_empty or \
-                   (await request.content.read()) != b'':
-                    _LOGGER.error('Invalid JSON received.')
-                    return view.json_message('Invalid JSON.', 400)
-                data = {}
+                if not self._allow_empty or (await request.content.read()) != b"":
+                    _LOGGER.error("Invalid JSON received")
+                    return view.json_message("Invalid JSON.", HTTPStatus.BAD_REQUEST)
+                raw_data = {}
 
             try:
-                kwargs['data'] = self._schema(data)
-            except vol.Invalid as err:
-                _LOGGER.error('Data does not match schema: %s', err)
+                data: dict[str, Any] = self._schema(raw_data)
+            except probatio.Invalid as err:
+                _LOGGER.error("Data does not match schema: %s", err)
                 return view.json_message(
-                    'Message format incorrect: {}'.format(err), 400)
+                    f"Message format incorrect: {err}", HTTPStatus.BAD_REQUEST
+                )
 
-            result = await method(view, request, *args, **kwargs)
-            return result
+            return await method(view, request, data, *args, **kwargs)
 
         return wrapper

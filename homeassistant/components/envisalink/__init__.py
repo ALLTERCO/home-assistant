@@ -1,0 +1,238 @@
+"""Support for Envisalink devices."""
+
+import asyncio
+from dataclasses import dataclass
+import logging
+
+import probatio
+from pyenvisalink import EnvisalinkAlarmPanel
+
+from homeassistant.const import (
+    CONF_CODE,
+    CONF_HOST,
+    CONF_TIMEOUT,
+    EVENT_HOMEASSISTANT_STOP,
+    Platform,
+)
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.discovery import async_load_platform
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.typing import ConfigType
+
+from .const import (
+    CONF_EVL_KEEPALIVE,
+    CONF_EVL_PORT,
+    CONF_EVL_VERSION,
+    CONF_PANEL_TYPE,
+    CONF_PANIC,
+    CONF_PARTITIONNAME,
+    CONF_PARTITIONS,
+    CONF_PASS,
+    CONF_USERNAME,
+    CONF_ZONEDUMP_INTERVAL,
+    CONF_ZONENAME,
+    CONF_ZONES,
+    CONF_ZONETYPE,
+    DATA_EVL,
+    DEFAULT_EVL_VERSION,
+    DEFAULT_KEEPALIVE,
+    DEFAULT_PANIC,
+    DEFAULT_PORT,
+    DEFAULT_TIMEOUT,
+    DEFAULT_ZONEDUMP_INTERVAL,
+    DEFAULT_ZONETYPE,
+    DOMAIN,
+    PANEL_TYPE_DSC,
+    PANEL_TYPE_HONEYWELL,
+    SIGNAL_KEYPAD_UPDATE,
+    SIGNAL_PARTITION_UPDATE,
+    SIGNAL_ZONE_UPDATE,
+)
+from .services import async_setup_services
+
+_LOGGER = logging.getLogger(__name__)
+
+ZONE_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_ZONENAME): cv.string,
+        probatio.Optional(CONF_ZONETYPE, default=DEFAULT_ZONETYPE): cv.string,
+    }
+)
+
+PARTITION_SCHEMA = probatio.Schema({probatio.Required(CONF_PARTITIONNAME): cv.string})
+
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        DOMAIN: probatio.Schema(
+            {
+                probatio.Required(CONF_HOST): cv.string,
+                probatio.Required(CONF_PANEL_TYPE): probatio.All(
+                    cv.string, probatio.In([PANEL_TYPE_HONEYWELL, PANEL_TYPE_DSC])
+                ),
+                probatio.Required(CONF_USERNAME): cv.string,
+                probatio.Required(CONF_PASS): cv.string,
+                probatio.Optional(CONF_CODE): cv.string,
+                probatio.Optional(CONF_PANIC, default=DEFAULT_PANIC): cv.string,
+                probatio.Optional(CONF_ZONES): {probatio.Coerce(int): ZONE_SCHEMA},
+                probatio.Optional(CONF_PARTITIONS): {
+                    probatio.Coerce(int): PARTITION_SCHEMA
+                },
+                probatio.Optional(CONF_EVL_PORT, default=DEFAULT_PORT): probatio.Port(),
+                probatio.Optional(
+                    CONF_EVL_VERSION, default=DEFAULT_EVL_VERSION
+                ): probatio.All(probatio.Coerce(int), probatio.Range(min=3, max=4)),
+                probatio.Optional(
+                    CONF_EVL_KEEPALIVE, default=DEFAULT_KEEPALIVE
+                ): probatio.All(probatio.Coerce(int), probatio.Range(min=15)),
+                probatio.Optional(
+                    CONF_ZONEDUMP_INTERVAL, default=DEFAULT_ZONEDUMP_INTERVAL
+                ): probatio.Coerce(int),
+                probatio.Optional(
+                    CONF_TIMEOUT, default=DEFAULT_TIMEOUT
+                ): probatio.Coerce(int),
+            }
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
+)
+
+
+@dataclass
+class EnvisalinkData:
+    """Runtime data for the Envisalink integration."""
+
+    controller: EnvisalinkAlarmPanel
+    code: str | None
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up for Envisalink devices."""
+    conf = config[DOMAIN]
+
+    host = conf.get(CONF_HOST)
+    port = conf.get(CONF_EVL_PORT)
+    code = conf.get(CONF_CODE)
+    panel_type = conf.get(CONF_PANEL_TYPE)
+    panic_type = conf.get(CONF_PANIC)
+    version = conf.get(CONF_EVL_VERSION)
+    user = conf.get(CONF_USERNAME)
+    password = conf.get(CONF_PASS)
+    keep_alive = conf.get(CONF_EVL_KEEPALIVE)
+    zone_dump = conf.get(CONF_ZONEDUMP_INTERVAL)
+    zones = conf.get(CONF_ZONES)
+    partitions = conf.get(CONF_PARTITIONS)
+    connection_timeout = conf.get(CONF_TIMEOUT)
+    sync_connect: asyncio.Future[bool] = hass.loop.create_future()
+
+    controller = EnvisalinkAlarmPanel(
+        host,
+        port,
+        panel_type,
+        version,
+        user,
+        password,
+        zone_dump,
+        keep_alive,
+        hass.loop,
+        connection_timeout,
+        False,
+    )
+    hass.data[DATA_EVL] = EnvisalinkData(controller, code)
+
+    @callback
+    def async_login_fail_callback(data):
+        """Handle when the evl rejects our login."""
+        _LOGGER.error("The Envisalink rejected your credentials")
+        if not sync_connect.done():
+            sync_connect.set_result(False)
+
+    @callback
+    def async_connection_fail_callback(data):
+        """Network failure callback."""
+        _LOGGER.error("Could not establish a connection with the Envisalink- retrying")
+        if not sync_connect.done():
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, stop_envisalink)
+            sync_connect.set_result(True)
+
+    @callback
+    def async_connection_success_callback(data):
+        """Handle a successful connection."""
+        _LOGGER.debug("Established a connection with the Envisalink")
+        if not sync_connect.done():
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, stop_envisalink)
+            sync_connect.set_result(True)
+
+    @callback
+    def async_zones_updated_callback(data):
+        """Handle zone timer updates."""
+        _LOGGER.debug("Envisalink sent a zone update event. Updating zones")
+        async_dispatcher_send(hass, SIGNAL_ZONE_UPDATE, data)
+
+    @callback
+    def async_alarm_data_updated_callback(data):
+        """Handle non-alarm based info updates."""
+        _LOGGER.debug("Envisalink sent new alarm info. Updating alarms")
+        async_dispatcher_send(hass, SIGNAL_KEYPAD_UPDATE, data)
+
+    @callback
+    def async_partition_updated_callback(data):
+        """Handle partition changes thrown by evl (including alarms)."""
+        _LOGGER.debug("The envisalink sent a partition update event")
+        async_dispatcher_send(hass, SIGNAL_PARTITION_UPDATE, data)
+
+    @callback
+    def stop_envisalink(event):
+        """Shutdown envisalink connection and thread on exit."""
+        _LOGGER.debug("Shutting down Envisalink")
+        controller.stop()
+
+    controller.callback_zone_timer_dump = async_zones_updated_callback
+    controller.callback_zone_state_change = async_zones_updated_callback
+    controller.callback_partition_state_change = async_partition_updated_callback
+    controller.callback_keypad_update = async_alarm_data_updated_callback
+    controller.callback_login_failure = async_login_fail_callback
+    controller.callback_login_timeout = async_connection_fail_callback
+    controller.callback_login_success = async_connection_success_callback
+
+    _LOGGER.debug("Start envisalink")
+    controller.start()
+
+    if not await sync_connect:
+        return False
+
+    # Load sub-components for Envisalink
+    if partitions:
+        hass.async_create_task(
+            async_load_platform(
+                hass,
+                Platform.ALARM_CONTROL_PANEL,
+                "envisalink",
+                {CONF_PARTITIONS: partitions, CONF_CODE: code, CONF_PANIC: panic_type},
+                config,
+            )
+        )
+        hass.async_create_task(
+            async_load_platform(
+                hass,
+                Platform.SENSOR,
+                "envisalink",
+                {CONF_PARTITIONS: partitions, CONF_CODE: code},
+                config,
+            )
+        )
+    if zones:
+        hass.async_create_task(
+            async_load_platform(
+                hass, Platform.BINARY_SENSOR, "envisalink", {CONF_ZONES: zones}, config
+            )
+        )
+
+        # Zone bypass switches are not currently created due
+        # to an issue with some panels. These switches will be
+        # re-added in the future after some further refactoring
+        # of the integration.
+
+    async_setup_services(hass)
+
+    return True

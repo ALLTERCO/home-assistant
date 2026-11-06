@@ -1,0 +1,67 @@
+"""Support for Axis devices."""
+
+import logging
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+
+from .const import CONF_COMPANION, PLATFORMS
+from .errors import AuthenticationRequired, CannotConnect
+from .hub import AxisHub, get_axis_api, is_companion_device
+
+_LOGGER = logging.getLogger(__name__)
+
+type AxisConfigEntry = ConfigEntry[AxisHub]
+
+
+async def async_setup_entry(hass: HomeAssistant, config_entry: AxisConfigEntry) -> None:
+    """Set up the Axis integration."""
+    try:
+        api = await get_axis_api(hass, config_entry.data)
+    except CannotConnect as err:
+        raise ConfigEntryNotReady from err
+    except AuthenticationRequired as err:
+        raise ConfigEntryAuthFailed from err
+
+    # Entries created before the config flow stored the companion flag
+    if CONF_COMPANION not in config_entry.data:
+        api.config.is_companion = is_companion_device(api)
+        hass.config_entries.async_update_entry(
+            config_entry,
+            data={**config_entry.data, CONF_COMPANION: api.config.is_companion},
+        )
+
+    hub = config_entry.runtime_data = AxisHub(hass, config_entry, api)
+    await hub.async_update_device_registry()
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    hub.setup()
+
+    config_entry.async_on_unload(
+        config_entry.add_update_listener(hub.async_new_address_callback)
+    )
+    config_entry.async_on_unload(hub.teardown)
+    config_entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, hub.shutdown)
+    )
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, config_entry: AxisConfigEntry
+) -> None:
+    """Unload Axis device config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(config_entry, PLATFORMS)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: AxisConfigEntry
+) -> None:
+    """Migrate old entry."""
+    _LOGGER.debug("Migrating from version %s", config_entry.version)
+
+    if config_entry.version != 3:
+        # Home Assistant 2023.2
+        hass.config_entries.async_update_entry(config_entry, version=3)
+
+    _LOGGER.debug("Migration to version %s successful", config_entry.version)

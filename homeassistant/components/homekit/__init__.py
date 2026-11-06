@@ -1,265 +1,1097 @@
-"""Support for Apple HomeKit.
+"""Support for Apple HomeKit."""
 
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/homekit/
-"""
+import asyncio
+from collections import defaultdict
+from collections.abc import Iterable
+from copy import deepcopy
 import ipaddress
 import logging
-from zlib import adler32
+import os
+import socket
+from typing import Any, cast
 
-import voluptuous as vol
+from aiohttp import web
+import probatio
+from pyhap import util as pyhap_util
+from pyhap.characteristic import Characteristic
+from pyhap.const import STANDALONE_AID
+from pyhap.loader import get_loader
+from pyhap.service import Service
+from zeroconf.asyncio import AsyncZeroconf
 
-from homeassistant.components import cover
+from homeassistant.components import device_automation, network, zeroconf
+from homeassistant.components.binary_sensor import (
+    DOMAIN as BINARY_SENSOR_DOMAIN,
+    BinarySensorDeviceClass,
+)
+from homeassistant.components.camera import DOMAIN as CAMERA_DOMAIN
+from homeassistant.components.device_automation.trigger import (  # pylint: disable=home-assistant-component-root-import
+    async_validate_trigger_config,
+)
+from homeassistant.components.event import DOMAIN as EVENT_DOMAIN, EventDeviceClass
+from homeassistant.components.fan import DOMAIN as FAN_DOMAIN
+from homeassistant.components.http import KEY_HASS, HomeAssistantView
+from homeassistant.components.humidifier import DOMAIN as HUMIDIFIER_DOMAIN
+from homeassistant.components.lock import DOMAIN as LOCK_DOMAIN
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN, SensorDeviceClass
+from homeassistant.config_entries import SOURCE_IMPORT
 from homeassistant.const import (
-    ATTR_DEVICE_CLASS, ATTR_SUPPORTED_FEATURES, ATTR_UNIT_OF_MEASUREMENT,
-    CONF_IP_ADDRESS, CONF_NAME, CONF_PORT, CONF_TYPE, DEVICE_CLASS_HUMIDITY,
-    DEVICE_CLASS_ILLUMINANCE, DEVICE_CLASS_TEMPERATURE,
-    EVENT_HOMEASSISTANT_START, EVENT_HOMEASSISTANT_STOP,
-    TEMP_CELSIUS, TEMP_FAHRENHEIT)
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entityfilter import FILTER_SCHEMA
-from homeassistant.util import get_local_ip
-from homeassistant.util.decorator import Registry
-from .const import (
-    BRIDGE_NAME, CONF_AUTO_START, CONF_ENTITY_CONFIG, CONF_FEATURE_LIST,
-    CONF_FILTER, DEFAULT_AUTO_START, DEFAULT_PORT, DEVICE_CLASS_CO,
-    DEVICE_CLASS_CO2, DEVICE_CLASS_PM25, DOMAIN, HOMEKIT_FILE,
-    SERVICE_HOMEKIT_START, TYPE_FAUCET, TYPE_OUTLET, TYPE_SHOWER,
-    TYPE_SPRINKLER, TYPE_SWITCH, TYPE_VALVE)
-from .util import (
-    show_setup_message, validate_entity_config, validate_media_player_features)
+    ATTR_BATTERY_CHARGING,
+    ATTR_BATTERY_LEVEL,
+    CONF_DEVICES,
+    CONF_IP_ADDRESS,
+    CONF_NAME,
+    CONF_PORT,
+    CONF_TYPE,
+    EVENT_HOMEASSISTANT_STOP,
+)
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, State, callback
+from homeassistant.exceptions import Unauthorized
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+    instance_id,
+)
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entityfilter import (
+    BASE_FILTER_SCHEMA,
+    FILTER_SCHEMA,
+    EntityFilter,
+)
+from homeassistant.helpers.start import async_at_started
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import IntegrationNotFound, async_get_integration
 
-REQUIREMENTS = ['HAP-python==2.2.2']
+from . import (  # noqa: F401
+    type_air_purifiers,
+    type_cameras,
+    type_covers,
+    type_fans,
+    type_heater_coolers,
+    type_humidifiers,
+    type_lights,
+    type_locks,
+    type_media_players,
+    type_remotes,
+    type_security_systems,
+    type_sensors,
+    type_switches,
+    type_thermostats,
+)
+from .accessories import (
+    HomeAccessory,
+    HomeBridge,
+    HomeDriver,
+    async_resolve_accessory_type,
+    get_accessory,
+)
+from .aidmanager import AccessoryAidStorage
+from .const import (
+    ATTR_HW_VERSION,
+    ATTR_INTEGRATION,
+    ATTR_MANUFACTURER,
+    ATTR_MODEL,
+    ATTR_SW_VERSION,
+    BRIDGE_NAME,
+    BRIDGE_SERIAL_NUMBER,
+    CONF_ADVERTISE_IP,
+    CONF_ENTITY_CONFIG,
+    CONF_EXCLUDE_ACCESSORY_MODE,
+    CONF_FILTER,
+    CONF_HOMEKIT_MODE,
+    CONF_LINKED_BATTERY_CHARGING_SENSOR,
+    CONF_LINKED_BATTERY_SENSOR,
+    CONF_LINKED_DOORBELL_SENSOR,
+    CONF_LINKED_HUMIDITY_SENSOR,
+    CONF_LINKED_MOTION_SENSOR,
+    CONF_LINKED_PM25_SENSOR,
+    CONF_LINKED_TEMPERATURE_SENSOR,
+    CONFIG_OPTIONS,
+    DEFAULT_EXCLUDE_ACCESSORY_MODE,
+    DEFAULT_HOMEKIT_MODE,
+    DEFAULT_PORT,
+    DOMAIN,
+    HOMEKIT_MODE_ACCESSORY,
+    HOMEKIT_MODES,
+    MANUFACTURER,
+    PERSIST_LOCK_DATA,
+    SHUTDOWN_TIMEOUT,
+    SIGNAL_RELOAD_ENTITIES,
+    STATUS_READY,
+    STATUS_RUNNING,
+    STATUS_STOPPED,
+    STATUS_WAIT,
+    TYPE_AIR_PURIFIER,
+)
+from .iidmanager import AccessoryIIDStorage
+from .models import HomeKitConfigEntry, HomeKitEntryData
+from .services import async_setup_services
+from .type_triggers import DeviceTriggerAccessory
+from .util import (
+    accessory_friendly_name,
+    async_dismiss_setup_message,
+    async_port_is_available,
+    async_show_setup_message,
+    async_update_entries_from_yaml,
+    get_persist_fullpath_for_entry_id,
+    remove_state_files_for_entry_id,
+    state_needs_accessory_mode,
+    validate_entity_config,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-MAX_DEVICES = 100
-TYPES = Registry()
+MAX_DEVICES = 150  # includes the bridge
 
-# #### Driver Status ####
-STATUS_READY = 0
-STATUS_RUNNING = 1
-STATUS_STOPPED = 2
-STATUS_WAIT = 3
+PORT_CLEANUP_CHECK_INTERVAL_SECS = 1
 
-SWITCH_TYPES = {
-    TYPE_FAUCET: 'Valve',
-    TYPE_OUTLET: 'Outlet',
-    TYPE_SHOWER: 'Valve',
-    TYPE_SPRINKLER: 'Valve',
-    TYPE_SWITCH: 'Switch',
-    TYPE_VALVE: 'Valve'}
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: vol.All({
-        vol.Optional(CONF_NAME, default=BRIDGE_NAME):
-            vol.All(cv.string, vol.Length(min=3, max=25)),
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-        vol.Optional(CONF_IP_ADDRESS):
-            vol.All(ipaddress.ip_address, cv.string),
-        vol.Optional(CONF_AUTO_START, default=DEFAULT_AUTO_START): cv.boolean,
-        vol.Optional(CONF_FILTER, default={}): FILTER_SCHEMA,
-        vol.Optional(CONF_ENTITY_CONFIG, default={}): validate_entity_config,
-    })
-}, extra=vol.ALLOW_EXTRA)
+_HOMEKIT_CONFIG_UPDATE_TIME = (
+    10  # number of seconds to wait for homekit to see the c# change
+)
+_HAS_IPV6 = hasattr(socket, "AF_INET6")
+_DEFAULT_BIND = ["0.0.0.0", "::"] if _HAS_IPV6 else ["0.0.0.0"]
 
 
-async def async_setup(hass, config):
-    """Set up the HomeKit component."""
-    _LOGGER.debug('Begin setup HomeKit')
+BATTERY_CHARGING_SENSOR = (
+    BINARY_SENSOR_DOMAIN,
+    BinarySensorDeviceClass.BATTERY_CHARGING,
+)
+BATTERY_SENSOR = (SENSOR_DOMAIN, SensorDeviceClass.BATTERY)
+MOTION_EVENT_SENSOR = (EVENT_DOMAIN, EventDeviceClass.MOTION)
+MOTION_SENSOR = (BINARY_SENSOR_DOMAIN, BinarySensorDeviceClass.MOTION)
+DOORBELL_EVENT_SENSOR = (EVENT_DOMAIN, EventDeviceClass.DOORBELL)
+HUMIDITY_SENSOR = (SENSOR_DOMAIN, SensorDeviceClass.HUMIDITY)
+TEMPERATURE_SENSOR = (SENSOR_DOMAIN, SensorDeviceClass.TEMPERATURE)
+PM25_SENSOR = (SENSOR_DOMAIN, SensorDeviceClass.PM25)
 
-    conf = config[DOMAIN]
-    name = conf[CONF_NAME]
-    port = conf[CONF_PORT]
-    ip_address = conf.get(CONF_IP_ADDRESS)
-    auto_start = conf[CONF_AUTO_START]
-    entity_filter = conf[CONF_FILTER]
-    entity_config = conf[CONF_ENTITY_CONFIG]
 
-    homekit = HomeKit(hass, name, port, ip_address, entity_filter,
-                      entity_config)
-    await hass.async_add_job(homekit.setup)
+def _has_all_unique_names_and_ports(
+    bridges: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Validate that each homekit bridge configured has a unique name."""
+    names = [bridge[CONF_NAME] for bridge in bridges]
+    ports = [bridge[CONF_PORT] for bridge in bridges]
+    probatio.Schema(probatio.Unique())(names)
+    probatio.Schema(probatio.Unique())(ports)
+    return bridges
 
-    if auto_start:
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, homekit.start)
+
+BRIDGE_SCHEMA = probatio.All(
+    probatio.Schema(
+        {
+            probatio.Optional(
+                CONF_HOMEKIT_MODE, default=DEFAULT_HOMEKIT_MODE
+            ): probatio.In(HOMEKIT_MODES),
+            probatio.Optional(CONF_NAME, default=BRIDGE_NAME): probatio.All(
+                cv.string, probatio.Length(min=3, max=25)
+            ),
+            probatio.Optional(CONF_PORT, default=DEFAULT_PORT): probatio.Port(),
+            probatio.Optional(CONF_IP_ADDRESS): probatio.All(
+                ipaddress.ip_address, cv.string
+            ),
+            probatio.Optional(CONF_ADVERTISE_IP): probatio.All(
+                probatio.EnsureList(), [ipaddress.ip_address], [cv.string]
+            ),
+            probatio.Optional(CONF_FILTER, default={}): BASE_FILTER_SCHEMA,
+            probatio.Optional(CONF_ENTITY_CONFIG, default={}): validate_entity_config,
+            probatio.Optional(CONF_DEVICES): probatio.EnsureList(),
+        },
+        extra=probatio.ALLOW_EXTRA,
+    ),
+)
+
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        DOMAIN: probatio.All(
+            probatio.EnsureList(), [BRIDGE_SCHEMA], _has_all_unique_names_and_ports
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
+)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the HomeKit from yaml."""
+    hass.data[PERSIST_LOCK_DATA] = asyncio.Lock()
+
+    # Initialize the loader before loading entries to ensure
+    # there is no race where multiple entries try to load it
+    # at the same time.
+    await hass.async_add_executor_job(get_loader)
+
+    hass.http.register_view(HomeKitPairingQRView)
+    async_setup_services(hass)
+    if DOMAIN not in config:
         return True
 
-    def handle_homekit_service_start(service):
-        """Handle start HomeKit service call."""
-        if homekit.status != STATUS_READY:
-            _LOGGER.warning(
-                'HomeKit is not ready. Either it is already running or has '
-                'been stopped.')
-            return
-        homekit.start()
-
-    hass.services.async_register(DOMAIN, SERVICE_HOMEKIT_START,
-                                 handle_homekit_service_start)
-
+    async_update_entries_from_yaml(hass, config, start_import_flow=True)
     return True
 
 
-def get_accessory(hass, driver, state, aid, config):
-    """Take state and return an accessory object if supported."""
-    if not aid:
-        _LOGGER.warning('The entitiy "%s" is not supported, since it '
-                        'generates an invalid aid, please change it.',
-                        state.entity_id)
-        return None
+async def async_setup_entry(hass: HomeAssistant, entry: HomeKitConfigEntry) -> None:
+    """Set up HomeKit from a config entry."""
+    _async_import_options_from_data_if_missing(hass, entry)
 
-    a_type = None
-    name = config.get(CONF_NAME, state.name)
+    conf = entry.data
+    options = entry.options
 
-    if state.domain == 'alarm_control_panel':
-        a_type = 'SecuritySystem'
+    name: str = conf[CONF_NAME]
+    port: int = conf[CONF_PORT]
+    # ip_address and advertise_ip are yaml only
+    ip_address: str | list[str] | None = conf.get(CONF_IP_ADDRESS, _DEFAULT_BIND)
+    advertise_ips: list[str]
+    advertise_ips = conf.get(
+        CONF_ADVERTISE_IP
+    ) or await network.async_get_announce_addresses(hass)
 
-    elif state.domain == 'binary_sensor' or state.domain == 'device_tracker':
-        a_type = 'BinarySensor'
+    # exclude_accessory_mode is only used for config flow
+    # to indicate that the config entry was setup after
+    # we started creating config entries for entities that
+    # to run in accessory mode and that we should never include
+    # these entities on the bridge. For backwards compatibility
+    # with users who have not migrated yet we do not do exclude
+    # these entities by default as we cannot migrate automatically
+    # since it requires a re-pairing.
+    exclude_accessory_mode: bool = conf.get(
+        CONF_EXCLUDE_ACCESSORY_MODE, DEFAULT_EXCLUDE_ACCESSORY_MODE
+    )
+    homekit_mode: str = options.get(CONF_HOMEKIT_MODE, DEFAULT_HOMEKIT_MODE)
+    entity_config: dict[str, Any] = options.get(CONF_ENTITY_CONFIG, {}).copy()
+    entity_filter: EntityFilter = FILTER_SCHEMA(options.get(CONF_FILTER, {}))
+    devices: list[str] = options.get(CONF_DEVICES, [])
 
-    elif state.domain == 'climate':
-        a_type = 'Thermostat'
+    homekit = HomeKit(
+        hass,
+        name,
+        port,
+        ip_address,
+        entity_filter,
+        exclude_accessory_mode,
+        entity_config,
+        homekit_mode,
+        advertise_ips,
+        entry.entry_id,
+        entry.title,
+        devices=devices,
+    )
 
-    elif state.domain == 'cover':
-        device_class = state.attributes.get(ATTR_DEVICE_CLASS)
-        features = state.attributes.get(ATTR_SUPPORTED_FEATURES, 0)
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, homekit.async_stop)
+    )
 
-        if device_class == 'garage' and \
-                features & (cover.SUPPORT_OPEN | cover.SUPPORT_CLOSE):
-            a_type = 'GarageDoorOpener'
-        elif features & cover.SUPPORT_SET_POSITION:
-            a_type = 'WindowCovering'
-        elif features & (cover.SUPPORT_OPEN | cover.SUPPORT_CLOSE):
-            a_type = 'WindowCoveringBasic'
+    entry_data = HomeKitEntryData(
+        homekit=homekit, pairing_qr=None, pairing_qr_secret=None
+    )
+    entry.runtime_data = entry_data
 
-    elif state.domain == 'fan':
-        a_type = 'Fan'
+    async def _async_start_homekit(hass: HomeAssistant) -> None:
+        await homekit.async_start()
 
-    elif state.domain == 'light':
-        a_type = 'Light'
-
-    elif state.domain == 'lock':
-        a_type = 'Lock'
-
-    elif state.domain == 'media_player':
-        feature_list = config.get(CONF_FEATURE_LIST)
-        if feature_list and \
-                validate_media_player_features(state, feature_list):
-            a_type = 'MediaPlayer'
-
-    elif state.domain == 'sensor':
-        device_class = state.attributes.get(ATTR_DEVICE_CLASS)
-        unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
-
-        if device_class == DEVICE_CLASS_TEMPERATURE or \
-                unit in (TEMP_CELSIUS, TEMP_FAHRENHEIT):
-            a_type = 'TemperatureSensor'
-        elif device_class == DEVICE_CLASS_HUMIDITY and unit == '%':
-            a_type = 'HumiditySensor'
-        elif device_class == DEVICE_CLASS_PM25 \
-                or DEVICE_CLASS_PM25 in state.entity_id:
-            a_type = 'AirQualitySensor'
-        elif device_class == DEVICE_CLASS_CO:
-            a_type = 'CarbonMonoxideSensor'
-        elif device_class == DEVICE_CLASS_CO2 \
-                or DEVICE_CLASS_CO2 in state.entity_id:
-            a_type = 'CarbonDioxideSensor'
-        elif device_class == DEVICE_CLASS_ILLUMINANCE or unit in ('lm', 'lx'):
-            a_type = 'LightSensor'
-
-    elif state.domain == 'switch':
-        switch_type = config.get(CONF_TYPE, TYPE_SWITCH)
-        a_type = SWITCH_TYPES[switch_type]
-
-    elif state.domain in ('automation', 'input_boolean', 'remote', 'script'):
-        a_type = 'Switch'
-
-    if a_type is None:
-        return None
-
-    _LOGGER.debug('Add "%s" as "%s"', state.entity_id, a_type)
-    return TYPES[a_type](hass, driver, name, state.entity_id, aid, config)
+    entry.async_on_unload(async_at_started(hass, _async_start_homekit))
 
 
-def generate_aid(entity_id):
-    """Generate accessory aid with zlib adler32."""
-    aid = adler32(entity_id.encode('utf-8'))
-    if aid in (0, 1):
-        return None
-    return aid
+async def _async_update_listener(
+    hass: HomeAssistant, entry: HomeKitConfigEntry
+) -> None:
+    """Handle options update."""
+    if entry.source == SOURCE_IMPORT:
+        return
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
-class HomeKit():
+async def async_unload_entry(hass: HomeAssistant, entry: HomeKitConfigEntry) -> None:
+    """Unload a config entry."""
+    async_dismiss_setup_message(hass, entry.entry_id)
+    entry_data = entry.runtime_data
+    homekit = entry_data.homekit
+    await homekit.async_stop()
+
+    logged_shutdown_wait = False
+    for _ in range(SHUTDOWN_TIMEOUT):
+        if async_port_is_available(entry.data[CONF_PORT]):
+            break
+
+        if not logged_shutdown_wait:
+            _LOGGER.debug("Waiting for the HomeKit server to shutdown")
+            logged_shutdown_wait = True
+
+        await asyncio.sleep(PORT_CLEANUP_CHECK_INTERVAL_SECS)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: HomeKitConfigEntry) -> None:
+    """Remove a config entry."""
+    await hass.async_add_executor_job(
+        remove_state_files_for_entry_id, hass, entry.entry_id
+    )
+
+
+@callback
+def _async_import_options_from_data_if_missing(
+    hass: HomeAssistant, entry: HomeKitConfigEntry
+) -> None:
+    options = deepcopy(dict(entry.options))
+    data = deepcopy(dict(entry.data))
+    modified = False
+    for importable_option in CONFIG_OPTIONS:
+        if importable_option not in entry.options and importable_option in entry.data:
+            options[importable_option] = entry.data[importable_option]
+            del data[importable_option]
+            modified = True
+
+    if modified:
+        hass.config_entries.async_update_entry(entry, data=data, options=options)
+
+
+class HomeKit:
     """Class to handle all actions between HomeKit and Home Assistant."""
 
-    def __init__(self, hass, name, port, ip_address, entity_filter,
-                 entity_config):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        name: str,
+        port: int,
+        ip_address: list[str] | str | None,
+        entity_filter: EntityFilter,
+        exclude_accessory_mode: bool,
+        entity_config: dict[str, Any],
+        homekit_mode: str,
+        advertise_ips: list[str],
+        entry_id: str,
+        entry_title: str,
+        devices: list[str] | None = None,
+    ) -> None:
         """Initialize a HomeKit object."""
         self.hass = hass
         self._name = name
         self._port = port
         self._ip_address = ip_address
         self._filter = entity_filter
-        self._config = entity_config
+        self._config: defaultdict[str, dict[str, Any]] = defaultdict(
+            dict, entity_config
+        )
+        self._exclude_accessory_mode = exclude_accessory_mode
+        self._advertise_ips = advertise_ips
+        self._entry_id = entry_id
+        self._entry_title = entry_title
+        self._homekit_mode = homekit_mode
+        self._devices = devices or []
+        self.aid_storage: AccessoryAidStorage | None = None
+        self.iid_storage: AccessoryIIDStorage | None = None
         self.status = STATUS_READY
+        self.driver: HomeDriver | None = None
+        self.bridge: HomeBridge | None = None
+        self._reset_lock = asyncio.Lock()
+        self._cancel_reload_dispatcher: CALLBACK_TYPE | None = None
+        # True while running the first ever start of this entry (no
+        # persisted pairing state yet); accessory mode uses it to tell a
+        # brand new entry from one that predates the HeaterCooler.
+        self._first_ever_start = False
 
-        self.bridge = None
-        self.driver = None
+    def setup(self, async_zeroconf_instance: AsyncZeroconf, uuid: str) -> bool:
+        """Set up bridge and accessory driver.
 
-    def setup(self):
-        """Set up bridge and accessory driver."""
-        from .accessories import HomeBridge, HomeDriver
+        Returns True if data was loaded from disk
 
-        self.hass.bus.async_listen_once(
-            EVENT_HOMEASSISTANT_STOP, self.stop)
+        Returns False if the persistent data was not loaded
+        """
+        assert self.iid_storage is not None
+        persist_file = get_persist_fullpath_for_entry_id(self.hass, self._entry_id)
+        self.driver = HomeDriver(
+            self.hass,
+            self._entry_id,
+            self._name,
+            self._entry_title,
+            loop=self.hass.loop,
+            address=self._ip_address,
+            port=self._port,
+            persist_file=persist_file,
+            advertised_address=self._advertise_ips,
+            async_zeroconf_instance=async_zeroconf_instance,
+            zeroconf_server=f"{uuid}-hap.local.",
+            loader=get_loader(),
+            iid_storage=self.iid_storage,
+        )
+        # If we do not load the mac address will be wrong
+        # as pyhap uses a random one until state is restored
+        if os.path.exists(persist_file):
+            self.driver.load()
+            return True
 
-        ip_addr = self._ip_address or get_local_ip()
-        path = self.hass.config.path(HOMEKIT_FILE)
-        self.driver = HomeDriver(self.hass, address=ip_addr,
-                                 port=self._port, persist_file=path)
-        self.bridge = HomeBridge(self.hass, self.driver, self._name)
+        # If there is no persist file, we need to generate a mac
+        self.driver.state.mac = pyhap_util.generate_mac()
+        return False
 
-    def add_bridge_accessory(self, state):
-        """Try adding accessory to bridge if configured beforehand."""
-        if not state or not self._filter(state.entity_id):
+    async def async_reset_accessories(self, entity_ids: Iterable[str]) -> None:
+        """Reset the accessory to load the latest configuration."""
+        _LOGGER.debug("Resetting accessories: %s", entity_ids)
+        async with self._reset_lock:
+            if not self.bridge:
+                # For accessory mode reset and reload are the same
+                await self._async_reload_accessories_in_accessory_mode(entity_ids)
+                return
+            await self._async_reset_accessories_in_bridge_mode(entity_ids)
+
+    async def async_reload_accessories(self, entity_ids: Iterable[str]) -> None:
+        """Reload the accessory to load the latest configuration."""
+        _LOGGER.debug("Reloading accessories: %s", entity_ids)
+        async with self._reset_lock:
+            if not self.bridge:
+                await self._async_reload_accessories_in_accessory_mode(entity_ids)
+                return
+            await self._async_reload_accessories_in_bridge_mode(entity_ids)
+
+    @callback
+    def _async_shutdown_accessory(self, accessory: HomeAccessory) -> None:
+        """Shutdown an accessory."""
+        assert self.driver is not None
+        accessory.async_stop()
+        # Deallocate the IIDs for the accessory
+        iid_manager = accessory.iid_manager
+        services: list[Service] = accessory.services
+        for service in services:
+            iid_manager.remove_obj(service)
+            characteristics: list[Characteristic] = service.characteristics
+            for char in characteristics:
+                iid_manager.remove_obj(char)
+
+    async def _async_reload_accessories_in_accessory_mode(
+        self, entity_ids: Iterable[str]
+    ) -> None:
+        """Reset accessories in accessory mode."""
+        assert self.driver is not None
+
+        acc = cast(HomeAccessory, self.driver.accessory)
+        if acc.entity_id not in entity_ids:
             return
-        aid = generate_aid(state.entity_id)
-        conf = self._config.pop(state.entity_id, {})
-        acc = get_accessory(self.hass, self.driver, state, aid, conf)
-        if acc is not None:
-            self.bridge.add_accessory(acc)
+        if not (state := self.hass.states.get(acc.entity_id)):
+            _LOGGER.warning(
+                "The underlying entity %s disappeared during reload", acc.entity_id
+            )
+            return
+        self._async_shutdown_accessory(acc)
+        if new_acc := self._async_create_single_accessory([state]):
+            self.driver.accessory = new_acc
+            new_acc.run()
+            self._async_update_accessories_hash()
 
-    def start(self, *args):
-        """Start the accessory driver."""
+    def _async_remove_accessories_by_entity_id(
+        self, entity_ids: Iterable[str]
+    ) -> list[str]:
+        """Remove accessories by entity id."""
+        assert self.aid_storage is not None
+        assert self.bridge is not None
+        removed: list[str] = []
+        acc: HomeAccessory | None
+        for entity_id in entity_ids:
+            # A lookup must not allocate; an allocation marks the entity as
+            # previously bridged, which would suppress the automatic routing.
+            aid = self.aid_storage.get_allocated_aid_for_entity_id(entity_id)
+            if aid is None or aid not in self.bridge.accessories:
+                continue
+            if acc := self.async_remove_bridge_accessory(aid):
+                self._async_shutdown_accessory(acc)
+                removed.append(entity_id)
+        return removed
+
+    async def _async_reset_accessories_in_bridge_mode(
+        self, entity_ids: Iterable[str]
+    ) -> None:
+        """Reset accessories in bridge mode."""
+        if not (removed := self._async_remove_accessories_by_entity_id(entity_ids)):
+            _LOGGER.debug("No accessories to reset in bridge mode for: %s", entity_ids)
+            return
+        # With a reset, we need to remove the accessories,
+        # and force config change so iCloud deletes them from
+        # the database.
+        assert self.driver is not None
+        self._async_update_accessories_hash()
+        await asyncio.sleep(_HOMEKIT_CONFIG_UPDATE_TIME)
+        await self._async_recreate_removed_accessories_in_bridge_mode(removed)
+
+    async def _async_reload_accessories_in_bridge_mode(
+        self, entity_ids: Iterable[str]
+    ) -> None:
+        """Reload accessories in bridge mode."""
+        removed = self._async_remove_accessories_by_entity_id(entity_ids)
+        await self._async_recreate_removed_accessories_in_bridge_mode(removed)
+
+    async def _async_recreate_removed_accessories_in_bridge_mode(
+        self, removed: list[str]
+    ) -> None:
+        """Recreate removed accessories in bridge mode."""
+        for entity_id in removed:
+            if not (state := self.hass.states.get(entity_id)):
+                _LOGGER.warning(
+                    "The underlying entity %s disappeared during reload", entity_id
+                )
+                continue
+            if acc := self.add_bridge_accessory(state):
+                acc.run()
+        self._async_update_accessories_hash()
+
+    @callback
+    def _async_update_accessories_hash(self) -> bool:
+        """Update the accessories hash."""
+        assert self.driver is not None
+        driver = self.driver
+        old_hash = driver.state.accessories_hash
+        new_hash = driver.accessories_hash
+        if driver.state.set_accessories_hash(new_hash):
+            _LOGGER.debug(
+                "Updating HomeKit accessories hash from %s -> %s", old_hash, new_hash
+            )
+            driver.async_persist()
+            driver.async_update_advertisement()
+            return True
+        _LOGGER.debug("HomeKit accessories hash is unchanged: %s", new_hash)
+        return False
+
+    def add_bridge_accessory(self, state: State) -> HomeAccessory | None:
+        """Try adding accessory to bridge if configured beforehand."""
+        assert self.driver is not None
+
+        if self._would_exceed_max_devices(state.entity_id):
+            return None
+
+        if state_needs_accessory_mode(state):
+            if self._exclude_accessory_mode:
+                return None
+            _LOGGER.warning(
+                (
+                    "The bridge %s has entity %s. For best performance, "
+                    "and to prevent unexpected unavailability, create and "
+                    "pair a separate HomeKit instance in accessory mode for "
+                    "this entity"
+                ),
+                self._name,
+                state.entity_id,
+            )
+
+        assert self.aid_storage is not None
+        assert self.bridge is not None
+        conf = self._config.get(state.entity_id, {}).copy()
+        # Must run before the aid is allocated below so a never bridged
+        # entity is still recognizable as new.
+        pending_type = async_resolve_accessory_type(
+            self.aid_storage, state, conf, allow_auto=True
+        )
+        newly_allocated = not self.aid_storage.entity_is_allocated(state.entity_id)
+        aid = self.aid_storage.get_or_allocate_aid_for_entity_id(state.entity_id)
+        # If an accessory cannot be created or added due to an exception
+        # of any kind (usually in pyhap) it should not prevent
+        # the rest of the accessories from being created
+        try:
+            acc = get_accessory(self.hass, self.driver, state, aid, conf)
+            if acc is not None:
+                self.bridge.add_accessory(acc)
+                if pending_type:
+                    self.aid_storage.async_set_accessory_type(
+                        state.entity_id, pending_type
+                    )
+                return acc
+        except Exception:
+            _LOGGER.exception(
+                "Failed to create a HomeKit accessory for %s", state.entity_id
+            )
+        if newly_allocated:
+            # A failed first attempt must not classify the entity as
+            # existing on the next try.
+            self.aid_storage.async_delete_aid_for_entity_id(state.entity_id)
+        return None
+
+    def _would_exceed_max_devices(self, name: str | None) -> bool:
+        """Check if adding another devices would reach the limit and log."""
+        # The bridge itself counts as an accessory
+        assert self.bridge is not None
+        if len(self.bridge.accessories) + 1 >= MAX_DEVICES:
+            _LOGGER.warning(
+                (
+                    "Cannot add %s as this would exceed the %d device limit. Consider"
+                    " using the filter option"
+                ),
+                name,
+                MAX_DEVICES,
+            )
+            return True
+        return False
+
+    async def add_bridge_triggers_accessory(
+        self, device: dr.DeviceEntry, device_triggers: list[dict[str, Any]]
+    ) -> None:
+        """Add device automation triggers to the bridge."""
+        if self._would_exceed_max_devices(device.name):
+            return
+
+        assert self.aid_storage is not None
+        assert self.bridge is not None
+        aid = self.aid_storage.get_or_allocate_aid(device.id, device.id)
+        # If an accessory cannot be created or added due to an exception
+        # of any kind (usually in pyhap) it should not prevent
+        # the rest of the accessories from being created
+        config: dict[str, Any] = {}
+        self._fill_config_from_device_registry_entry(device, config)
+        trigger_accessory = DeviceTriggerAccessory(
+            self.hass,
+            self.driver,
+            device.name,
+            None,
+            aid,
+            config,
+            device_id=device.id,
+            device_triggers=device_triggers,
+        )
+        await trigger_accessory.async_attach()
+        self.bridge.add_accessory(trigger_accessory)
+
+    @callback
+    def async_remove_bridge_accessory(self, aid: int) -> HomeAccessory | None:
+        """Try adding accessory to bridge if configured beforehand."""
+        assert self.bridge is not None
+        if acc := self.bridge.accessories.pop(aid, None):
+            return cast(HomeAccessory, acc)
+        return None
+
+    async def async_configure_accessories(self) -> list[State]:
+        """Configure accessories for the included states."""
+        dev_reg = dr.async_get(self.hass)
+        ent_reg = er.async_get(self.hass)
+        device_lookup: dict[str, dict[tuple[str, str | None], str]] = {}
+        entity_states: list[State] = []
+        entity_filter = self._filter.get_filter()
+        entries = ent_reg.entities
+        for state in self.hass.states.async_all():
+            entity_id = state.entity_id
+            if not entity_filter(entity_id):
+                continue
+
+            if ent_reg_ent := ent_reg.async_get(entity_id):
+                if (
+                    ent_reg_ent.entity_category is not None
+                    or ent_reg_ent.hidden_by is not None
+                ) and not self._filter.explicitly_included(entity_id):
+                    continue
+
+                await self._async_set_device_info_attributes(
+                    ent_reg_ent, dev_reg, entity_id
+                )
+                if device_id := ent_reg_ent.device_id:
+                    if device_id not in device_lookup:
+                        device_lookup[device_id] = {
+                            (
+                                entry.domain,
+                                entry.device_class or entry.original_device_class,
+                            ): entry.entity_id
+                            for entry in entries.get_entries_for_device_id(device_id)
+                        }
+                    self._async_configure_linked_sensors(
+                        ent_reg_ent, device_lookup[device_id], state
+                    )
+
+            entity_states.append(state)
+
+        return entity_states
+
+    async def async_start(self, *args: Any) -> None:
+        """Load storage and start."""
         if self.status != STATUS_READY:
             return
         self.status = STATUS_WAIT
+        self._cancel_reload_dispatcher = async_dispatcher_connect(
+            self.hass,
+            SIGNAL_RELOAD_ENTITIES.format(self._entry_id),
+            self.async_reload_accessories,
+        )
+        async_zc_instance = await zeroconf.async_get_async_instance(self.hass)
+        uuid = await instance_id.async_get(self.hass)
+        self.aid_storage = AccessoryAidStorage(self.hass, self._entry_id)
+        self.iid_storage = AccessoryIIDStorage(self.hass, self._entry_id)
+        # Avoid gather here since it will be I/O bound anyways
+        await self.aid_storage.async_initialize()
+        await self.iid_storage.async_initialize()
+        loaded_from_disk = await self.hass.async_add_executor_job(
+            self.setup, async_zc_instance, uuid
+        )
+        assert self.driver is not None
+        self._first_ever_start = not loaded_from_disk
 
-        # pylint: disable=unused-variable
-        from . import (  # noqa F401
-            type_covers, type_fans, type_lights, type_locks,
-            type_media_players, type_security_systems, type_sensors,
-            type_switches, type_thermostats)
-
-        for state in self.hass.states.all():
-            self.add_bridge_accessory(state)
-        self.driver.add_accessory(self.bridge)
-
-        if not self.driver.state.paired:
-            show_setup_message(self.hass, self.driver.state.pincode)
-
-        if len(self.bridge.accessories) > MAX_DEVICES:
-            _LOGGER.warning('You have exceeded the device limit, which might '
-                            'cause issues. Consider using the filter option.')
-
-        _LOGGER.debug('Driver start')
-        self.hass.add_job(self.driver.start)
+        if not await self._async_create_accessories():
+            return
+        self._async_register_bridge()
+        _LOGGER.debug("Driver start for %s", self._name)
+        await self.driver.async_start()
+        if not loaded_from_disk:
+            # If the state was not loaded from disk, it means this is the
+            # first time the bridge is ever starting up. In this case, we
+            # need to make sure its persisted to disk.
+            async with self.hass.data[PERSIST_LOCK_DATA]:
+                await self.hass.async_add_executor_job(self.driver.persist)
+        # The pairing state is persisted now, so later reloads treat the
+        # entry as existing.
+        self._first_ever_start = False
         self.status = STATUS_RUNNING
 
-    def stop(self, *args):
+        if self.driver.state.paired:
+            return
+        self._async_show_setup_message()
+
+    @callback
+    def _async_show_setup_message(self) -> None:
+        """Show the pairing setup message."""
+        assert self.driver is not None
+
+        async_show_setup_message(
+            self.hass,
+            self._entry_id,
+            accessory_friendly_name(self._entry_title, self.driver.accessory),
+            self.driver.state.pincode,
+            self.driver.accessory.xhm_uri(),
+        )
+
+    @callback
+    def async_unpair(self) -> None:
+        """Remove all pairings for an accessory so it can be repaired."""
+        assert self.driver is not None
+
+        state = self.driver.state
+        for client_uuid in list(state.paired_clients):
+            # We need to check again since removing a single client
+            # can result in removing all the clients that the client
+            # granted access to if it was an admin, otherwise
+            # remove_paired_client can generate a KeyError
+            if client_uuid in state.paired_clients:
+                state.remove_paired_client(client_uuid)
+        self.driver.async_persist()
+        self.driver.async_update_advertisement()
+        self._async_show_setup_message()
+
+    @callback
+    def _async_register_bridge(self) -> None:
+        """Register bridge as device for homekit_controller exclusion."""
+        assert self.driver is not None
+        dev_reg = dr.async_get(self.hass)
+        formatted_mac = dr.format_mac(self.driver.state.mac)
+        # Connections and identifiers are both used here.
+        #
+        # connections exists so homekit_controller can know the
+        # virtual mac address of the bridge and know to not offer
+        # it via discovery.
+        #
+        # identifiers is used as well since the virtual mac may change
+        # because it will not survive manual pairing resets (deleting state file)
+        # which we have trained users to do over the past few years
+        # because this was the way you had to fix homekit when pairing
+        # failed.
+        #
+        connection = (dr.CONNECTION_NETWORK_MAC, formatted_mac)
+        identifier = (DOMAIN, self._entry_id, BRIDGE_SERIAL_NUMBER)
+        self._async_purge_old_bridges(dev_reg, identifier, connection)
+        accessory_type = type(self.driver.accessory).__name__
+        dev_reg.async_get_or_create(
+            config_entry_id=self._entry_id,
+            identifiers={
+                identifier  # type: ignore[arg-type]
+            },  # this needs to be migrated as a 2 item tuple at some point
+            connections={connection},
+            manufacturer=MANUFACTURER,
+            name=accessory_friendly_name(self._entry_title, self.driver.accessory),
+            model=accessory_type,
+            entry_type=dr.DeviceEntryType.SERVICE,
+        )
+
+    @callback
+    def _async_purge_old_bridges(
+        self,
+        dev_reg: dr.DeviceRegistry,
+        identifier: tuple[str, str, str],
+        connection: tuple[str, str],
+    ) -> None:
+        """Purge bridges that exist from failed pairing or manual resets."""
+        devices_to_purge = [
+            entry.id
+            for entry in dr.async_entries_for_config_entry(dev_reg, self._entry_id)
+            if (
+                identifier not in entry.identifiers  # type: ignore[comparison-overlap]
+                or connection not in entry.connections  # type: ignore[unreachable]
+            )
+        ]
+
+        for device_id in devices_to_purge:
+            dev_reg.async_remove_device(device_id)
+
+    @callback
+    def _async_create_single_accessory(
+        self, entity_states: list[State]
+    ) -> HomeAccessory | None:
+        """Create a single HomeKit accessory (accessory mode)."""
+        assert self.driver is not None
+
+        if not entity_states:
+            _LOGGER.error(
+                "HomeKit %s cannot startup: entity not available: %s",
+                self._name,
+                self._filter.config,
+            )
+            return None
+        state = entity_states[0]
+        conf = self._config.get(state.entity_id, {}).copy()
+        # Accessory mode has no aid allocation to tell new from existing,
+        # so only a brand new pairing picks its type automatically; anything
+        # else keeps its current accessory.
+        assert self.aid_storage is not None
+        pending_type = async_resolve_accessory_type(
+            self.aid_storage, state, conf, allow_auto=self._first_ever_start
+        )
+        acc = get_accessory(self.hass, self.driver, state, STANDALONE_AID, conf)
+        if acc is None:
+            _LOGGER.error(
+                "HomeKit %s cannot startup: entity not supported: %s",
+                self._name,
+                self._filter.config,
+            )
+            return None
+        if pending_type:
+            self.aid_storage.async_set_accessory_type(state.entity_id, pending_type)
+        return acc
+
+    async def _async_create_bridge_accessory(
+        self, entity_states: Iterable[State]
+    ) -> HomeAccessory:
+        """Create a HomeKit bridge with accessories. (bridge mode)."""
+        assert self.driver is not None
+
+        self.bridge = HomeBridge(self.hass, self.driver, self._name)
+        for state in entity_states:
+            self.add_bridge_accessory(state)
+        if self._devices:
+            await self._async_add_trigger_accessories()
+        return self.bridge
+
+    async def _async_add_trigger_accessories(self) -> None:
+        """Add devices with triggers to the bridge."""
+        dev_reg = dr.async_get(self.hass)
+        valid_device_ids = []
+        for device_id in self._devices:
+            device = dev_reg.async_get(device_id)
+            if device is None:
+                _LOGGER.warning(
+                    (
+                        "HomeKit %s cannot add device %s because it is missing from the"
+                        " device registry"
+                    ),
+                    self._name,
+                    device_id,
+                )
+            elif isinstance(device, dr.ChildDeviceEntry):
+                _LOGGER.warning(
+                    (
+                        "HomeKit %s cannot add device %s because a child device cannot"
+                        " be a HomeKit accessory"
+                    ),
+                    self._name,
+                    device_id,
+                )
+            else:
+                # A main or composite device is a valid HomeKit accessory
+                valid_device_ids.append(device_id)
+        for device_id, device_triggers in (
+            await device_automation.async_get_device_automations(
+                self.hass,
+                device_automation.DeviceAutomationType.TRIGGER,
+                valid_device_ids,
+            )
+        ).items():
+            device = dev_reg.async_get(device_id, include_child_devices=False)
+            assert device is not None
+            valid_device_triggers: list[dict[str, Any]] = []
+            for trigger in device_triggers:
+                try:
+                    await async_validate_trigger_config(self.hass, trigger)
+                except probatio.Invalid as ex:
+                    _LOGGER.debug(
+                        (
+                            "%s: cannot add unsupported trigger %s because it requires"
+                            " additional inputs which are not supported by HomeKit: %s"
+                        ),
+                        self._name,
+                        trigger,
+                        ex,
+                    )
+                    continue
+                valid_device_triggers.append(trigger)
+            await self.add_bridge_triggers_accessory(device, valid_device_triggers)
+
+    async def _async_create_accessories(self) -> bool:
+        """Create the accessories."""
+        assert self.driver is not None
+
+        entity_states = await self.async_configure_accessories()
+        if self._homekit_mode == HOMEKIT_MODE_ACCESSORY:
+            acc = self._async_create_single_accessory(entity_states)
+        else:
+            acc = await self._async_create_bridge_accessory(entity_states)
+
+        if acc is None:
+            return False
+        # No need to load/persist as we do it in setup
+        self.driver.accessory = acc
+        return True
+
+    async def async_stop(self, *args: Any) -> None:
         """Stop the accessory driver."""
+        # The dispatcher is connected before the start can bail out early.
+        if self._cancel_reload_dispatcher:
+            self._cancel_reload_dispatcher()
+            self._cancel_reload_dispatcher = None
         if self.status != STATUS_RUNNING:
             return
-        self.status = STATUS_STOPPED
+        async with self._reset_lock:
+            self.status = STATUS_STOPPED
+            _LOGGER.debug("Driver stop for %s", self._name)
+            if self.driver:
+                await self.driver.async_stop()
 
-        _LOGGER.debug('Driver stop')
-        self.hass.add_job(self.driver.stop)
+    @callback
+    def _async_configure_linked_sensors(
+        self,
+        ent_reg_ent: er.RegistryEntry,
+        lookup: dict[tuple[str, str | None], str],
+        state: State,
+    ) -> None:
+        if (ent_reg_ent.device_class or ent_reg_ent.original_device_class) in (
+            BinarySensorDeviceClass.BATTERY_CHARGING,
+            SensorDeviceClass.BATTERY,
+        ):
+            return
+
+        domain = state.domain
+        attributes = state.attributes
+        config = self._config
+        entity_id = state.entity_id
+
+        if ATTR_BATTERY_CHARGING not in attributes and (
+            battery_charging_binary_sensor_entity_id := lookup.get(
+                BATTERY_CHARGING_SENSOR
+            )
+        ):
+            config[entity_id].setdefault(
+                CONF_LINKED_BATTERY_CHARGING_SENSOR,
+                battery_charging_binary_sensor_entity_id,
+            )
+
+        if ATTR_BATTERY_LEVEL not in attributes and (
+            battery_sensor_entity_id := lookup.get(BATTERY_SENSOR)
+        ):
+            config[entity_id].setdefault(
+                CONF_LINKED_BATTERY_SENSOR, battery_sensor_entity_id
+            )
+
+        if domain == CAMERA_DOMAIN:
+            if motion_event_entity_id := lookup.get(MOTION_EVENT_SENSOR):
+                config[entity_id].setdefault(
+                    CONF_LINKED_MOTION_SENSOR, motion_event_entity_id
+                )
+            elif motion_binary_sensor_entity_id := lookup.get(MOTION_SENSOR):
+                config[entity_id].setdefault(
+                    CONF_LINKED_MOTION_SENSOR, motion_binary_sensor_entity_id
+                )
+
+        if domain in (CAMERA_DOMAIN, LOCK_DOMAIN):
+            if doorbell_event_entity_id := lookup.get(DOORBELL_EVENT_SENSOR):
+                config[entity_id].setdefault(
+                    CONF_LINKED_DOORBELL_SENSOR, doorbell_event_entity_id
+                )
+
+        if domain == FAN_DOMAIN:
+            if current_humidity_sensor_entity_id := lookup.get(HUMIDITY_SENSOR):
+                config[entity_id].setdefault(
+                    CONF_LINKED_HUMIDITY_SENSOR, current_humidity_sensor_entity_id
+                )
+            if current_pm25_sensor_entity_id := lookup.get(PM25_SENSOR):
+                config[entity_id].setdefault(CONF_TYPE, TYPE_AIR_PURIFIER)
+                config[entity_id].setdefault(
+                    CONF_LINKED_PM25_SENSOR, current_pm25_sensor_entity_id
+                )
+            if current_temperature_sensor_entity_id := lookup.get(TEMPERATURE_SENSOR):
+                config[entity_id].setdefault(
+                    CONF_LINKED_TEMPERATURE_SENSOR, current_temperature_sensor_entity_id
+                )
+
+        if domain == HUMIDIFIER_DOMAIN and (
+            current_humidity_sensor_entity_id := lookup.get(HUMIDITY_SENSOR)
+        ):
+            config[entity_id].setdefault(
+                CONF_LINKED_HUMIDITY_SENSOR, current_humidity_sensor_entity_id
+            )
+
+    async def _async_set_device_info_attributes(
+        self,
+        ent_reg_ent: er.RegistryEntry,
+        dev_reg: dr.DeviceRegistry,
+        entity_id: str,
+    ) -> None:
+        """Set attributes that will be used for homekit device info."""
+        ent_cfg = self._config[entity_id]
+        if ent_reg_ent.device_id:
+            dev_reg_ent = dev_reg.async_get(ent_reg_ent.device_id)
+            if isinstance(dev_reg_ent, dr.ChildDeviceEntry):
+                # A child device has no hardware info of its own; use the parent's
+                dev_reg_ent = dev_reg.async_get(
+                    dev_reg_ent.parent_device_id, include_child_devices=False
+                )
+            if dev_reg_ent is not None:
+                self._fill_config_from_device_registry_entry(dev_reg_ent, ent_cfg)
+        if ATTR_MANUFACTURER not in ent_cfg:
+            try:
+                integration = await async_get_integration(
+                    self.hass, ent_reg_ent.platform
+                )
+                ent_cfg[ATTR_INTEGRATION] = integration.name
+            except IntegrationNotFound:
+                ent_cfg[ATTR_INTEGRATION] = ent_reg_ent.platform
+
+    def _fill_config_from_device_registry_entry(
+        self, device_entry: dr.DeviceEntry, config: dict[str, Any]
+    ) -> None:
+        """Populate a config dict from the registry."""
+        if device_entry.manufacturer:
+            config[ATTR_MANUFACTURER] = device_entry.manufacturer
+        if device_entry.model:
+            config[ATTR_MODEL] = device_entry.model
+        if device_entry.sw_version:
+            config[ATTR_SW_VERSION] = device_entry.sw_version
+        if device_entry.hw_version:
+            config[ATTR_HW_VERSION] = device_entry.hw_version
+        if entry := self.hass.config_entries.async_get_entry(
+            device_entry.config_entry_id
+        ):
+            config[ATTR_INTEGRATION] = entry.domain
+
+
+class HomeKitPairingQRView(HomeAssistantView):
+    """Display the homekit pairing code at a protected url."""
+
+    url = "/api/homekit/pairingqr"
+    name = "api:homekit:pairingqr"
+    requires_auth = False
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Retrieve the pairing QRCode image."""
+        if not request.query_string:
+            raise Unauthorized
+        entry_id, secret = request.query_string.split("-")
+        hass = request.app[KEY_HASS]
+        entry_data: HomeKitEntryData | None
+        if (
+            not (entry := hass.config_entries.async_get_entry(entry_id))
+            or not (entry_data := getattr(entry, "runtime_data", None))
+            or not secret
+            or not entry_data.pairing_qr_secret
+            or secret != entry_data.pairing_qr_secret
+        ):
+            raise Unauthorized
+        return web.Response(
+            body=entry_data.pairing_qr,
+            content_type="image/svg+xml",
+        )

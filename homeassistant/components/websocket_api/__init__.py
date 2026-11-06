@@ -1,42 +1,99 @@
-"""
-Websocket based API for Home Assistant.
+"""WebSocket based API for Home Assistant."""
 
-For more details about this component, please refer to the documentation at
-https://developers.home-assistant.io/docs/external_api_websocket.html
-"""
-from homeassistant.core import callback
-from homeassistant.loader import bind_hass
+from typing import Final, cast
 
-from . import commands, connection, const, decorators, http, messages
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType, VolSchemaType
 
-DOMAIN = const.DOMAIN
+from . import commands, connection, const, decorators, http, messages  # noqa: F401
+from .connection import ActiveConnection, current_connection
+from .const import (
+    ERR_HOME_ASSISTANT_ERROR,
+    ERR_INVALID_FORMAT,
+    ERR_NOT_ALLOWED,
+    ERR_NOT_FOUND,
+    ERR_NOT_SUPPORTED,
+    ERR_SERVICE_VALIDATION_ERROR,
+    ERR_TEMPLATE_ERROR,
+    ERR_TIMEOUT,
+    ERR_UNAUTHORIZED,
+    ERR_UNKNOWN_COMMAND,
+    ERR_UNKNOWN_ERROR,
+    TYPE_RESULT,
+    AsyncWebSocketCommandHandler,
+    WebSocketCommandHandler,
+)
+from .decorators import (
+    async_response,
+    require_admin,
+    websocket_command,
+    ws_require_user,
+)
+from .messages import (
+    BASE_COMMAND_MESSAGE_SCHEMA,
+    error_message,
+    event_message,
+    result_message,
+)
 
-DEPENDENCIES = ('http',)
+DOMAIN: Final = const.DOMAIN
 
-# Backwards compat / Make it easier to integrate
-# pylint: disable=invalid-name
-ActiveConnection = connection.ActiveConnection
-BASE_COMMAND_MESSAGE_SCHEMA = messages.BASE_COMMAND_MESSAGE_SCHEMA
-error_message = messages.error_message
-result_message = messages.result_message
-async_response = decorators.async_response
-require_owner = decorators.require_owner
-ws_require_user = decorators.ws_require_user
-# pylint: enable=invalid-name
+DEPENDENCIES: Final[tuple[str]] = ("http",)
+
+CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
+
+__all__ = [
+    "BASE_COMMAND_MESSAGE_SCHEMA",
+    "DOMAIN",
+    "ERR_HOME_ASSISTANT_ERROR",
+    "ERR_INVALID_FORMAT",
+    "ERR_NOT_ALLOWED",
+    "ERR_NOT_FOUND",
+    "ERR_NOT_SUPPORTED",
+    "ERR_SERVICE_VALIDATION_ERROR",
+    "ERR_TEMPLATE_ERROR",
+    "ERR_TIMEOUT",
+    "ERR_UNAUTHORIZED",
+    "ERR_UNKNOWN_COMMAND",
+    "ERR_UNKNOWN_ERROR",
+    "TYPE_RESULT",
+    "ActiveConnection",
+    "AsyncWebSocketCommandHandler",
+    "WebSocketCommandHandler",
+    "async_register_command",
+    "async_response",
+    "current_connection",
+    "error_message",
+    "event_message",
+    "require_admin",
+    "result_message",
+    "websocket_command",
+    "ws_require_user",
+]
 
 
-@bind_hass
 @callback
-def async_register_command(hass, command, handler, schema):
+def async_register_command(
+    hass: HomeAssistant,
+    command_or_handler: str | const.WebSocketCommandHandler,
+    handler: const.WebSocketCommandHandler | None = None,
+    schema: VolSchemaType | None = None,
+) -> None:
     """Register a websocket command."""
-    handlers = hass.data.get(DOMAIN)
-    if handlers is None:
+    if handler is None:
+        handler = cast(const.WebSocketCommandHandler, command_or_handler)
+        command = handler._ws_command  # type: ignore[attr-defined]  # noqa: SLF001
+        schema = handler._ws_schema  # type: ignore[attr-defined]  # noqa: SLF001
+    else:
+        command = command_or_handler
+    if (handlers := hass.data.get(DOMAIN)) is None:
         handlers = hass.data[DOMAIN] = {}
     handlers[command] = (handler, schema)
 
 
-async def async_setup(hass, config):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Initialize the websocket API."""
-    hass.http.register_view(http.WebsocketAPIView)
-    commands.async_register_commands(hass)
+    hass.http.register_view(http.WebsocketAPIView())
+    commands.async_register_commands(hass, async_register_command)
     return True

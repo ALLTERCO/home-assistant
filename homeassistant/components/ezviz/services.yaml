@@ -1,0 +1,5 @@
+wake_device:
+  target:
+    entity:
+      integration: ezviz
+      domain: camera

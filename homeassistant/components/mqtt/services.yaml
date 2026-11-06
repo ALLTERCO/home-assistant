@@ -1,26 +1,51 @@
 # Describes the format for available MQTT services
 
 publish:
-  description: Publish a message to an MQTT topic.
   fields:
     topic:
-      description: Topic to publish payload.
+      required: true
       example: /homeassistant/hello
+      selector:
+        text:
     payload:
-      description: Payload to publish.
-      example: This is great
-    payload_template:
-      description: Template to render as payload value. Ignored if payload given.
-      example: "{{ states('sensor.temperature') }}"
-    qos:
-      description: Quality of Service to use.
-      example: 2
-      values:
-        - 0
-        - 1
-        - 2
-      default: 0
-    retain:
-      description: If message should have the retain flag set.
-      example: true
-      default: false
+      example: "The temperature is {{ states('sensor.temperature') }}"
+      selector:
+        template:
+    publish_options:
+      collapsed: true
+      fields:
+        evaluate_payload:
+          default: false
+          selector:
+            boolean:
+        qos:
+          default: "0"
+          selector:
+            select:
+              options:
+                - "0"
+                - "1"
+                - "2"
+        retain:
+          default: false
+          selector:
+            boolean:
+        message_expiry_interval:
+          selector:
+            duration:
+              enable_day: true
+dump:
+  fields:
+    topic:
+      example: "OpenZWave/#"
+      selector:
+        text:
+    duration:
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 300
+          unit_of_measurement: "seconds"
+
+reload:

@@ -1,868 +1,558 @@
-"""
-Support for MQTT message handling.
+"""Support for MQTT message handling."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/mqtt/
-"""
 import asyncio
-from itertools import groupby
+from collections.abc import Callable
 import logging
-from operator import attrgetter
-import os
-import socket
-import ssl
-import time
-from typing import Any, Callable, List, Optional, Union, cast  # noqa: F401
+from typing import Any, cast
 
-import attr
-import requests.certs
-import voluptuous as vol
+import probatio
 
-from homeassistant import config_entries
+from homeassistant import config as conf_util
+from homeassistant.components import websocket_api
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    CONF_PASSWORD, CONF_PAYLOAD, CONF_PORT, CONF_PROTOCOL, CONF_USERNAME,
-    CONF_VALUE_TEMPLATE, EVENT_HOMEASSISTANT_STOP)
-from homeassistant.core import Event, ServiceCall, callback
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers import template
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.typing import (
-    ConfigType, HomeAssistantType, ServiceDataType)
-from homeassistant.loader import bind_hass
-from homeassistant.setup import async_prepare_setup_platform
-from homeassistant.util.async_ import (
-    run_callback_threadsafe, run_coroutine_threadsafe)
+    CONF_DISCOVERY,
+    CONF_PLATFORM,
+    CONF_PORT,
+    CONF_PROTOCOL,
+    SERVICE_RELOAD,
+    Platform,
+)
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import Unauthorized
+from homeassistant.helpers import (
+    config_validation as cv,
+    entity_registry as er,
+    issue_registry as ir,
+)
+from homeassistant.helpers.device_registry import AnyDeviceEntry
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_loaded_integration
+from homeassistant.setup import SetupPhases, async_pause_setup
+from homeassistant.util.async_ import create_eager_task
 
 # Loading the config flow file will register the flow
-from . import config_flow  # noqa  # pylint: disable=unused-import
-from .const import CONF_BROKER, CONF_DISCOVERY, DEFAULT_DISCOVERY
-from .server import HBMQTT_CONFIG_SCHEMA
+from . import debug_info, discovery
+from .client import (
+    MQTT,
+    async_on_subscribe_done,
+    async_publish,
+    async_subscribe,
+    async_subscribe_internal,
+    publish,
+    subscribe,
+    try_connection,
+)
+from .config import MQTT_BASE_SCHEMA, MQTT_RO_SCHEMA, MQTT_RW_SCHEMA
+from .config_integration import CONFIG_SCHEMA_BASE
+from .const import (
+    ATTR_PAYLOAD,
+    ATTR_QOS,
+    ATTR_RETAIN,
+    ATTR_TOPIC,
+    CONF_BIRTH_MESSAGE,
+    CONF_BROKER,
+    CONF_CERTIFICATE,
+    CONF_CLIENT_CERT,
+    CONF_CLIENT_KEY,
+    CONF_COMMAND_TOPIC,
+    CONF_DISCOVERY_PREFIX,
+    CONF_KEEPALIVE,
+    CONF_QOS,
+    CONF_STATE_TOPIC,
+    CONF_TLS_INSECURE,
+    CONF_TOPIC,
+    CONF_TRANSPORT,
+    CONF_WILL_MESSAGE,
+    CONF_WS_HEADERS,
+    CONF_WS_PATH,
+    CONFIG_ENTRY_MINOR_VERSION,
+    CONFIG_ENTRY_VERSION,
+    DEFAULT_DISCOVERY,
+    DEFAULT_ENCODING,
+    DEFAULT_PORT,
+    DEFAULT_PREFIX,
+    DEFAULT_QOS,
+    DEFAULT_RETAIN,
+    DOMAIN,
+    ENTITY_PLATFORMS,
+    MQTT_CONNECTION_STATE,
+    PROTOCOL_5,
+    PROTOCOL_311,
+    SERVICE_PUBLISH,
+    TEMPLATE_ERRORS,
+    MqttService,
+    MqttServiceArgument,
+)
+from .models import (
+    DATA_MQTT,
+    DATA_MQTT_AVAILABLE,
+    MqttCommandTemplate,
+    MqttData,
+    MqttValueTemplate,
+    PayloadSentinel,
+    PublishPayloadType,
+    ReceiveMessage,
+    convert_outgoing_mqtt_payload,
+)
+from .services import async_setup_services
+from .subscription import (
+    EntitySubscription,
+    async_prepare_subscribe_topics,
+    async_subscribe_topics,
+    async_unsubscribe_topics,
+)
+from .util import (
+    async_check_config_schema,
+    async_create_certificate_temp_files,
+    async_forward_entry_setup_and_setup_discovery,
+    async_refresh_mqtt_issues,
+    async_wait_for_mqtt_client,
+    mqtt_config_entry_enabled,
+    platforms_from_config,
+    valid_publish_topic,
+    valid_qos_schema,
+    valid_subscribe_topic,
+)
 
-REQUIREMENTS = ['paho-mqtt==1.4.0']
+__all__ = [
+    "ATTR_PAYLOAD",
+    "ATTR_QOS",
+    "ATTR_RETAIN",
+    "ATTR_TOPIC",
+    "CONFIG_ENTRY_MINOR_VERSION",
+    "CONFIG_ENTRY_VERSION",
+    "CONF_BIRTH_MESSAGE",
+    "CONF_BROKER",
+    "CONF_CERTIFICATE",
+    "CONF_CLIENT_CERT",
+    "CONF_CLIENT_KEY",
+    "CONF_COMMAND_TOPIC",
+    "CONF_DISCOVERY_PREFIX",
+    "CONF_KEEPALIVE",
+    "CONF_QOS",
+    "CONF_STATE_TOPIC",
+    "CONF_TLS_INSECURE",
+    "CONF_TOPIC",
+    "CONF_TRANSPORT",
+    "CONF_WILL_MESSAGE",
+    "CONF_WS_HEADERS",
+    "CONF_WS_PATH",
+    "DATA_MQTT",
+    "DATA_MQTT_AVAILABLE",
+    "DEFAULT_DISCOVERY",
+    "DEFAULT_ENCODING",
+    "DEFAULT_PREFIX",
+    "DEFAULT_QOS",
+    "DEFAULT_RETAIN",
+    "DOMAIN",
+    "ENTITY_PLATFORMS",
+    "MQTT",
+    "MQTT_BASE_SCHEMA",
+    "MQTT_CONNECTION_STATE",
+    "MQTT_RO_SCHEMA",
+    "MQTT_RW_SCHEMA",
+    "SERVICE_PUBLISH",
+    "SERVICE_RELOAD",
+    "TEMPLATE_ERRORS",
+    "EntitySubscription",
+    "MqttCommandTemplate",
+    "MqttData",
+    "MqttService",
+    "MqttServiceArgument",
+    "MqttValueTemplate",
+    "PayloadSentinel",
+    "PublishPayloadType",
+    "ReceiveMessage",
+    "SetupPhases",
+    "async_check_config_schema",
+    "async_create_certificate_temp_files",
+    "async_forward_entry_setup_and_setup_discovery",
+    "async_migrate_entry",
+    "async_on_subscribe_done",
+    "async_prepare_subscribe_topics",
+    "async_publish",
+    "async_remove_config_entry_device",
+    "async_subscribe",
+    "async_subscribe_connection_status",
+    "async_subscribe_topics",
+    "async_unsubscribe_topics",
+    "async_wait_for_mqtt_client",
+    "convert_outgoing_mqtt_payload",
+    "create_eager_task",
+    "is_connected",
+    "mqtt_config_entry_enabled",
+    "platforms_from_config",
+    "publish",
+    "subscribe",
+    "valid_publish_topic",
+    "valid_qos_schema",
+    "valid_subscribe_topic",
+    "websocket_mqtt_info",
+    "websocket_subscribe",
+]
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = 'mqtt'
-
-DATA_MQTT = 'mqtt'
-DATA_MQTT_CONFIG = 'mqtt_config'
-DATA_MQTT_HASS_CONFIG = 'mqtt_hass_config'
-
-SERVICE_PUBLISH = 'publish'
-
-CONF_EMBEDDED = 'embedded'
-
-CONF_CLIENT_ID = 'client_id'
-CONF_DISCOVERY_PREFIX = 'discovery_prefix'
-CONF_KEEPALIVE = 'keepalive'
-CONF_CERTIFICATE = 'certificate'
-CONF_CLIENT_KEY = 'client_key'
-CONF_CLIENT_CERT = 'client_cert'
-CONF_TLS_INSECURE = 'tls_insecure'
-CONF_TLS_VERSION = 'tls_version'
-
-CONF_BIRTH_MESSAGE = 'birth_message'
-CONF_WILL_MESSAGE = 'will_message'
-
-CONF_STATE_TOPIC = 'state_topic'
-CONF_COMMAND_TOPIC = 'command_topic'
-CONF_AVAILABILITY_TOPIC = 'availability_topic'
-CONF_PAYLOAD_AVAILABLE = 'payload_available'
-CONF_PAYLOAD_NOT_AVAILABLE = 'payload_not_available'
-CONF_QOS = 'qos'
-CONF_RETAIN = 'retain'
-
-PROTOCOL_31 = '3.1'
-PROTOCOL_311 = '3.1.1'
-
-DEFAULT_PORT = 1883
-DEFAULT_KEEPALIVE = 60
-DEFAULT_QOS = 0
-DEFAULT_RETAIN = False
-DEFAULT_PROTOCOL = PROTOCOL_311
-DEFAULT_DISCOVERY_PREFIX = 'homeassistant'
-DEFAULT_TLS_PROTOCOL = 'auto'
-DEFAULT_PAYLOAD_AVAILABLE = 'online'
-DEFAULT_PAYLOAD_NOT_AVAILABLE = 'offline'
-
-ATTR_TOPIC = 'topic'
-ATTR_PAYLOAD = 'payload'
-ATTR_PAYLOAD_TEMPLATE = 'payload_template'
-ATTR_QOS = CONF_QOS
-ATTR_RETAIN = CONF_RETAIN
-ATTR_DISCOVERY_HASH = 'discovery_hash'
-
 MAX_RECONNECT_WAIT = 300  # seconds
 
+CONNECTION_SUCCESS = "connection_success"
+CONNECTION_FAILED = "connection_failed"
+CONNECTION_FAILED_RECOVERABLE = "connection_failed_recoverable"
 
-def valid_topic(value: Any) -> str:
-    """Validate that this is a valid topic name/filter."""
-    value = cv.string(value)
-    try:
-        raw_value = value.encode('utf-8')
-    except UnicodeError:
-        raise vol.Invalid("MQTT topic name/filter must be valid UTF-8 string.")
-    if not raw_value:
-        raise vol.Invalid("MQTT topic name/filter must not be empty.")
-    if len(raw_value) > 65535:
-        raise vol.Invalid("MQTT topic name/filter must not be longer than "
-                          "65535 encoded bytes.")
-    if '\0' in value:
-        raise vol.Invalid("MQTT topic name/filter must not contain null "
-                          "character.")
-    return value
-
-
-def valid_subscribe_topic(value: Any) -> str:
-    """Validate that we can subscribe using this MQTT topic."""
-    value = valid_topic(value)
-    for i in (i for i, c in enumerate(value) if c == '+'):
-        if (i > 0 and value[i - 1] != '/') or \
-                (i < len(value) - 1 and value[i + 1] != '/'):
-            raise vol.Invalid("Single-level wildcard must occupy an entire "
-                              "level of the filter")
-
-    index = value.find('#')
-    if index != -1:
-        if index != len(value) - 1:
-            # If there are multiple wildcards, this will also trigger
-            raise vol.Invalid("Multi-level wildcard must be the last "
-                              "character in the topic filter.")
-        if len(value) > 1 and value[index - 1] != '/':
-            raise vol.Invalid("Multi-level wildcard must be after a topic "
-                              "level separator.")
-
-    return value
+# We accept 2 schemes for configuring manual MQTT items
+#
+# Preferred style:
+#
+# mqtt:
+#   - {domain}:
+#       name: ""
+#       ...
+#   - {domain}:
+#       name: ""
+#       ...
+# ```
+#
+# Legacy supported style:
+#
+# mqtt:
+#   {domain}:
+#     - name: ""
+#       ...
+#     - name: ""
+#       ...
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        DOMAIN: probatio.All(
+            probatio.EnsureList(),
+            cv.remove_falsy,
+            [CONFIG_SCHEMA_BASE],
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
+)
 
 
-def valid_publish_topic(value: Any) -> str:
-    """Validate that we can publish using this MQTT topic."""
-    value = valid_topic(value)
-    if '+' in value or '#' in value:
-        raise vol.Invalid("Wildcards can not be used in topic names")
-    return value
+async def _async_config_entry_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Handle signals of config entry being updated.
+
+    Causes for this is config entry options changing.
+    """
+    hass.config_entries.async_schedule_reload(entry.entry_id)
 
 
-_VALID_QOS_SCHEMA = vol.All(vol.Coerce(int), vol.In([0, 1, 2]))
-
-CLIENT_KEY_AUTH_MSG = 'client_key and client_cert must both be present in ' \
-                      'the MQTT broker configuration'
-
-MQTT_WILL_BIRTH_SCHEMA = vol.Schema({
-    vol.Required(ATTR_TOPIC): valid_publish_topic,
-    vol.Required(ATTR_PAYLOAD, CONF_PAYLOAD): cv.string,
-    vol.Optional(ATTR_QOS, default=DEFAULT_QOS): _VALID_QOS_SCHEMA,
-    vol.Optional(ATTR_RETAIN, default=DEFAULT_RETAIN): cv.boolean,
-}, required=True)
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: vol.Schema({
-        vol.Optional(CONF_CLIENT_ID): cv.string,
-        vol.Optional(CONF_KEEPALIVE, default=DEFAULT_KEEPALIVE):
-            vol.All(vol.Coerce(int), vol.Range(min=15)),
-        vol.Optional(CONF_BROKER): cv.string,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-        vol.Optional(CONF_USERNAME): cv.string,
-        vol.Optional(CONF_PASSWORD): cv.string,
-        vol.Optional(CONF_CERTIFICATE): vol.Any('auto', cv.isfile),
-        vol.Inclusive(CONF_CLIENT_KEY, 'client_key_auth',
-                      msg=CLIENT_KEY_AUTH_MSG): cv.isfile,
-        vol.Inclusive(CONF_CLIENT_CERT, 'client_key_auth',
-                      msg=CLIENT_KEY_AUTH_MSG): cv.isfile,
-        vol.Optional(CONF_TLS_INSECURE): cv.boolean,
-        vol.Optional(CONF_TLS_VERSION, default=DEFAULT_TLS_PROTOCOL):
-            vol.Any('auto', '1.0', '1.1', '1.2'),
-        vol.Optional(CONF_PROTOCOL, default=DEFAULT_PROTOCOL):
-            vol.All(cv.string, vol.In([PROTOCOL_31, PROTOCOL_311])),
-        vol.Optional(CONF_EMBEDDED): HBMQTT_CONFIG_SCHEMA,
-        vol.Optional(CONF_WILL_MESSAGE): MQTT_WILL_BIRTH_SCHEMA,
-        vol.Optional(CONF_BIRTH_MESSAGE): MQTT_WILL_BIRTH_SCHEMA,
-        vol.Optional(CONF_DISCOVERY, default=DEFAULT_DISCOVERY): cv.boolean,
-        # discovery_prefix must be a valid publish topic because if no
-        # state topic is specified, it will be created with the given prefix.
-        vol.Optional(CONF_DISCOVERY_PREFIX,
-                     default=DEFAULT_DISCOVERY_PREFIX): valid_publish_topic,
-    }),
-}, extra=vol.ALLOW_EXTRA)
-
-SCHEMA_BASE = {
-    vol.Optional(CONF_QOS, default=DEFAULT_QOS): _VALID_QOS_SCHEMA,
-}
-
-MQTT_AVAILABILITY_SCHEMA = vol.Schema({
-    vol.Optional(CONF_AVAILABILITY_TOPIC): valid_subscribe_topic,
-    vol.Optional(CONF_PAYLOAD_AVAILABLE,
-                 default=DEFAULT_PAYLOAD_AVAILABLE): cv.string,
-    vol.Optional(CONF_PAYLOAD_NOT_AVAILABLE,
-                 default=DEFAULT_PAYLOAD_NOT_AVAILABLE): cv.string,
-})
-
-MQTT_BASE_PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(SCHEMA_BASE)
-
-# Sensor type platforms subscribe to MQTT events
-MQTT_RO_PLATFORM_SCHEMA = MQTT_BASE_PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_STATE_TOPIC): valid_subscribe_topic,
-    vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
-})
-
-# Switch type platforms publish to MQTT and may subscribe
-MQTT_RW_PLATFORM_SCHEMA = MQTT_BASE_PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_COMMAND_TOPIC): valid_publish_topic,
-    vol.Optional(CONF_RETAIN, default=DEFAULT_RETAIN): cv.boolean,
-    vol.Optional(CONF_STATE_TOPIC): valid_subscribe_topic,
-    vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
-})
-
-# Service call validation schema
-MQTT_PUBLISH_SCHEMA = vol.Schema({
-    vol.Required(ATTR_TOPIC): valid_publish_topic,
-    vol.Exclusive(ATTR_PAYLOAD, CONF_PAYLOAD): object,
-    vol.Exclusive(ATTR_PAYLOAD_TEMPLATE, CONF_PAYLOAD): cv.string,
-    vol.Optional(ATTR_QOS, default=DEFAULT_QOS): _VALID_QOS_SCHEMA,
-    vol.Optional(ATTR_RETAIN, default=DEFAULT_RETAIN): cv.boolean,
-}, required=True)
+def _platforms_in_use(hass: HomeAssistant, entry: ConfigEntry) -> set[str | Platform]:
+    """Return a set of platforms in use."""
+    domains: set[str | Platform] = {
+        entry.domain
+        for entry in er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )
+    }
+    # Update with domains from subentries
+    for subentry in entry.subentries.values():
+        components = subentry.data["components"].values()
+        domains.update(component[CONF_PLATFORM] for component in components)
+    return domains
 
 
-# pylint: disable=invalid-name
-PublishPayloadType = Union[str, bytes, int, float, None]
-SubscribePayloadType = Union[str, bytes]  # Only bytes if encoding is None
-MessageCallbackType = Callable[[str, SubscribePayloadType, int], None]
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the actions and websocket API for the MQTT component."""
+
+    if config.get(DOMAIN) and not mqtt_config_entry_enabled(hass):
+        issue_registry = ir.async_get(hass)
+        issue_registry.async_get_or_create(
+            DOMAIN,
+            "yaml_setup_without_active_setup",
+            is_fixable=False,
+            is_persistent=False,
+            severity=ir.IssueSeverity.WARNING,
+            learn_more_url="https://www.home-assistant.io/integrations/mqtt/"
+            "#configuration",
+            translation_key="yaml_setup_without_active_setup",
+        )
+
+    websocket_api.async_register_command(hass, websocket_subscribe)
+    websocket_api.async_register_command(hass, websocket_mqtt_info)
+
+    async_setup_services(hass)
+
+    return True
 
 
-def _build_publish_data(topic: Any, qos: int, retain: bool) -> ServiceDataType:
-    """Build the arguments for the publish service without the payload."""
-    data = {ATTR_TOPIC: topic}
-    if qos is not None:
-        data[ATTR_QOS] = qos
-    if retain is not None:
-        data[ATTR_RETAIN] = retain
-    return data
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Migrate the config entry to the latest version."""
+    _LOGGER.debug("Migrating from version %s.%s", entry.version, entry.minor_version)
+    data: dict[str, Any] = dict(entry.data)
+    options: dict[str, Any] = dict(entry.options)
+
+    if entry.version == 1 and entry.minor_version < 2:
+        for key in (
+            CONF_DISCOVERY,
+            CONF_DISCOVERY_PREFIX,
+            "birth_message",
+            "will_message",
+        ):
+            if key not in data:
+                continue
+            options[key] = data.pop(key)
+
+    # Bump config entry to version 2.1
+    hass.config_entries.async_update_entry(
+        entry,
+        data=data,
+        options=options,
+        version=2,
+        minor_version=1,
+    )
+
+    _LOGGER.debug(
+        "Migration to version %s.%s successful", entry.version, entry.minor_version
+    )
 
 
-@bind_hass
-def publish(hass: HomeAssistantType, topic, payload, qos=None,
-            retain=None) -> None:
-    """Publish message to an MQTT topic."""
-    hass.add_job(async_publish, hass, topic, payload, qos, retain)
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Load a config entry."""
+    mqtt_data: MqttData
+
+    if (protocol := entry.data.get(CONF_PROTOCOL, PROTOCOL_311)) != PROTOCOL_5:
+        # Automatically migrate the broker protocol to v5 if possible
+        # Can be removed with HA Core 2027.1
+        new_entry_data = entry.data.copy()
+        new_entry_data[CONF_PROTOCOL] = PROTOCOL_5
+        # Create temporary certificate files from entry
+        await async_create_certificate_temp_files(hass, new_entry_data)
+        # Try the connection with protocol version 5
+        # And update the protocol if successful
+        if await hass.async_add_executor_job(
+            try_connection,
+            {CONF_PORT: DEFAULT_PORT} | new_entry_data,
+        ):
+            hass.config_entries.async_update_entry(
+                entry,
+                data=new_entry_data,
+            )
+            ir.async_delete_issue(hass, DOMAIN, "protocol_5_migration")
+            _LOGGER.info(
+                "The MQTT protocol version was successfully updated to version 5"
+            )
+        else:
+            broker: str = entry.data[CONF_BROKER]
+            async_create_issue(
+                hass,
+                DOMAIN,
+                "protocol_5_migration",
+                config_entry_id=entry.entry_id,
+                issue_domain=DOMAIN,
+                is_fixable=False,
+                breaks_in_ha_version="2027.1.0",
+                severity=IssueSeverity.WARNING,
+                learn_more_url="https://www.home-assistant.io/integrations/mqtt/"
+                "#mqtt-protocol",
+                data={
+                    "entry_id": entry.entry_id,
+                    "broker": broker,
+                    "protocol": protocol,
+                },
+                translation_placeholders={"broker": broker, "protocol": protocol},
+                translation_key="protocol_5_migration",
+            )
+
+    async def _setup_client() -> tuple[MqttData, dict[str, Any]]:
+        """Set up the MQTT client."""
+        # Fetch configuration
+        conf = dict(entry.data | entry.options)
+        hass_config = await conf_util.async_hass_config_yaml(hass)
+        mqtt_yaml = CONFIG_SCHEMA(hass_config).get(DOMAIN, [])
+        await async_create_certificate_temp_files(hass, conf)
+        client = MQTT(hass, entry, conf)
+        if DOMAIN in hass.data:
+            mqtt_data = hass.data[DATA_MQTT]
+            mqtt_data.config = mqtt_yaml
+            mqtt_data.client = client
+        else:
+            # Initial setup
+            hass.data[DATA_MQTT] = mqtt_data = MqttData(config=mqtt_yaml, client=client)
+        await client.async_start(mqtt_data)
+
+        # Restore saved subscriptions
+        if mqtt_data.subscriptions_to_restore:
+            mqtt_data.client.async_restore_tracked_subscriptions(
+                mqtt_data.subscriptions_to_restore
+            )
+            mqtt_data.subscriptions_to_restore = set()
+        mqtt_data.reload_dispatchers.append(
+            entry.add_update_listener(_async_config_entry_updated)
+        )
+
+        return (mqtt_data, conf)
+
+    client_available: asyncio.Future[bool]
+    if DATA_MQTT_AVAILABLE not in hass.data:
+        client_available = hass.data[DATA_MQTT_AVAILABLE] = hass.loop.create_future()
+    else:
+        client_available = hass.data[DATA_MQTT_AVAILABLE]
+
+    mqtt_data, conf = await _setup_client()
+    platforms_used = platforms_from_config(mqtt_data.config)
+    platforms_used.update(_platforms_in_use(hass, entry))
+    integration = async_get_loaded_integration(hass, DOMAIN)
+    # Preload platforms we know we are going to use so
+    # discovery can setup each platform synchronously
+    # and avoid creating a flood of tasks at startup
+    # while waiting for the the imports to complete
+    if not integration.platforms_are_loaded(platforms_used):
+        with async_pause_setup(hass, SetupPhases.WAIT_IMPORT_PLATFORMS):
+            await integration.async_get_platforms(platforms_used)
+
+    # Wait to connect until the platforms are loaded so
+    # we can be sure discovery does not have to wait for
+    # each platform to load when we get the flood of retained
+    # messages on connect
+    await mqtt_data.client.async_connect(client_available)
+
+    # setup platforms and discovery, this re-creates the issues of manually
+    # configured items which are still invalid, also those stored before a restart
+    with async_refresh_mqtt_issues(hass):
+        await async_forward_entry_setup_and_setup_discovery(hass, entry, platforms_used)
+
+    # Setup discovery
+    if conf.get(CONF_DISCOVERY, DEFAULT_DISCOVERY):
+        await discovery.async_start(
+            hass, conf.get(CONF_DISCOVERY_PREFIX, DEFAULT_PREFIX), entry
+        )
+
+
+@websocket_api.websocket_command(
+    {
+        probatio.Required("type"): "mqtt/device/debug_info",
+        probatio.Required("device_id"): str,
+    }
+)
+@callback
+def websocket_mqtt_info(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Get MQTT debug info for device."""
+    device_id = msg["device_id"]
+    mqtt_info = debug_info.info_for_device(hass, device_id)
+
+    connection.send_result(msg["id"], mqtt_info)
+
+
+@websocket_api.websocket_command(
+    {
+        probatio.Required("type"): "mqtt/subscribe",
+        probatio.Required("topic"): valid_subscribe_topic,
+        probatio.Optional("qos"): valid_qos_schema,
+    }
+)
+@websocket_api.async_response
+async def websocket_subscribe(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Subscribe to a MQTT topic."""
+    if not connection.user.is_admin:
+        raise Unauthorized
+
+    @callback
+    def forward_messages(mqttmsg: ReceiveMessage) -> None:
+        """Forward events to websocket."""
+        try:
+            payload = cast(bytes, mqttmsg.payload).decode(
+                DEFAULT_ENCODING
+            )  # not str because encoding is set to None
+        except AttributeError, UnicodeDecodeError:
+            # Convert non UTF-8 payload to a string presentation
+            payload = str(mqttmsg.payload)
+
+        connection.send_message(
+            websocket_api.event_message(
+                msg["id"],
+                {
+                    "topic": mqttmsg.topic,
+                    "payload": payload,
+                    "qos": mqttmsg.qos,
+                    "retain": mqttmsg.retain,
+                },
+            )
+        )
+
+    # Perform UTF-8 decoding directly in callback routine
+    qos: int = msg.get("qos", DEFAULT_QOS)
+    connection.subscriptions[msg["id"]] = async_subscribe_internal(
+        hass, msg["topic"], forward_messages, encoding=None, qos=qos
+    )
+
+    connection.send_message(websocket_api.result_message(msg["id"]))
+
+
+type ConnectionStatusCallback = Callable[[bool], None]
 
 
 @callback
-@bind_hass
-def async_publish(hass: HomeAssistantType, topic: Any, payload, qos=None,
-                  retain=None) -> None:
-    """Publish message to an MQTT topic."""
-    data = _build_publish_data(topic, qos, retain)
-    data[ATTR_PAYLOAD] = payload
-    hass.async_create_task(
-        hass.services.async_call(DOMAIN, SERVICE_PUBLISH, data))
-
-
-@bind_hass
-def publish_template(hass: HomeAssistantType, topic, payload_template,
-                     qos=None, retain=None) -> None:
-    """Publish message to an MQTT topic using a template payload."""
-    data = _build_publish_data(topic, qos, retain)
-    data[ATTR_PAYLOAD_TEMPLATE] = payload_template
-    hass.services.call(DOMAIN, SERVICE_PUBLISH, data)
-
-
-@bind_hass
-async def async_subscribe(hass: HomeAssistantType, topic: str,
-                          msg_callback: MessageCallbackType,
-                          qos: int = DEFAULT_QOS,
-                          encoding: str = 'utf-8'):
-    """Subscribe to an MQTT topic.
-
-    Call the return value to unsubscribe.
-    """
-    async_remove = await hass.data[DATA_MQTT].async_subscribe(
-        topic, msg_callback, qos, encoding)
-    return async_remove
-
-
-@bind_hass
-def subscribe(hass: HomeAssistantType, topic: str,
-              msg_callback: MessageCallbackType, qos: int = DEFAULT_QOS,
-              encoding: str = 'utf-8') -> Callable[[], None]:
-    """Subscribe to an MQTT topic."""
-    async_remove = run_coroutine_threadsafe(
-        async_subscribe(hass, topic, msg_callback, qos, encoding), hass.loop
-    ).result()
-
-    def remove():
-        """Remove listener convert."""
-        run_callback_threadsafe(hass.loop, async_remove).result()
-
-    return remove
-
-
-async def _async_setup_server(hass: HomeAssistantType, config: ConfigType):
-    """Try to start embedded MQTT broker.
-
-    This method is a coroutine.
-    """
-    conf = config.get(DOMAIN, {})  # type: ConfigType
-
-    server = await async_prepare_setup_platform(
-        hass, config, DOMAIN, 'server')
-
-    if server is None:
-        _LOGGER.error("Unable to load embedded server")
-        return None
-
-    success, broker_config = \
-        await server.async_start(
-            hass, conf.get(CONF_PASSWORD), conf.get(CONF_EMBEDDED))
-
-    if not success:
-        return None
-
-    return broker_config
-
-
-async def _async_setup_discovery(hass: HomeAssistantType, conf: ConfigType,
-                                 hass_config: ConfigType,
-                                 config_entry) -> bool:
-    """Try to start the discovery of MQTT devices.
-
-    This method is a coroutine.
-    """
-    discovery = await async_prepare_setup_platform(
-        hass, hass_config, DOMAIN, 'discovery')
-
-    if discovery is None:
-        _LOGGER.error("Unable to load MQTT discovery")
-        return False
-
-    success = await discovery.async_start(
-        hass, conf[CONF_DISCOVERY_PREFIX], hass_config,
-        config_entry)  # type: bool
-
-    return success
-
-
-async def async_setup(hass: HomeAssistantType, config: ConfigType) -> bool:
-    """Start the MQTT protocol service."""
-    conf = config.get(DOMAIN)  # type: Optional[ConfigType]
-
-    # We need this because discovery can cause components to be set up and
-    # otherwise it will not load the users config.
-    # This needs a better solution.
-    hass.data[DATA_MQTT_HASS_CONFIG] = config
-
-    if conf is None:
-        # If we have a config entry, setup is done by that config entry.
-        # If there is no config entry, this should fail.
-        return bool(hass.config_entries.async_entries(DOMAIN))
-
-    conf = dict(conf)
-
-    if CONF_EMBEDDED in conf or CONF_BROKER not in conf:
-        if (conf.get(CONF_PASSWORD) is None and
-                config.get('http', {}).get('api_password') is not None):
-            _LOGGER.error(
-                "Starting from release 0.76, the embedded MQTT broker does not"
-                " use api_password as default password anymore. Please set"
-                " password configuration. See https://home-assistant.io/docs/"
-                "mqtt/broker#embedded-broker for details")
-            return False
-
-        broker_config = await _async_setup_server(hass, config)
-
-        if broker_config is None:
-            _LOGGER.error("Unable to start embedded MQTT broker")
-            return False
-
-        conf.update({
-            CONF_BROKER: broker_config[0],
-            CONF_PORT: broker_config[1],
-            CONF_USERNAME: broker_config[2],
-            CONF_PASSWORD: broker_config[3],
-            CONF_CERTIFICATE: broker_config[4],
-            CONF_PROTOCOL: broker_config[5],
-            CONF_CLIENT_KEY: None,
-            CONF_CLIENT_CERT: None,
-            CONF_TLS_INSECURE: None,
-        })
-
-    hass.data[DATA_MQTT_CONFIG] = conf
-
-    # Only import if we haven't before.
-    if not hass.config_entries.async_entries(DOMAIN):
-        hass.async_create_task(hass.config_entries.flow.async_init(
-            DOMAIN, context={'source': config_entries.SOURCE_IMPORT},
-            data={}
-        ))
-
-    return True
-
-
-async def async_setup_entry(hass, entry):
-    """Load a config entry."""
-    conf = hass.data.get(DATA_MQTT_CONFIG)
-
-    # Config entry was created because user had configuration.yaml entry
-    # They removed that, so remove entry.
-    if conf is None and entry.source == config_entries.SOURCE_IMPORT:
-        hass.async_create_task(
-            hass.config_entries.async_remove(entry.entry_id))
-        return False
-
-    # If user didn't have configuration.yaml config, generate defaults
-    if conf is None:
-        conf = CONFIG_SCHEMA({
-            DOMAIN: entry.data,
-        })[DOMAIN]
-    elif any(key in conf for key in entry.data):
-        _LOGGER.warning(
-            "Data in your config entry is going to override your "
-            "configuration.yaml: %s", entry.data)
-
-    conf.update(entry.data)
-
-    broker = conf[CONF_BROKER]
-    port = conf[CONF_PORT]
-    client_id = conf.get(CONF_CLIENT_ID)
-    keepalive = conf[CONF_KEEPALIVE]
-    username = conf.get(CONF_USERNAME)
-    password = conf.get(CONF_PASSWORD)
-    certificate = conf.get(CONF_CERTIFICATE)
-    client_key = conf.get(CONF_CLIENT_KEY)
-    client_cert = conf.get(CONF_CLIENT_CERT)
-    tls_insecure = conf.get(CONF_TLS_INSECURE)
-    protocol = conf[CONF_PROTOCOL]
-
-    # For cloudmqtt.com, secured connection, auto fill in certificate
-    if (certificate is None and 19999 < conf[CONF_PORT] < 30000 and
-            broker.endswith('.cloudmqtt.com')):
-        certificate = os.path.join(
-            os.path.dirname(__file__), 'addtrustexternalcaroot.crt')
-
-    # When the certificate is set to auto, use bundled certs from requests
-    elif certificate == 'auto':
-        certificate = requests.certs.where()
-
-    if CONF_WILL_MESSAGE in conf:
-        will_message = Message(**conf[CONF_WILL_MESSAGE])
-    else:
-        will_message = None
-
-    if CONF_BIRTH_MESSAGE in conf:
-        birth_message = Message(**conf[CONF_BIRTH_MESSAGE])
-    else:
-        birth_message = None
-
-    # Be able to override versions other than TLSv1.0 under Python3.6
-    conf_tls_version = conf.get(CONF_TLS_VERSION)  # type: str
-    if conf_tls_version == '1.2':
-        tls_version = ssl.PROTOCOL_TLSv1_2
-    elif conf_tls_version == '1.1':
-        tls_version = ssl.PROTOCOL_TLSv1_1
-    elif conf_tls_version == '1.0':
-        tls_version = ssl.PROTOCOL_TLSv1
-    else:
-        import sys
-        # Python3.6 supports automatic negotiation of highest TLS version
-        if sys.hexversion >= 0x03060000:
-            tls_version = ssl.PROTOCOL_TLS  # pylint: disable=no-member
-        else:
-            tls_version = ssl.PROTOCOL_TLSv1
-
-    hass.data[DATA_MQTT] = MQTT(
-        hass,
-        broker=broker,
-        port=port,
-        client_id=client_id,
-        keepalive=keepalive,
-        username=username,
-        password=password,
-        certificate=certificate,
-        client_key=client_key,
-        client_cert=client_cert,
-        tls_insecure=tls_insecure,
-        protocol=protocol,
-        will_message=will_message,
-        birth_message=birth_message,
-        tls_version=tls_version,
+def async_subscribe_connection_status(
+    hass: HomeAssistant, connection_status_callback: ConnectionStatusCallback
+) -> Callable[[], None]:
+    """Subscribe to MQTT connection changes."""
+    return async_dispatcher_connect(
+        hass, MQTT_CONNECTION_STATE, connection_status_callback
     )
 
-    success = await hass.data[DATA_MQTT].async_connect()  # type: bool
 
-    if not success:
-        return False
+def is_connected(hass: HomeAssistant) -> bool:
+    """Return if MQTT client is connected."""
+    mqtt_data = hass.data[DATA_MQTT]
+    return mqtt_data.client.connected
 
-    async def async_stop_mqtt(event: Event):
-        """Stop MQTT component."""
-        await hass.data[DATA_MQTT].async_disconnect()
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_stop_mqtt)
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry: AnyDeviceEntry
+) -> bool:
+    """Remove MQTT config entry from a device."""
+    from . import device_automation  # noqa: PLC0415
 
-    async def async_publish_service(call: ServiceCall):
-        """Handle MQTT publish service calls."""
-        msg_topic = call.data[ATTR_TOPIC]  # type: str
-        payload = call.data.get(ATTR_PAYLOAD)
-        payload_template = call.data.get(ATTR_PAYLOAD_TEMPLATE)
-        qos = call.data[ATTR_QOS]  # type: int
-        retain = call.data[ATTR_RETAIN]  # type: bool
-        if payload_template is not None:
-            try:
-                payload = \
-                    template.Template(payload_template, hass).async_render()
-            except template.jinja2.TemplateError as exc:
-                _LOGGER.error(
-                    "Unable to publish to %s: rendering payload template of "
-                    "%s failed because %s",
-                    msg_topic, payload_template, exc)
-                return
-
-        await hass.data[DATA_MQTT].async_publish(
-            msg_topic, payload, qos, retain)
-
-    hass.services.async_register(
-        DOMAIN, SERVICE_PUBLISH, async_publish_service,
-        schema=MQTT_PUBLISH_SCHEMA)
-
-    if conf.get(CONF_DISCOVERY):
-        await _async_setup_discovery(
-            hass, conf, hass.data[DATA_MQTT_HASS_CONFIG], entry)
-
+    await device_automation.async_removed_from_device(hass, device_entry.id)
     return True
 
 
-@attr.s(slots=True, frozen=True)
-class Subscription:
-    """Class to hold data about an active subscription."""
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Unload MQTT dump and publish service when the config entry is unloaded."""
+    mqtt_data = hass.data[DATA_MQTT]
+    mqtt_client = mqtt_data.client
 
-    topic = attr.ib(type=str)
-    callback = attr.ib(type=MessageCallbackType)
-    qos = attr.ib(type=int, default=0)
-    encoding = attr.ib(type=str, default='utf-8')
-
-
-@attr.s(slots=True, frozen=True)
-class Message:
-    """MQTT Message."""
-
-    topic = attr.ib(type=str)
-    payload = attr.ib(type=PublishPayloadType)
-    qos = attr.ib(type=int, default=0)
-    retain = attr.ib(type=bool, default=False)
-
-
-class MQTT:
-    """Home Assistant MQTT client."""
-
-    def __init__(self, hass: HomeAssistantType, broker: str, port: int,
-                 client_id: Optional[str], keepalive: Optional[int],
-                 username: Optional[str], password: Optional[str],
-                 certificate: Optional[str], client_key: Optional[str],
-                 client_cert: Optional[str], tls_insecure: Optional[bool],
-                 protocol: Optional[str], will_message: Optional[Message],
-                 birth_message: Optional[Message],
-                 tls_version: Optional[int]) -> None:
-        """Initialize Home Assistant MQTT client."""
-        import paho.mqtt.client as mqtt
-
-        self.hass = hass
-        self.broker = broker
-        self.port = port
-        self.keepalive = keepalive
-        self.subscriptions = []  # type: List[Subscription]
-        self.birth_message = birth_message
-        self._mqttc = None  # type: mqtt.Client
-        self._paho_lock = asyncio.Lock(loop=hass.loop)
-
-        if protocol == PROTOCOL_31:
-            proto = mqtt.MQTTv31  # type: int
-        else:
-            proto = mqtt.MQTTv311
-
-        if client_id is None:
-            self._mqttc = mqtt.Client(protocol=proto)
-        else:
-            self._mqttc = mqtt.Client(client_id, protocol=proto)
-
-        if username is not None:
-            self._mqttc.username_pw_set(username, password)
-
-        if certificate is not None:
-            self._mqttc.tls_set(
-                certificate, certfile=client_cert,
-                keyfile=client_key, tls_version=tls_version)
-
-            if tls_insecure is not None:
-                self._mqttc.tls_insecure_set(tls_insecure)
-
-        self._mqttc.on_connect = self._mqtt_on_connect
-        self._mqttc.on_disconnect = self._mqtt_on_disconnect
-        self._mqttc.on_message = self._mqtt_on_message
-
-        if will_message is not None:
-            self._mqttc.will_set(*attr.astuple(will_message))
-
-    async def async_publish(self, topic: str, payload: PublishPayloadType,
-                            qos: int, retain: bool) -> None:
-        """Publish a MQTT message.
-
-        This method must be run in the event loop and returns a coroutine.
-        """
-        async with self._paho_lock:
-            _LOGGER.debug("Transmitting message on %s: %s", topic, payload)
-            await self.hass.async_add_job(
-                self._mqttc.publish, topic, payload, qos, retain)
-
-    async def async_connect(self) -> bool:
-        """Connect to the host. Does process messages yet.
-
-        This method is a coroutine.
-        """
-        result = None  # type: int
-        try:
-            result = await self.hass.async_add_job(
-                self._mqttc.connect, self.broker, self.port, self.keepalive)
-        except OSError as err:
-            _LOGGER.error("Failed to connect due to exception: %s", err)
-            return False
-
-        if result != 0:
-            import paho.mqtt.client as mqtt
-            _LOGGER.error("Failed to connect: %s", mqtt.error_string(result))
-            return False
-
-        self._mqttc.loop_start()
-        return True
-
-    @callback
-    def async_disconnect(self):
-        """Stop the MQTT client.
-
-        This method must be run in the event loop and returns a coroutine.
-        """
-        def stop():
-            """Stop the MQTT client."""
-            self._mqttc.disconnect()
-            self._mqttc.loop_stop()
-
-        return self.hass.async_add_job(stop)
-
-    async def async_subscribe(self, topic: str,
-                              msg_callback: MessageCallbackType,
-                              qos: int, encoding: str) -> Callable[[], None]:
-        """Set up a subscription to a topic with the provided qos.
-
-        This method is a coroutine.
-        """
-        if not isinstance(topic, str):
-            raise HomeAssistantError("Topic needs to be a string!")
-
-        subscription = Subscription(topic, msg_callback, qos, encoding)
-        self.subscriptions.append(subscription)
-
-        await self._async_perform_subscription(topic, qos)
-
-        @callback
-        def async_remove() -> None:
-            """Remove subscription."""
-            if subscription not in self.subscriptions:
-                raise HomeAssistantError("Can't remove subscription twice")
-            self.subscriptions.remove(subscription)
-
-            if any(other.topic == topic for other in self.subscriptions):
-                # Other subscriptions on topic remaining - don't unsubscribe.
-                return
-            self.hass.async_create_task(self._async_unsubscribe(topic))
-
-        return async_remove
-
-    async def _async_unsubscribe(self, topic: str) -> None:
-        """Unsubscribe from a topic.
-
-        This method is a coroutine.
-        """
-        async with self._paho_lock:
-            result = None  # type: int
-            result, _ = await self.hass.async_add_job(
-                self._mqttc.unsubscribe, topic)
-            _raise_on_error(result)
-
-    async def _async_perform_subscription(self, topic: str, qos: int) -> None:
-        """Perform a paho-mqtt subscription."""
-        _LOGGER.debug("Subscribing to %s", topic)
-
-        async with self._paho_lock:
-            result = None  # type: int
-            result, _ = await self.hass.async_add_job(
-                self._mqttc.subscribe, topic, qos)
-            _raise_on_error(result)
-
-    def _mqtt_on_connect(
-            self, _mqttc, _userdata, _flags, result_code: int) -> None:
-        """On connect callback.
-
-        Resubscribe to all topics we were subscribed to and publish birth
-        message.
-        """
-        import paho.mqtt.client as mqtt
-
-        if result_code != mqtt.CONNACK_ACCEPTED:
-            _LOGGER.error("Unable to connect to the MQTT broker: %s",
-                          mqtt.connack_string(result_code))
-            self._mqttc.disconnect()
-            return
-
-        # Group subscriptions to only re-subscribe once for each topic.
-        keyfunc = attrgetter('topic')
-        for topic, subs in groupby(sorted(self.subscriptions, key=keyfunc),
-                                   keyfunc):
-            # Re-subscribe with the highest requested qos
-            max_qos = max(subscription.qos for subscription in subs)
-            self.hass.add_job(self._async_perform_subscription, topic, max_qos)
-
-        if self.birth_message:
-            self.hass.add_job(
-                self.async_publish(*attr.astuple(self.birth_message)))
-
-    def _mqtt_on_message(self, _mqttc, _userdata, msg) -> None:
-        """Message received callback."""
-        self.hass.add_job(self._mqtt_handle_message, msg)
-
-    @callback
-    def _mqtt_handle_message(self, msg) -> None:
-        _LOGGER.debug("Received message on %s: %s", msg.topic, msg.payload)
-
-        for subscription in self.subscriptions:
-            if not _match_topic(subscription.topic, msg.topic):
-                continue
-
-            payload = msg.payload  # type: SubscribePayloadType
-            if subscription.encoding is not None:
-                try:
-                    payload = msg.payload.decode(subscription.encoding)
-                except (AttributeError, UnicodeDecodeError):
-                    _LOGGER.warning(
-                        "Can't decode payload %s on %s with encoding %s",
-                        msg.payload, msg.topic, subscription.encoding)
-                    continue
-
-            self.hass.async_run_job(
-                subscription.callback, msg.topic, payload, msg.qos)
-
-    def _mqtt_on_disconnect(self, _mqttc, _userdata, result_code: int) -> None:
-        """Disconnected callback."""
-        # When disconnected because of calling disconnect()
-        if result_code == 0:
-            return
-
-        tries = 0
-
-        while True:
-            try:
-                if self._mqttc.reconnect() == 0:
-                    _LOGGER.info("Successfully reconnected to the MQTT server")
-                    break
-            except socket.error:
-                pass
-
-            wait_time = min(2**tries, MAX_RECONNECT_WAIT)
-            _LOGGER.warning(
-                "Disconnected from MQTT (%s). Trying to reconnect in %s s",
-                result_code, wait_time)
-            # It is ok to sleep here as we are in the MQTT thread.
-            time.sleep(wait_time)
-            tries += 1
-
-
-def _raise_on_error(result_code: int) -> None:
-    """Raise error if error result."""
-    if result_code != 0:
-        import paho.mqtt.client as mqtt
-
-        raise HomeAssistantError(
-            'Error talking to MQTT: {}'.format(mqtt.error_string(result_code)))
-
-
-def _match_topic(subscription: str, topic: str) -> bool:
-    """Test if topic matches subscription."""
-    from paho.mqtt.matcher import MQTTMatcher
-    matcher = MQTTMatcher()
-    matcher[subscription] = True
+    # Stop the discovery
+    await discovery.async_stop(hass)
     try:
-        next(matcher.iter_match(topic))
-        return True
-    except StopIteration:
-        return False
+        # Unload the entity platforms
+        loaded_entity_platforms = mqtt_data.platforms_loaded - {
+            "device_automation",
+            "tag",
+        }
+        await hass.config_entries.async_unload_platforms_or_raise(
+            entry, loaded_entity_platforms
+        )
+    finally:
+        mqtt_data.platforms_loaded = set()
+        await asyncio.sleep(0)
+        # Unsubscribe reload dispatchers
+        while reload_dispatchers := mqtt_data.reload_dispatchers:
+            reload_dispatchers.pop()()
+        # Cleanup listeners
+        mqtt_client.cleanup()
 
+        # Cleanup entity registry hooks
+        registry_hooks = mqtt_data.discovery_registry_hooks
+        while registry_hooks:
+            registry_hooks.popitem()[1]()
+        # Wait for all ACKs, stop the loop and disconnect the client
+        await mqtt_client.async_disconnect(disconnect_paho_client=True)
 
-class MqttAvailability(Entity):
-    """Mixin used for platforms that report availability."""
-
-    def __init__(self, availability_topic: Optional[str], qos: Optional[int],
-                 payload_available: Optional[str],
-                 payload_not_available: Optional[str]) -> None:
-        """Initialize the availability mixin."""
-        self._availability_topic = availability_topic
-        self._availability_qos = qos
-        self._available = availability_topic is None  # type: bool
-        self._payload_available = payload_available
-        self._payload_not_available = payload_not_available
-
-    async def async_added_to_hass(self) -> None:
-        """Subscribe MQTT events.
-
-        This method must be run in the event loop and returns a coroutine.
-        """
-        @callback
-        def availability_message_received(topic: str,
-                                          payload: SubscribePayloadType,
-                                          qos: int) -> None:
-            """Handle a new received MQTT availability message."""
-            if payload == self._payload_available:
-                self._available = True
-            elif payload == self._payload_not_available:
-                self._available = False
-
-            self.async_schedule_update_ha_state()
-
-        if self._availability_topic is not None:
-            await async_subscribe(
-                self.hass, self._availability_topic,
-                availability_message_received, self._availability_qos)
-
-    @property
-    def available(self) -> bool:
-        """Return if the device is available."""
-        return self._available
-
-
-class MqttDiscoveryUpdate(Entity):
-    """Mixin used to handle updated discovery message."""
-
-    def __init__(self, discovery_hash) -> None:
-        """Initialize the discovery update mixin."""
-        self._discovery_hash = discovery_hash
-        self._remove_signal = None
-
-    async def async_added_to_hass(self) -> None:
-        """Subscribe to discovery updates."""
-        from homeassistant.helpers.dispatcher import async_dispatcher_connect
-        from homeassistant.components.mqtt.discovery import (
-            ALREADY_DISCOVERED, MQTT_DISCOVERY_UPDATED)
-
-        @callback
-        def discovery_callback(payload):
-            """Handle discovery update."""
-            _LOGGER.info("Got update for entity with hash: %s '%s'",
-                         self._discovery_hash, payload)
-            if not payload:
-                # Empty payload: Remove component
-                _LOGGER.info("Removing component: %s", self.entity_id)
-                self.hass.async_create_task(self.async_remove())
-                del self.hass.data[ALREADY_DISCOVERED][self._discovery_hash]
-                self._remove_signal()
-
-        if self._discovery_hash:
-            self._remove_signal = async_dispatcher_connect(
-                self.hass,
-                MQTT_DISCOVERY_UPDATED.format(self._discovery_hash),
-                discovery_callback)
+        # Cleanup MQTT client availability
+        hass.data.pop(DATA_MQTT_AVAILABLE, None)
+        # Store remaining subscriptions to be able to restore or reload them
+        # when the entry is set up again
+        if subscriptions := mqtt_client.subscriptions:
+            mqtt_data.subscriptions_to_restore = subscriptions

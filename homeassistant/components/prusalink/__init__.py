@@ -1,0 +1,122 @@
+"""The PrusaLink integration."""
+
+from pyprusalink import PrusaLink
+from pyprusalink.types import InvalidAuth
+
+from homeassistant.const import (
+    CONF_API_KEY,
+    CONF_HOST,
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    Platform,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.httpx_client import get_async_client
+
+from .const import DOMAIN
+from .coordinator import (
+    InfoUpdateCoordinator,
+    JobUpdateCoordinator,
+    LegacyStatusCoordinator,
+    PrusaLinkConfigEntry,
+    PrusaLinkUpdateCoordinator,
+    StatusCoordinator,
+    VersionUpdateCoordinator,
+)
+
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.CAMERA,
+    Platform.SENSOR,
+]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: PrusaLinkConfigEntry) -> None:
+    """Set up PrusaLink from a config entry."""
+    if entry.version == 1 and entry.minor_version < 2:
+        raise ConfigEntryError("Please upgrade your printer's firmware.")
+
+    api = PrusaLink(
+        get_async_client(hass),
+        entry.data[CONF_HOST],
+        entry.data[CONF_USERNAME],
+        entry.data[CONF_PASSWORD],
+    )
+
+    coordinators: dict[str, PrusaLinkUpdateCoordinator] = {
+        "legacy_status": LegacyStatusCoordinator(hass, entry, api),
+        "status": StatusCoordinator(hass, entry, api),
+        "job": JobUpdateCoordinator(hass, entry, api),
+        "info": InfoUpdateCoordinator(hass, entry, api),
+        "version": VersionUpdateCoordinator(hass, entry, api),
+    }
+    for coordinator in coordinators.values():
+        await coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = coordinators
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: PrusaLinkConfigEntry
+) -> None:
+    """Migrate old entry."""
+    new_data = dict(config_entry.data)
+    if config_entry.version == 1:
+        if config_entry.minor_version < 2:
+            # Add username and password
+            # "maker" is currently hardcoded in the firmware
+            # https://github.com/prusa3d/Prusa-Firmware-Buddy/blob/bfb0ffc745ee6546e7efdba618d0e7c0f4c909cd/lib/WUI/wui_api.h#L19
+            username = "maker"
+            password = config_entry.data[CONF_API_KEY]
+
+            api = PrusaLink(
+                get_async_client(hass),
+                config_entry.data[CONF_HOST],
+                username,
+                password,
+            )
+            try:
+                await api.get_info()
+            except InvalidAuth:
+                # We are unable to reach the new API which usually means
+                # that the user is running an outdated firmware version
+                ir.async_create_issue(
+                    hass,
+                    DOMAIN,
+                    f"firmware_5_1_required_{config_entry.entry_id}",
+                    is_fixable=False,
+                    config_entry_id=config_entry.entry_id,
+                    severity=ir.IssueSeverity.ERROR,
+                    translation_key="firmware_5_1_required",
+                    translation_placeholders={
+                        "entry_title": config_entry.title,
+                        "prusa_mini_firmware_update": "https://help.prusa3d.com/article/firmware-updating-mini-mini_124784",
+                        "prusa_mk4_xl_firmware_update": "https://help.prusa3d.com/article/how-to-update-firmware-mk4-xl_453086",
+                    },
+                )
+                # There is a check in the async_setup_entry to
+                # prevent the setup if minor_version < 2
+                # Currently we can't reload the config entry
+                # if the migration fails.
+                # Return here to workaround that.
+                return
+
+            new_data[CONF_USERNAME] = username
+            new_data[CONF_PASSWORD] = password
+
+        ir.async_delete_issue(
+            hass, DOMAIN, f"firmware_5_1_required_{config_entry.entry_id}"
+        )
+        hass.config_entries.async_update_entry(
+            config_entry, data=new_data, minor_version=2
+        )
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: PrusaLinkConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

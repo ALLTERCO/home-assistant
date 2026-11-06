@@ -1,0 +1,31 @@
+"""The sensor tests for the tado platform."""
+
+from collections.abc import Generator
+from unittest.mock import patch
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, snapshot_platform
+from syrupy.assertion import SnapshotAssertion
+
+from homeassistant.components.tado import DOMAIN
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+
+
+@pytest.fixture(autouse=True)
+def setup_platforms() -> Generator[None]:
+    """Set up the platforms for the tests."""
+    with patch("homeassistant.components.tado.PLATFORMS", [Platform.SENSOR]):
+        yield
+
+
+@pytest.mark.usefixtures("init_integration")
+async def test_entities(
+    hass: HomeAssistant, entity_registry: er.EntityRegistry, snapshot: SnapshotAssertion
+) -> None:
+    """Test creation of sensor entities."""
+
+    config_entry: MockConfigEntry = hass.config_entries.async_entries(DOMAIN)[0]
+
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)

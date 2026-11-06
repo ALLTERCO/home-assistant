@@ -1,0 +1,10 @@
+"""The roomba constants."""
+
+from homeassistant.const import Platform
+
+DOMAIN = "roomba"
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR, Platform.VACUUM]
+CONF_CERT = "certificate"
+CONF_BLID = "blid"
+DEFAULT_CERT = "/etc/ssl/certs/ca-certificates.crt"
+ROOMBA_SESSION = "roomba_session"

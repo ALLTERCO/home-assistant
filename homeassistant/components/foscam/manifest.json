@@ -1,0 +1,13 @@
+{
+  "domain": "foscam",
+  "name": "Foscam",
+  "categories": ["security_safety.cameras"],
+  "codeowners": ["@Foscam-wangzhengyu"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/foscam",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["libpyfoscamcgi"],
+  "requirements": ["libpyfoscamcgi==0.0.9"]
+}

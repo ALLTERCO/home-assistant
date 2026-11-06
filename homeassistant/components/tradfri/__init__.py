@@ -1,134 +1,234 @@
-"""
-Support for IKEA Tradfri.
+"""Support for IKEA Tradfri."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/ikea_tradfri/
-"""
-import logging
+from datetime import datetime, timedelta
 
-import voluptuous as vol
+from pytradfri import Gateway, RequestError
+from pytradfri.api.aiocoap_api import APIFactory, APIRequestProtocol
+from pytradfri.command import Command
+from pytradfri.device import Device
 
-from homeassistant import config_entries
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-import homeassistant.helpers.config_validation as cv
-from homeassistant.util.json import load_json
+from homeassistant.const import CONF_HOST, EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.dispatcher import (
+    async_dispatcher_connect,
+    async_dispatcher_send,
+)
+from homeassistant.helpers.event import async_track_time_interval
 
-from .const import (
-    CONF_IMPORT_GROUPS, CONF_IDENTITY, CONF_HOST, CONF_KEY, CONF_GATEWAY_ID)
+from .const import CONF_GATEWAY_ID, CONF_IDENTITY, CONF_KEY, DOMAIN, LOGGER
+from .coordinator import (
+    TradfriConfigEntry,
+    TradfriData,
+    TradfriDeviceDataUpdateCoordinator,
+)
 
-from . import config_flow  # noqa  pylint_disable=unused-import
-
-REQUIREMENTS = ['pytradfri[async]==6.0.1']
-
-DOMAIN = 'tradfri'
-CONFIG_FILE = '.tradfri_psk.conf'
-KEY_GATEWAY = 'tradfri_gateway'
-KEY_API = 'tradfri_api'
-CONF_ALLOW_TRADFRI_GROUPS = 'allow_tradfri_groups'
-DEFAULT_ALLOW_TRADFRI_GROUPS = True
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: vol.Schema({
-        vol.Inclusive(CONF_HOST, 'gateway'): cv.string,
-        vol.Optional(CONF_ALLOW_TRADFRI_GROUPS,
-                     default=DEFAULT_ALLOW_TRADFRI_GROUPS): cv.boolean,
-    })
-}, extra=vol.ALLOW_EXTRA)
-
-_LOGGER = logging.getLogger(__name__)
+PLATFORMS = [
+    Platform.COVER,
+    Platform.FAN,
+    Platform.LIGHT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
+SIGNAL_GW = "tradfri.gw_status"
+TIMEOUT_API = 30
 
 
-async def async_setup(hass, config):
-    """Set up the Tradfri component."""
-    conf = config.get(DOMAIN)
-
-    if conf is None:
-        return True
-
-    configured_hosts = [entry.data['host'] for entry in
-                        hass.config_entries.async_entries(DOMAIN)]
-
-    legacy_hosts = await hass.async_add_executor_job(
-        load_json, hass.config.path(CONFIG_FILE))
-
-    for host, info in legacy_hosts.items():
-        if host in configured_hosts:
-            continue
-
-        info[CONF_HOST] = host
-        info[CONF_IMPORT_GROUPS] = conf[CONF_ALLOW_TRADFRI_GROUPS]
-
-        hass.async_create_task(hass.config_entries.flow.async_init(
-            DOMAIN, context={'source': config_entries.SOURCE_IMPORT},
-            data=info
-        ))
-
-    host = conf.get(CONF_HOST)
-
-    if host is None or host in configured_hosts or host in legacy_hosts:
-        return True
-
-    hass.async_create_task(hass.config_entries.flow.async_init(
-        DOMAIN, context={'source': config_entries.SOURCE_IMPORT},
-        data={'host': host}
-    ))
-
-    return True
-
-
-async def async_setup_entry(hass, entry):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: TradfriConfigEntry,
+) -> None:
     """Create a gateway."""
-    # host, identity, key, allow_tradfri_groups
-    from pytradfri import Gateway, RequestError  # pylint: disable=import-error
-    from pytradfri.api.aiocoap_api import APIFactory
-
-    factory = APIFactory(
+    factory = await APIFactory.init(
         entry.data[CONF_HOST],
         psk_id=entry.data[CONF_IDENTITY],
         psk=entry.data[CONF_KEY],
-        loop=hass.loop
     )
 
-    async def on_hass_stop(event):
+    async def on_hass_stop(event: Event) -> None:
         """Close connection when hass stops."""
         await factory.shutdown()
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_hass_stop)
+    # Setup listeners
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_hass_stop)
+    )
 
-    api = factory.request
+    api: APIRequestProtocol = factory.request
     gateway = Gateway()
 
     try:
-        gateway_info = await api(gateway.get_gateway_info())
-    except RequestError:
-        _LOGGER.error("Tradfri setup failed.")
-        return False
+        gateway_info = await api(gateway.get_gateway_info(), timeout=TIMEOUT_API)
+        devices_commands: list[Command[Device]] = await api(
+            gateway.get_devices(), timeout=TIMEOUT_API
+        )
+        devices: list[Device] = await api(devices_commands, timeout=TIMEOUT_API)
 
-    hass.data.setdefault(KEY_API, {})[entry.entry_id] = api
-    hass.data.setdefault(KEY_GATEWAY, {})[entry.entry_id] = gateway
+    except RequestError as exc:
+        await factory.shutdown()
+        raise ConfigEntryNotReady from exc
 
-    dev_reg = await hass.helpers.device_registry.async_get_registry()
+    dev_reg = dr.async_get(hass)
     dev_reg.async_get_or_create(
         config_entry_id=entry.entry_id,
         connections=set(),
-        identifiers={
-            (DOMAIN, entry.data[CONF_GATEWAY_ID])
-        },
-        manufacturer='IKEA',
-        name='Gateway',
+        identifiers={(DOMAIN, entry.data[CONF_GATEWAY_ID])},
+        manufacturer="IKEA of Sweden",
+        name="Gateway",
         # They just have 1 gateway model. Type is not exposed yet.
-        model='E1526',
+        model="E1526",
         sw_version=gateway_info.firmware_version,
     )
 
-    hass.async_create_task(hass.config_entries.async_forward_entry_setup(
-        entry, 'light'
-    ))
-    hass.async_create_task(hass.config_entries.async_forward_entry_setup(
-        entry, 'sensor'
-    ))
-    hass.async_create_task(hass.config_entries.async_forward_entry_setup(
-        entry, 'switch'
-    ))
+    remove_stale_devices(hass, entry, devices)
 
-    return True
+    # Setup the device coordinators
+    tradfri_data = TradfriData(factory=factory, gateway=gateway, api=api)
+
+    for device in devices:
+        coordinator = TradfriDeviceDataUpdateCoordinator(
+            hass=hass, config_entry=entry, api=api, device=device
+        )
+        await coordinator.async_config_entry_first_refresh()
+
+        entry.async_on_unload(
+            async_dispatcher_connect(hass, SIGNAL_GW, coordinator.set_hub_available)
+        )
+        tradfri_data.coordinator_list.append(coordinator)
+
+    entry.runtime_data = tradfri_data
+
+    async def async_keep_alive(now: datetime) -> None:
+        if hass.is_stopping:
+            return
+
+        gw_status = True
+        try:
+            await api(gateway.get_gateway_info())
+        except RequestError:
+            LOGGER.error("Keep-alive failed")
+            gw_status = False
+
+        async_dispatcher_send(hass, SIGNAL_GW, gw_status)
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, async_keep_alive, timedelta(seconds=60))
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: TradfriConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+    await entry.runtime_data.factory.shutdown()
+
+
+@callback
+def remove_stale_devices(
+    hass: HomeAssistant, config_entry: TradfriConfigEntry, devices: list[Device]
+) -> None:
+    """Remove stale devices from device registry."""
+    device_registry = dr.async_get(hass)
+    device_entries = dr.async_entries_for_config_entry(
+        device_registry, config_entry.entry_id
+    )
+    all_device_ids = {str(device.id) for device in devices}
+
+    for device_entry in device_entries:
+        device_id: str | None = None
+        gateway_id: str | None = None
+
+        for identifier in device_entry.identifiers:
+            if identifier[0] != DOMAIN:
+                continue
+
+            _id = identifier[1]
+
+            # Identify gateway device.
+            if _id == config_entry.data[CONF_GATEWAY_ID]:
+                gateway_id = _id
+                break
+
+            device_id = _id.replace(f"{config_entry.data[CONF_GATEWAY_ID]}-", "")
+            break
+
+        if gateway_id is not None:
+            # Do not remove gateway device entry.
+            continue
+
+        if device_id is None or device_id not in all_device_ids:
+            # If device_id is None an invalid device entry
+            # was found for this config entry.
+            # If the device_id is not in existing device ids it's a stale device entry.
+            # Remove the device entry in either case.
+            device_registry.async_remove_device(device_entry.id)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: TradfriConfigEntry
+) -> None:
+    """Migrate old entry."""
+    LOGGER.debug(
+        "Migrating Tradfri configuration from version %s.%s",
+        config_entry.version,
+        config_entry.minor_version,
+    )
+
+    if config_entry.version == 1:
+        # Migrate to version 2
+        migrate_config_entry_and_identifiers(hass, config_entry)
+
+        hass.config_entries.async_update_entry(config_entry, version=2)
+
+    LOGGER.debug(
+        "Migration to Tradfri configuration version %s.%s successful",
+        config_entry.version,
+        config_entry.minor_version,
+    )
+
+
+def migrate_config_entry_and_identifiers(
+    hass: HomeAssistant, config_entry: TradfriConfigEntry
+) -> None:
+    """Migrate old non-unique identifiers to new unique identifiers."""
+
+    related_device_flag: bool
+    device_id: str
+
+    device_reg = dr.async_get(hass)
+    # Get all devices associated to contextual gateway config_entry
+    # and loop through list of devices.
+    for device in dr.async_entries_for_config_entry(device_reg, config_entry.entry_id):
+        related_device_flag = False
+        for identifier in device.identifiers:
+            if identifier[0] != DOMAIN:
+                continue
+
+            related_device_flag = True
+
+            _id = identifier[1]
+
+            # Identify gateway device.
+            if _id == config_entry.data[CONF_GATEWAY_ID]:
+                # Using this to avoid updating gateway's own device registry entry
+                related_device_flag = False
+                break
+
+            device_id = str(_id)
+            break
+
+        # Check that device is related to tradfri domain (and is not the gateway itself)
+        if not related_device_flag:
+            continue
+
+        if config_entry.data[CONF_GATEWAY_ID] in device_id:
+            continue
+
+        device_reg.async_update_device(
+            device.id,
+            new_identifiers={
+                (DOMAIN, f"{config_entry.data[CONF_GATEWAY_ID]}-{device_id}")
+            },
+        )

@@ -1,0 +1,71 @@
+"""Common utilities for Vallox tests."""
+
+from collections.abc import Generator
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, load_json_object_fixture
+from vallox_websocket_api import MetricData, MetricValue
+
+from homeassistant.components.vallox.const import DOMAIN
+from homeassistant.const import CONF_HOST, CONF_NAME
+from homeassistant.core import HomeAssistant
+
+from . import TEST_HOST, TEST_NAME, setup_integration
+
+
+@pytest.fixture
+def mock_config_entry() -> MockConfigEntry:
+    """Return the default mocked config entry."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title=TEST_NAME,
+        data={CONF_HOST: TEST_HOST, CONF_NAME: TEST_NAME},
+    )
+
+
+@pytest.fixture
+def default_metrics() -> dict[str, MetricValue]:
+    """Return default Vallox metrics."""
+    return load_json_object_fixture("metrics.json", DOMAIN)
+
+
+@pytest.fixture
+def metrics() -> dict[str, MetricValue]:
+    """Return metrics that override the default metrics."""
+    return {}
+
+
+@pytest.fixture
+def mock_vallox_client(
+    default_metrics: dict[str, MetricValue],
+    metrics: dict[str, MetricValue],
+) -> Generator[AsyncMock]:
+    """Return a mocked Vallox client used by both the integration and config flow."""
+    with (
+        patch("homeassistant.components.vallox.Vallox", autospec=True) as mock_class,
+        patch("homeassistant.components.vallox.config_flow.Vallox", new=mock_class),
+    ):
+        client = mock_class.return_value
+        client.fetch_metric_data.return_value = MetricData(default_metrics | metrics)
+        yield client
+
+
+@pytest.fixture
+async def init_integration(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_vallox_client: AsyncMock,
+) -> MockConfigEntry:
+    """Set up the Vallox integration for testing."""
+    await setup_integration(hass, mock_config_entry)
+    return mock_config_entry
+
+
+@pytest.fixture
+def mock_setup_entry() -> Generator[AsyncMock]:
+    """Override async_setup_entry."""
+    with patch(
+        "homeassistant.components.vallox.async_setup_entry", return_value=None
+    ) as mock_setup_entry:
+        yield mock_setup_entry

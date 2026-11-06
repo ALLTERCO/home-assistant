@@ -1,15 +1,33 @@
 configure:
-  description: Set attribute of device in deCONZ. See https://home-assistant.io/components/deconz/#device-services for details.
   fields:
-    field:
-      description: Field is a string representing a specific device in deCONZ.
-      example: '/lights/1/state'
     entity:
-      description: Entity id representing a specific device in deCONZ.
-      example: 'light.rgb_light'
+      selector:
+        entity:
+          integration: deconz
+    field:
+      example: '"/lights/1/state" or "/state"'
+      selector:
+        text:
     data:
-      description: Data is a json object with what data you want to alter.
+      required: true
       example: '{"on": true}'
+      selector:
+        object:
+    bridgeid:
+      example: "00212EFFFF012345"
+      selector:
+        text:
 
 device_refresh:
-  description: Refresh device lists from deCONZ.
+  fields:
+    bridgeid:
+      example: "00212EFFFF012345"
+      selector:
+        text:
+
+remove_orphaned_entries:
+  fields:
+    bridgeid:
+      example: "00212EFFFF012345"
+      selector:
+        text:

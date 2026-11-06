@@ -1,0 +1,57 @@
+"""The fritzbox_callmonitor integration."""
+
+from fritzconnection.core.exceptions import FritzConnectionException, FritzSecurityError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryError,
+    ConfigEntryNotReady,
+)
+
+from .base import FritzBoxPhonebook
+from .const import CONF_PHONEBOOK, CONF_PREFIXES, DOMAIN, PLATFORMS
+
+type FritzBoxCallMonitorConfigEntry = ConfigEntry[FritzBoxPhonebook]
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, config_entry: FritzBoxCallMonitorConfigEntry
+) -> None:
+    """Set up the fritzbox_callmonitor platforms."""
+    fritzbox_phonebook = FritzBoxPhonebook(
+        host=config_entry.data[CONF_HOST],
+        username=config_entry.data[CONF_USERNAME],
+        password=config_entry.data[CONF_PASSWORD],
+        phonebook_id=config_entry.data[CONF_PHONEBOOK],
+        prefixes=config_entry.options.get(CONF_PREFIXES),
+    )
+
+    try:
+        await hass.async_add_executor_job(fritzbox_phonebook.init_phonebook)
+    except FritzSecurityError as ex:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="insufficient_permissions",
+        ) from ex
+    except FritzConnectionException as ex:
+        raise ConfigEntryAuthFailed from ex
+    except RequestsConnectionError as ex:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="cannot_connect",
+            translation_placeholders={"host": config_entry.data[CONF_HOST]},
+        ) from ex
+
+    config_entry.runtime_data = fritzbox_phonebook
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, config_entry: FritzBoxCallMonitorConfigEntry
+) -> None:
+    """Unloading the fritzbox_callmonitor platforms."""
+    await hass.config_entries.async_unload_platforms_or_raise(config_entry, PLATFORMS)

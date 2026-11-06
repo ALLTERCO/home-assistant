@@ -1,74 +1,47 @@
 """Static file handling for HTTP component."""
 
-import re
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Final, override
 
-from aiohttp import hdrs
-from aiohttp.web import FileResponse, middleware
-from aiohttp.web_exceptions import HTTPNotFound
+from aiohttp.hdrs import CACHE_CONTROL, CONTENT_TYPE
+from aiohttp.web import FileResponse, Request, StreamResponse
+from aiohttp.web_fileresponse import CONTENT_TYPES, FALLBACK_CONTENT_TYPE
 from aiohttp.web_urldispatcher import StaticResource
-from yarl import URL
+from lru import LRU
 
-_FINGERPRINT = re.compile(r'^(.+)-[a-z0-9]{32}\.(\w+)$', re.IGNORECASE)
+CACHE_TIME: Final = 31 * 86400  # = 1 month
+CACHE_HEADER = f"public, max-age={CACHE_TIME}"
+CACHE_HEADERS: Mapping[str, str] = {CACHE_CONTROL: CACHE_HEADER}
+RESPONSE_CACHE: LRU[tuple[str, Path], tuple[Path, str]] = LRU(512)
+
+_GUESSER = CONTENT_TYPES.guess_file_type
 
 
 class CachingStaticResource(StaticResource):
     """Static Resource handler that will add cache headers."""
 
-    async def _handle(self, request):
-        filename = URL(request.match_info['filename']).path
-        try:
-            # PyLint is wrong about resolve not being a member.
-            filepath = self._directory.joinpath(filename).resolve()
-            if not self._follow_symlinks:
-                filepath.relative_to(self._directory)
-        except (ValueError, FileNotFoundError) as error:
-            # relatively safe
-            raise HTTPNotFound() from error
-        except Exception as error:
-            # perm error or other kind!
-            request.app.logger.exception(error)
-            raise HTTPNotFound() from error
+    @override
+    async def _handle(self, request: Request) -> StreamResponse:
+        """Wrap base handler to cache file path resolution and content type guess."""
+        rel_url = request.match_info["filename"]
+        key = (rel_url, self._directory)
+        response: StreamResponse
 
-        if filepath.is_dir():
-            return await super()._handle(request)
-        if filepath.is_file():
-            return CachingFileResponse(filepath, chunk_size=self._chunk_size)
-        raise HTTPNotFound
+        if key in RESPONSE_CACHE:
+            file_path, content_type = RESPONSE_CACHE[key]
+            response = FileResponse(file_path, chunk_size=self._chunk_size)
+            response.headers[CONTENT_TYPE] = content_type
+        else:
+            response = await super()._handle(request)
+            if not isinstance(response, FileResponse):
+                # Must be directory index; ignore caching
+                return response
+            file_path = response._path  # noqa: SLF001
+            response.content_type = _GUESSER(file_path)[0] or FALLBACK_CONTENT_TYPE
+            # Cache actual header after setter construction.
+            content_type = response.headers[CONTENT_TYPE]
+            RESPONSE_CACHE[key] = (file_path, content_type)
 
-
-# pylint: disable=too-many-ancestors
-class CachingFileResponse(FileResponse):
-    """FileSender class that caches output if not in dev mode."""
-
-    def __init__(self, *args, **kwargs):
-        """Initialize the hass file sender."""
-        super().__init__(*args, **kwargs)
-
-        orig_sendfile = self._sendfile
-
-        async def sendfile(request, fobj, count):
-            """Sendfile that includes a cache header."""
-            cache_time = 31 * 86400  # = 1 month
-            self.headers[hdrs.CACHE_CONTROL] = "public, max-age={}".format(
-                cache_time)
-
-            await orig_sendfile(request, fobj, count)
-
-        # Overwriting like this because __init__ can change implementation.
-        self._sendfile = sendfile
-
-
-@middleware
-async def staticresource_middleware(request, handler):
-    """Middleware to strip out fingerprint from fingerprinted assets."""
-    path = request.path
-    if not path.startswith('/static/') and not path.startswith('/frontend'):
-        return await handler(request)
-
-    fingerprinted = _FINGERPRINT.match(request.match_info['filename'])
-
-    if fingerprinted:
-        request.match_info['filename'] = \
-            '{}.{}'.format(*fingerprinted.groups())
-
-    return await handler(request)
+        response.headers[CACHE_CONTROL] = CACHE_HEADER
+        return response

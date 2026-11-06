@@ -1,0 +1,358 @@
+"""Property update methods and schemas."""
+
+from typing import Any
+
+import probatio
+from pyinsteon import devices
+from pyinsteon.config import (
+    LED_BRIGHTNESS,
+    LED_DIMMING,
+    LOAD_BUTTON,
+    LOAD_BUTTON_NUMBER,
+    NIGHT_MODE_LED_BRIGHTNESS,
+    NIGHT_MODE_RAMP_RATE,
+    NON_TOGGLE_MASK,
+    NON_TOGGLE_ON_OFF_MASK,
+    OFF_MASK,
+    ON_MASK,
+    RADIO_BUTTON_GROUPS,
+    RAMP_RATE,
+    RAMP_RATE_IN_SEC,
+    TRIGGER_GROUP_MASK,
+    get_usable_value,
+)
+from pyinsteon.constants import (
+    RAMP_RATES_SEC,
+    PropertyType,
+    RelayMode,
+    ResponseStatus,
+    ToggleMode,
+)
+from pyinsteon.device_types.device_base import Device
+
+from homeassistant.components import websocket_api
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+
+from ..const import (
+    DEVICE_ADDRESS,
+    ID,
+    INSTEON_DEVICE_NOT_FOUND,
+    PROPERTY_NAME,
+    PROPERTY_VALUE,
+    TYPE,
+)
+from .device import notify_device_not_found
+
+SHOW_ADVANCED = "show_advanced"
+RAMP_RATE_SECONDS = list(dict.fromkeys(RAMP_RATES_SEC))
+RAMP_RATE_SECONDS.sort()
+RAMP_RATE_LIST = [str(seconds) for seconds in RAMP_RATE_SECONDS]
+TOGGLE_MODES = [str(ToggleMode(v)).lower() for v in list(ToggleMode)]
+RELAY_MODES = [str(RelayMode(v)).lower() for v in list(RelayMode)]
+
+# Device guides define ramp rate as 0x00-0x1F and LED brightness as up to 0x7F
+RAMP_RATE_MAX = 0x1F
+LED_BRIGHTNESS_MAX = 0x7F
+RAMP_RATE_NAMES = {RAMP_RATE, NIGHT_MODE_RAMP_RATE}
+LED_BRIGHTNESS_NAMES = {LED_DIMMING, LED_BRIGHTNESS, NIGHT_MODE_LED_BRIGHTNESS}
+BUTTON_MASK_NAMES = {
+    ON_MASK,
+    OFF_MASK,
+    NON_TOGGLE_MASK,
+    NON_TOGGLE_ON_OFF_MASK,
+    TRIGGER_GROUP_MASK,
+}
+
+
+def _bool_schema(name):
+    return probatio.to_field_list(probatio.Schema({probatio.Required(name): bool}))[0]
+
+
+def _base_name(name):
+    """Return a per-button property name without its button suffix."""
+    base, _, suffix = name.rpartition("_")
+    return base if suffix.isdigit() else name
+
+
+def _int_range(name, groups):
+    """Return the valid range of an integer property."""
+    base = _base_name(name)
+    if base in RAMP_RATE_NAMES:
+        return 0, RAMP_RATE_MAX
+    if base in LED_BRIGHTNESS_NAMES:
+        return 0, LED_BRIGHTNESS_MAX
+    if name == LOAD_BUTTON_NUMBER:
+        return 1, max(groups)
+    return 0, 255
+
+
+def _int_validator(name, groups):
+    low, high = _int_range(name, groups)
+    return probatio.All(probatio.Coerce(int), probatio.Range(min=low, max=high))
+
+
+def _int_schema(name, groups):
+    return probatio.to_field_list(
+        probatio.Schema({probatio.Required(name): _int_validator(name, groups)})
+    )[0]
+
+
+def _validate_int(name, value, groups):
+    """Check an integer value against the property's range and button bits."""
+    value = _int_validator(name, groups)(value)
+    if _base_name(name) in BUTTON_MASK_NAMES:
+        buttons = sum(1 << (button - 1) for button in groups)
+        if value & ~buttons:
+            raise probatio.Invalid(
+                f"{name} can only set bits for buttons {sorted(groups)}"
+            )
+    return value
+
+
+def _float_schema(name):
+    return probatio.to_field_list(probatio.Schema({probatio.Required(name): float}))[0]
+
+
+def _list_schema(name, values):
+    return probatio.to_field_list(
+        probatio.Schema({probatio.Required(name): probatio.In(values)}),
+        custom_serializer=cv.custom_serializer,
+    )[0]
+
+
+def _multi_select_schema(name, values):
+    return probatio.to_field_list(
+        probatio.Schema({probatio.Optional(name): cv.multi_select(values)}),
+        custom_serializer=cv.custom_serializer,
+    )[0]
+
+
+def _read_only_schema(name, value):
+    """Return a constant value schema."""
+    return probatio.to_field_list(probatio.Schema({probatio.Required(name): value}))[0]
+
+
+def get_schema(prop, name, groups):
+    """Return the correct schema type."""
+    if prop.is_read_only:
+        return _read_only_schema(name, prop.value)
+    if name == RAMP_RATE_IN_SEC:
+        return _list_schema(name, RAMP_RATE_LIST)
+    if name == RADIO_BUTTON_GROUPS:
+        button_list = {str(group): groups[group].name for group in groups}
+        return _multi_select_schema(name, button_list)
+    if name == LOAD_BUTTON:
+        button_list = {group: groups[group].name for group in groups}
+        return _list_schema(name, button_list)
+    if prop.value_type is bool:
+        return _bool_schema(name)
+    if prop.value_type is int:
+        return _int_schema(name, groups)
+    if prop.value_type is float:
+        return _float_schema(name)
+    if prop.value_type == ToggleMode:
+        return _list_schema(name, TOGGLE_MODES)
+    if prop.value_type == RelayMode:
+        return _list_schema(name, RELAY_MODES)
+    return None
+
+
+def get_properties(device: Device, show_advanced=False):
+    """Get the properties of an Insteon device and return the records and schema."""
+
+    properties = []
+    schema = {}
+
+    for name, prop in device.configuration.items():
+        if prop.is_read_only and not show_advanced:
+            continue
+
+        prop_schema = get_schema(prop, name, device.groups)
+        if prop_schema is None:
+            continue
+        schema[name] = prop_schema
+        properties.append(property_to_dict(prop))
+
+    if show_advanced:
+        for name, prop in device.operating_flags.items():
+            if prop.property_type != PropertyType.ADVANCED:
+                continue
+            prop_schema = get_schema(prop, name, device.groups)
+            if prop_schema is not None:
+                schema[name] = prop_schema
+                properties.append(property_to_dict(prop))
+        for name, prop in device.properties.items():
+            if prop.property_type != PropertyType.ADVANCED:
+                continue
+            prop_schema = get_schema(prop, name, device.groups)
+            if prop_schema is not None:
+                schema[name] = prop_schema
+                properties.append(property_to_dict(prop))
+
+    return properties, schema
+
+
+def property_to_dict(prop):
+    """Return a property data row."""
+    value = get_usable_value(prop)
+    modified = value == prop.new_value
+    if prop.value_type in [ToggleMode, RelayMode] or prop.name == RAMP_RATE_IN_SEC:
+        value = str(value).lower()
+    return {"name": prop.name, "value": value, "modified": modified}
+
+
+def update_property(device, prop_name, value):
+    """Update the value of a device property."""
+    for props in (device.configuration, device.operating_flags, device.properties):
+        if prop_name in props:
+            prop = props[prop_name]
+            break
+    else:
+        raise KeyError(prop_name)
+    if prop.value_type == ToggleMode:
+        toggle_mode = getattr(ToggleMode, value.upper())
+        prop.new_value = toggle_mode
+    elif prop.value_type == RelayMode:
+        relay_mode = getattr(RelayMode, value.upper())
+        prop.new_value = relay_mode
+    elif prop.value_type is int:
+        prop.new_value = _validate_int(prop_name, value, device.groups)
+    else:
+        prop.new_value = value
+
+
+@websocket_api.websocket_command(
+    {
+        probatio.Required(TYPE): "insteon/properties/get",
+        probatio.Required(DEVICE_ADDRESS): str,
+        probatio.Required(SHOW_ADVANCED): bool,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_get_properties(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Add the default All-Link Database records for an Insteon device."""
+    if not (device := devices[msg[DEVICE_ADDRESS]]):
+        notify_device_not_found(connection, msg, INSTEON_DEVICE_NOT_FOUND)
+        return
+
+    properties, schema = get_properties(device, msg[SHOW_ADVANCED])
+
+    connection.send_result(msg[ID], {"properties": properties, "schema": schema})
+
+
+@websocket_api.websocket_command(
+    {
+        probatio.Required(TYPE): "insteon/properties/change",
+        probatio.Required(DEVICE_ADDRESS): str,
+        probatio.Required(PROPERTY_NAME): str,
+        probatio.Required(PROPERTY_VALUE): probatio.Any(list, int, float, bool, str),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_change_properties_record(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Add the default All-Link Database records for an Insteon device."""
+    if not (device := devices[msg[DEVICE_ADDRESS]]):
+        notify_device_not_found(connection, msg, INSTEON_DEVICE_NOT_FOUND)
+        return
+
+    update_property(device, msg[PROPERTY_NAME], msg[PROPERTY_VALUE])
+    connection.send_result(msg[ID])
+
+
+@websocket_api.websocket_command(
+    {
+        probatio.Required(TYPE): "insteon/properties/write",
+        probatio.Required(DEVICE_ADDRESS): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_write_properties(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Add the default All-Link Database records for an Insteon device."""
+    if not (device := devices[msg[DEVICE_ADDRESS]]):
+        notify_device_not_found(connection, msg, INSTEON_DEVICE_NOT_FOUND)
+        return
+
+    result = await device.async_write_config()
+    await devices.async_save(workdir=hass.config.config_dir)
+    if result not in [ResponseStatus.SUCCESS, ResponseStatus.RUN_ON_WAKE]:
+        connection.send_message(
+            websocket_api.error_message(
+                msg[ID], "write_failed", "properties not written to device"
+            )
+        )
+        return
+    connection.send_result(msg[ID])
+
+
+@websocket_api.websocket_command(
+    {
+        probatio.Required(TYPE): "insteon/properties/load",
+        probatio.Required(DEVICE_ADDRESS): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_load_properties(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Add the default All-Link Database records for an Insteon device."""
+    if not (device := devices[msg[DEVICE_ADDRESS]]):
+        notify_device_not_found(connection, msg, INSTEON_DEVICE_NOT_FOUND)
+        return
+
+    result = await device.async_read_config(read_aldb=False)
+    await devices.async_save(workdir=hass.config.config_dir)
+
+    if result not in [ResponseStatus.SUCCESS, ResponseStatus.RUN_ON_WAKE]:
+        connection.send_message(
+            websocket_api.error_message(
+                msg[ID], "load_failed", "properties not loaded from device"
+            )
+        )
+        return
+    connection.send_result(msg[ID])
+
+
+@websocket_api.websocket_command(
+    {
+        probatio.Required(TYPE): "insteon/properties/reset",
+        probatio.Required(DEVICE_ADDRESS): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_reset_properties(
+    hass: HomeAssistant,
+    connection: websocket_api.connection.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Add the default All-Link Database records for an Insteon device."""
+    if not (device := devices[msg[DEVICE_ADDRESS]]):
+        notify_device_not_found(connection, msg, INSTEON_DEVICE_NOT_FOUND)
+        return
+
+    for prop in device.configuration.values():
+        prop.new_value = None
+    for prop in device.operating_flags:
+        device.operating_flags[prop].new_value = None
+    for prop in device.properties:
+        device.properties[prop].new_value = None
+    connection.send_result(msg[ID])

@@ -1,173 +1,338 @@
 """Config flow to configure deCONZ component."""
 
-import voluptuous as vol
+import asyncio
+from collections.abc import Mapping
+import logging
+from pprint import pformat
+from typing import Any, cast, override
+from urllib.parse import urlparse
 
-from homeassistant import config_entries
-from homeassistant.core import callback
+import probatio
+from pydeconz.errors import LinkButtonNotPressed, RequestError, ResponseError
+from pydeconz.gateway import DeconzSession
+from pydeconz.utils import (
+    DiscoveredBridge,
+    discovery as deconz_discovery,
+    get_bridge_id as deconz_get_bridge_id,
+    normalize_bridge_id,
+)
+
+from homeassistant.config_entries import (
+    SOURCE_HASSIO,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_PORT
+from homeassistant.core import callback
 from homeassistant.helpers import aiohttp_client
-from homeassistant.util.json import load_json
+from homeassistant.helpers.service_info.hassio import HassioServiceInfo
+from homeassistant.helpers.service_info.ssdp import ATTR_UPNP_SERIAL, SsdpServiceInfo
 
+from . import DeconzConfigEntry
 from .const import (
-    CONF_ALLOW_DECONZ_GROUPS, CONF_ALLOW_CLIP_SENSOR, CONFIG_FILE, DOMAIN)
+    CONF_ALLOW_CLIP_SENSOR,
+    CONF_ALLOW_DECONZ_GROUPS,
+    CONF_ALLOW_NEW_DEVICES,
+    DEFAULT_ALLOW_CLIP_SENSOR,
+    DEFAULT_ALLOW_DECONZ_GROUPS,
+    DEFAULT_ALLOW_NEW_DEVICES,
+    DEFAULT_PORT,
+    DOMAIN,
+    HASSIO_CONFIGURATION_URL,
+    LOGGER,
+)
+from .hub import DeconzHub
+
+DECONZ_MANUFACTURERURL = "http://www.dresden-elektronik.de"
+CONF_SERIAL = "serial"
+CONF_MANUAL_INPUT = "Manually define gateway"
 
 
-CONF_BRIDGEID = 'bridgeid'
-
-
-@callback
-def configured_hosts(hass):
-    """Return a set of the configured hosts."""
-    return set(entry.data[CONF_HOST] for entry
-               in hass.config_entries.async_entries(DOMAIN))
-
-
-@config_entries.HANDLERS.register(DOMAIN)
-class DeconzFlowHandler(config_entries.ConfigFlow):
+class DeconzFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a deCONZ config flow."""
 
     VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_PUSH
 
-    def __init__(self):
+    _hassio_discovery: dict[str, Any]
+
+    bridges: list[DiscoveredBridge]
+    host: str
+    port: int
+    api_key: str
+
+    @staticmethod
+    @callback
+    @override
+    def async_get_options_flow(
+        config_entry: DeconzConfigEntry,
+    ) -> DeconzOptionsFlowHandler:
+        """Get the options flow for this handler."""
+        return DeconzOptionsFlowHandler()
+
+    def __init__(self) -> None:
         """Initialize the deCONZ config flow."""
-        self.bridges = []
-        self.deconz_config = {}
+        self.bridge_id = ""
 
-    async def async_step_user(self, user_input=None):
-        """Handle a flow initialized by the user."""
-        return await self.async_step_init(user_input)
-
-    async def async_step_init(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a deCONZ config flow start.
 
-        Only allows one instance to be set up.
-        If only one bridge is found go to link step.
-        If more than one bridge is found let user choose bridge to link.
+        Let user choose between discovered bridges and manual configuration.
+        If no bridge is found allow user to manually input configuration.
         """
-        from pydeconz.utils import async_discovery
-
-        if configured_hosts(self.hass):
-            return self.async_abort(reason='one_instance_only')
-
         if user_input is not None:
+            if user_input[CONF_HOST] == CONF_MANUAL_INPUT:
+                return await self.async_step_manual_input()
+
             for bridge in self.bridges:
                 if bridge[CONF_HOST] == user_input[CONF_HOST]:
-                    self.deconz_config = bridge
+                    self.bridge_id = bridge["id"]
+                    self.host = bridge[CONF_HOST]
+                    self.port = bridge[CONF_PORT]
+                    await self.async_set_unique_id(self.bridge_id)
+                    self._abort_if_unique_id_configured(
+                        updates={CONF_HOST: self.host, CONF_PORT: self.port},
+                        reload_on_update=False,
+                    )
                     return await self.async_step_link()
 
         session = aiohttp_client.async_get_clientsession(self.hass)
-        self.bridges = await async_discovery(session)
 
-        if len(self.bridges) == 1:
-            self.deconz_config = self.bridges[0]
-            return await self.async_step_link()
-        if len(self.bridges) > 1:
-            hosts = []
-            for bridge in self.bridges:
-                hosts.append(bridge[CONF_HOST])
+        try:
+            async with asyncio.timeout(10):
+                self.bridges = await deconz_discovery(session)
+
+        except TimeoutError, ResponseError:
+            self.bridges = []
+
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("Discovered deCONZ gateways %s", pformat(self.bridges))
+
+        if self.bridges:
+            hosts = [bridge[CONF_HOST] for bridge in self.bridges]
+
+            hosts.append(CONF_MANUAL_INPUT)
+
             return self.async_show_form(
-                step_id='init',
-                data_schema=vol.Schema({
-                    vol.Required(CONF_HOST): vol.In(hosts)
-                })
+                step_id="user",
+                data_schema=probatio.Schema(
+                    {probatio.Optional(CONF_HOST): probatio.In(hosts)}
+                ),
             )
 
-        return self.async_abort(
-            reason='no_bridges'
+        return await self.async_step_manual_input()
+
+    async def async_step_manual_input(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manual configuration."""
+        if user_input:
+            self.host = user_input[CONF_HOST]
+            self.port = user_input[CONF_PORT]
+            return await self.async_step_link()
+
+        return self.async_show_form(
+            step_id="manual_input",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(CONF_HOST): str,
+                    probatio.Required(CONF_PORT, default=DEFAULT_PORT): int,
+                }
+            ),
         )
 
-    async def async_step_link(self, user_input=None):
+    async def async_step_link(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Attempt to link with the deCONZ bridge."""
-        from pydeconz.utils import async_get_api_key
-        errors = {}
+        errors: dict[str, str] = {}
+
+        LOGGER.debug(
+            "Preparing linking with deCONZ gateway %s %d", self.host, self.port
+        )
 
         if user_input is not None:
-            if configured_hosts(self.hass):
-                return self.async_abort(reason='one_instance_only')
             session = aiohttp_client.async_get_clientsession(self.hass)
-            api_key = await async_get_api_key(session, **self.deconz_config)
-            if api_key:
-                self.deconz_config[CONF_API_KEY] = api_key
-                return await self.async_step_options()
-            errors['base'] = 'no_key'
+            deconz_session = DeconzSession(session, self.host, self.port)
 
-        return self.async_show_form(
-            step_id='link',
-            errors=errors,
+            try:
+                async with asyncio.timeout(10):
+                    api_key = await deconz_session.get_api_key()
+
+            except LinkButtonNotPressed:
+                errors["base"] = "linking_not_possible"
+
+            except ResponseError, RequestError, TimeoutError:
+                errors["base"] = "no_key"
+
+            else:
+                self.api_key = api_key
+                return await self._create_entry()
+
+        return self.async_show_form(step_id="link", errors=errors)
+
+    async def _create_entry(self) -> ConfigFlowResult:
+        """Create entry for gateway."""
+        if not self.bridge_id:
+            session = aiohttp_client.async_get_clientsession(self.hass)
+
+            try:
+                async with asyncio.timeout(10):
+                    self.bridge_id = await deconz_get_bridge_id(
+                        session, self.host, self.port, self.api_key
+                    )
+
+            except TimeoutError:
+                return self.async_abort(reason="no_bridges")
+
+            else:
+                await self.async_set_unique_id(self.bridge_id)
+
+                self._abort_if_unique_id_configured(
+                    updates={
+                        CONF_HOST: self.host,
+                        CONF_PORT: self.port,
+                        CONF_API_KEY: self.api_key,
+                    },
+                    reload_on_update=False,
+                )
+
+        return self.async_create_entry(
+            title=self.bridge_id,
+            data={
+                CONF_HOST: self.host,
+                CONF_PORT: self.port,
+                CONF_API_KEY: self.api_key,
+            },
         )
 
-    async def async_step_options(self, user_input=None):
-        """Extra options for deCONZ.
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Trigger a reauthentication flow."""
+        self.context["title_placeholders"] = {"host": entry_data[CONF_HOST]}
 
-        CONF_CLIP_SENSOR -- Allow user to choose if they want clip sensors.
-        CONF_DECONZ_GROUPS -- Allow user to choose if they want deCONZ groups.
-        """
-        from pydeconz.utils import async_get_bridgeid
+        self.host = entry_data[CONF_HOST]
+        self.port = entry_data[CONF_PORT]
 
-        if user_input is not None:
-            self.deconz_config[CONF_ALLOW_CLIP_SENSOR] = \
-                user_input[CONF_ALLOW_CLIP_SENSOR]
-            self.deconz_config[CONF_ALLOW_DECONZ_GROUPS] = \
-                user_input[CONF_ALLOW_DECONZ_GROUPS]
+        return await self.async_step_link()
 
-            if CONF_BRIDGEID not in self.deconz_config:
-                session = aiohttp_client.async_get_clientsession(self.hass)
-                self.deconz_config[CONF_BRIDGEID] = await async_get_bridgeid(
-                    session, **self.deconz_config)
+    @override
+    async def async_step_ssdp(
+        self, discovery_info: SsdpServiceInfo
+    ) -> ConfigFlowResult:
+        """Handle a discovered deCONZ bridge."""
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("deCONZ SSDP discovery %s", pformat(discovery_info))
 
-            return self.async_create_entry(
-                title='deCONZ-' + self.deconz_config[CONF_BRIDGEID],
-                data=self.deconz_config
-            )
+        self.bridge_id = normalize_bridge_id(discovery_info.upnp[ATTR_UPNP_SERIAL])
+        parsed_url = urlparse(discovery_info.ssdp_location)
 
-        return self.async_show_form(
-            step_id='options',
-            data_schema=vol.Schema({
-                vol.Optional(CONF_ALLOW_CLIP_SENSOR): bool,
-                vol.Optional(CONF_ALLOW_DECONZ_GROUPS): bool,
-            }),
+        entry = await self.async_set_unique_id(self.bridge_id)
+        if entry and entry.source == SOURCE_HASSIO:
+            return self.async_abort(reason="already_configured")
+
+        self.host = cast(str, parsed_url.hostname)
+        self.port = cast(int, parsed_url.port)
+
+        self._abort_if_unique_id_configured(
+            updates={
+                CONF_HOST: self.host,
+                CONF_PORT: self.port,
+            },
+            reload_on_update=False,
         )
 
-    async def async_step_discovery(self, discovery_info):
-        """Prepare configuration for a discovered deCONZ bridge.
+        self.context.update(
+            {
+                "title_placeholders": {"host": self.host},
+                "configuration_url": f"http://{self.host}:{self.port}",
+            }
+        )
+
+        return await self.async_step_link()
+
+    @override
+    async def async_step_hassio(
+        self, discovery_info: HassioServiceInfo
+    ) -> ConfigFlowResult:
+        """Prepare configuration for a Hass.io deCONZ bridge.
 
         This flow is triggered by the discovery component.
         """
-        deconz_config = {}
-        deconz_config[CONF_HOST] = discovery_info.get(CONF_HOST)
-        deconz_config[CONF_PORT] = discovery_info.get(CONF_PORT)
-        deconz_config[CONF_BRIDGEID] = discovery_info.get('serial')
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("deCONZ HASSIO discovery %s", pformat(discovery_info.config))
 
-        config_file = await self.hass.async_add_job(
-            load_json, self.hass.config.path(CONFIG_FILE))
-        if config_file and \
-           config_file[CONF_HOST] == deconz_config[CONF_HOST] and \
-           CONF_API_KEY in config_file:
-            deconz_config[CONF_API_KEY] = config_file[CONF_API_KEY]
+        self.bridge_id = normalize_bridge_id(discovery_info.config[CONF_SERIAL])
+        await self.async_set_unique_id(self.bridge_id)
 
-        return await self.async_step_import(deconz_config)
+        self.host = discovery_info.config[CONF_HOST]
+        self.port = discovery_info.config[CONF_PORT]
+        self.api_key = discovery_info.config[CONF_API_KEY]
 
-    async def async_step_import(self, import_config):
-        """Import a deCONZ bridge as a config entry.
+        self._abort_if_unique_id_configured(
+            updates={
+                CONF_HOST: self.host,
+                CONF_PORT: self.port,
+                CONF_API_KEY: self.api_key,
+            },
+            reload_on_update=False,
+        )
 
-        This flow is triggered by `async_setup` for configured bridges.
-        This flow is also triggered by `async_step_discovery`.
+        self.context["configuration_url"] = HASSIO_CONFIGURATION_URL
+        self._hassio_discovery = discovery_info.config
 
-        This will execute for any bridge that does not have a
-        config entry yet (based on host).
+        return await self.async_step_hassio_confirm()
 
-        If an API key is provided, we will create an entry.
-        Otherwise we will delegate to `link` step which
-        will ask user to link the bridge.
-        """
-        if configured_hosts(self.hass):
-            return self.async_abort(reason='one_instance_only')
+    async def async_step_hassio_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm a Hass.io discovery."""
 
-        self.deconz_config = import_config
-        if CONF_API_KEY not in import_config:
-            return await self.async_step_link()
+        if user_input is not None:
+            return await self._create_entry()
 
-        user_input = {CONF_ALLOW_CLIP_SENSOR: True,
-                      CONF_ALLOW_DECONZ_GROUPS: True}
-        return await self.async_step_options(user_input=user_input)
+        return self.async_show_form(
+            step_id="hassio_confirm",
+            description_placeholders={"addon": self._hassio_discovery["addon"]},
+        )
+
+
+class DeconzOptionsFlowHandler(OptionsFlow):
+    """Handle deCONZ options."""
+
+    gateway: DeconzHub
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the deCONZ options."""
+        return await self.async_step_deconz_devices()
+
+    async def async_step_deconz_devices(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the deconz devices options."""
+        if user_input is not None:
+            return self.async_create_entry(data=self.config_entry.options | user_input)
+
+        schema_options = {}
+        for option, default in (
+            (CONF_ALLOW_CLIP_SENSOR, DEFAULT_ALLOW_CLIP_SENSOR),
+            (CONF_ALLOW_DECONZ_GROUPS, DEFAULT_ALLOW_DECONZ_GROUPS),
+            (CONF_ALLOW_NEW_DEVICES, DEFAULT_ALLOW_NEW_DEVICES),
+        ):
+            schema_options[
+                probatio.Optional(
+                    option,
+                    default=self.config_entry.options.get(option, default),
+                )
+            ] = bool
+
+        return self.async_show_form(
+            step_id="deconz_devices",
+            data_schema=probatio.Schema(schema_options),
+        )

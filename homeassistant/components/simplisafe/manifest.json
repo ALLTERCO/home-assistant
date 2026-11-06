@@ -1,0 +1,19 @@
+{
+  "domain": "simplisafe",
+  "name": "SimpliSafe",
+  "categories": ["security_safety.alarm_systems"],
+  "codeowners": ["@bachya"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "dhcp": [
+    {
+      "hostname": "simplisafe*",
+      "macaddress": "30AEA4*"
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/simplisafe",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "loggers": ["simplipy"],
+  "requirements": ["simplisafe-python==2026.06.0"]
+}

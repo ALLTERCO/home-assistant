@@ -1,0 +1,12 @@
+ebusd_write:
+  fields:
+    name:
+      required: true
+      example: "Hc1MaxFlowTempDesired"
+      selector:
+        text:
+    value:
+      required: true
+      example: "21"
+      selector:
+        text:

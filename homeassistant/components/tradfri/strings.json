@@ -1,23 +1,45 @@
 {
   "config": {
-    "title": "IKEA TRÅDFRI",
-    "step": {
-      "auth": {
-        "title": "Enter security code",
-        "description": "You can find the security code on the back of your gateway.",
-        "data": {
-          "host": "Host",
-          "security_code": "Security Code"
-        }
-      }
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "wrong_gateway": "The gateway at this address is not the gateway that was configured."
     },
     "error": {
-      "invalid_key": "Failed to register with provided key. If this keeps happening, try restarting the gateway.",
-      "cannot_connect": "Unable to connect to the gateway.",
+      "cannot_authenticate": "Cannot authenticate, is your gateway paired with another server like e.g. HomeKit?",
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "invalid_security_code": "Failed to register with provided code. If this keeps happening, try restarting the gateway.",
       "timeout": "Timeout validating the code."
     },
-    "abort": {
-      "already_configured": "Bridge is already configured"
+    "step": {
+      "auth": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]",
+          "security_code": "Security code"
+        },
+        "data_description": {
+          "host": "Hostname or IP address of your Trådfri gateway."
+        },
+        "description": "You can find the security code on the back of your gateway.",
+        "title": "Enter security code"
+      },
+      "reconfigure": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]"
+        },
+        "data_description": {
+          "host": "[%key:component::tradfri::config::step::auth::data_description::host%]"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "aqi": {
+        "name": "Air quality"
+      },
+      "filter_life_remaining": {
+        "name": "Filter time left"
+      }
     }
   }
 }

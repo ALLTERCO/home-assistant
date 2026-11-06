@@ -1,0 +1,148 @@
+"""Provides device automations for Cover."""
+
+import probatio
+
+from homeassistant.components.device_automation import async_validate_entity_schema
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    CONF_DEVICE_ID,
+    CONF_DOMAIN,
+    CONF_ENTITY_ID,
+    CONF_TYPE,
+)
+from homeassistant.core import Context, HomeAssistant
+from homeassistant.helpers import config_validation as cv, entity_registry as er
+from homeassistant.helpers.entity import get_supported_features
+from homeassistant.helpers.typing import ConfigType, TemplateVarsType
+
+from . import ATTR_POSITION, CoverEntityFeature
+from .const import DOMAIN, CoverService, CoverServiceArgument
+
+CMD_ACTION_TYPES = {"open", "close", "stop", "open_tilt", "close_tilt"}
+POSITION_ACTION_TYPES = {"set_position", "set_tilt_position"}
+
+CMD_ACTION_SCHEMA = cv.DEVICE_ACTION_BASE_SCHEMA.extend(
+    {
+        probatio.Required(CONF_TYPE): probatio.In(CMD_ACTION_TYPES),
+        probatio.Required(CONF_ENTITY_ID): cv.entity_id_or_uuid,
+    }
+)
+
+POSITION_ACTION_SCHEMA = cv.DEVICE_ACTION_BASE_SCHEMA.extend(
+    {
+        probatio.Required(CONF_TYPE): probatio.In(POSITION_ACTION_TYPES),
+        probatio.Required(CONF_ENTITY_ID): cv.entity_id_or_uuid,
+        probatio.Optional("position", default=0): probatio.All(
+            probatio.Coerce(int), probatio.Percentage()
+        ),
+    }
+)
+
+_ACTION_SCHEMA = probatio.TaggedUnion(
+    CONF_TYPE,
+    {
+        "open": CMD_ACTION_SCHEMA,
+        "close": CMD_ACTION_SCHEMA,
+        "stop": CMD_ACTION_SCHEMA,
+        "open_tilt": CMD_ACTION_SCHEMA,
+        "close_tilt": CMD_ACTION_SCHEMA,
+        "set_position": POSITION_ACTION_SCHEMA,
+        "set_tilt_position": POSITION_ACTION_SCHEMA,
+    },
+)
+
+
+async def async_validate_action_config(
+    hass: HomeAssistant, config: ConfigType
+) -> ConfigType:
+    """Validate config."""
+    return async_validate_entity_schema(hass, config, _ACTION_SCHEMA)
+
+
+async def async_get_actions(
+    hass: HomeAssistant, device_id: str
+) -> list[dict[str, str]]:
+    """List device actions for Cover devices."""
+    registry = er.async_get(hass)
+    actions = []
+
+    # Get all the integrations entities for this device
+    for entry in er.async_entries_for_device(registry, device_id):
+        if entry.domain != DOMAIN:
+            continue
+
+        supported_features = get_supported_features(hass, entry.entity_id)
+
+        # Add actions for each entity that belongs to this integration
+        base_action = {
+            CONF_DEVICE_ID: device_id,
+            CONF_DOMAIN: DOMAIN,
+            CONF_ENTITY_ID: entry.id,
+        }
+
+        if supported_features & CoverEntityFeature.SET_POSITION:
+            actions.append({**base_action, CONF_TYPE: "set_position"})
+        if supported_features & CoverEntityFeature.OPEN:
+            actions.append({**base_action, CONF_TYPE: "open"})
+        if supported_features & CoverEntityFeature.CLOSE:
+            actions.append({**base_action, CONF_TYPE: "close"})
+        if supported_features & CoverEntityFeature.STOP:
+            actions.append({**base_action, CONF_TYPE: "stop"})
+
+        if supported_features & CoverEntityFeature.SET_TILT_POSITION:
+            actions.append({**base_action, CONF_TYPE: "set_tilt_position"})
+        if supported_features & CoverEntityFeature.OPEN_TILT:
+            actions.append({**base_action, CONF_TYPE: "open_tilt"})
+        if supported_features & CoverEntityFeature.CLOSE_TILT:
+            actions.append({**base_action, CONF_TYPE: "close_tilt"})
+
+    return actions
+
+
+async def async_get_action_capabilities(
+    hass: HomeAssistant, config: ConfigType
+) -> dict[str, probatio.Schema]:
+    """List action capabilities."""
+    if config[CONF_TYPE] not in POSITION_ACTION_TYPES:
+        return {}
+
+    return {
+        "extra_fields": probatio.Schema(
+            {
+                probatio.Optional(ATTR_POSITION, default=0): probatio.All(
+                    probatio.Coerce(int), probatio.Percentage()
+                )
+            }
+        )
+    }
+
+
+async def async_call_action_from_config(
+    hass: HomeAssistant,
+    config: ConfigType,
+    variables: TemplateVarsType,
+    context: Context | None,
+) -> None:
+    """Execute a device action."""
+    service_data = {ATTR_ENTITY_ID: config[CONF_ENTITY_ID]}
+
+    if config[CONF_TYPE] == "open":
+        service = CoverService.OPEN
+    elif config[CONF_TYPE] == "close":
+        service = CoverService.CLOSE
+    elif config[CONF_TYPE] == "stop":
+        service = CoverService.STOP
+    elif config[CONF_TYPE] == "open_tilt":
+        service = CoverService.OPEN_TILT
+    elif config[CONF_TYPE] == "close_tilt":
+        service = CoverService.CLOSE_TILT
+    elif config[CONF_TYPE] == "set_position":
+        service = CoverService.SET_POSITION
+        service_data[CoverServiceArgument.POSITION] = config["position"]
+    elif config[CONF_TYPE] == "set_tilt_position":
+        service = CoverService.SET_TILT_POSITION
+        service_data[CoverServiceArgument.TILT_POSITION] = config["position"]
+
+    await hass.services.async_call(
+        DOMAIN, service, service_data, blocking=True, context=context
+    )

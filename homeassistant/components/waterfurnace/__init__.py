@@ -1,0 +1,135 @@
+"""Support for WaterFurnace geothermal systems."""
+
+import asyncio
+import logging
+
+from waterfurnace.waterfurnace import WaterFurnace, WFCredentialError, WFException
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryError,
+    ConfigEntryNotReady,
+)
+from homeassistant.helpers.start import async_at_started
+
+from .const import DOMAIN
+from .coordinator import (
+    WaterFurnaceCoordinator,
+    WaterFurnaceDeviceData,
+    WaterFurnaceEnergyCoordinator,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+PLATFORMS = [Platform.CLIMATE, Platform.SENSOR]
+
+
+type WaterFurnaceConfigEntry = ConfigEntry[dict[str, WaterFurnaceDeviceData]]
+
+
+async def _async_setup_coordinator(
+    hass: HomeAssistant,
+    username: str,
+    password: str,
+    device_index: int,
+    entry: WaterFurnaceConfigEntry,
+) -> tuple[str, WaterFurnaceDeviceData]:
+    """Set up a coordinator for a device."""
+
+    device_client = WaterFurnace(username, password, device=device_index)
+    await hass.async_add_executor_job(device_client.login)
+    coordinator = WaterFurnaceCoordinator(hass, device_client, entry)
+    await coordinator.async_config_entry_first_refresh()
+
+    if device_client.gwid is None:
+        raise ConfigEntryNotReady(
+            f"Invalid GWID for device at index {device_index}: {device_client.gwid}"
+        )
+
+    energy_coordinator = WaterFurnaceEnergyCoordinator(
+        hass, device_client, entry, device_client.gwid
+    )
+
+    # Defer the first energy refresh until HA has fully started so the
+    # potentially large initial backfill doesn't compete with startup I/O.
+    async def _async_start_energy(hass: HomeAssistant) -> None:
+        await energy_coordinator.async_refresh()
+
+    entry.async_on_unload(async_at_started(hass, _async_start_energy))
+
+    return device_client.gwid, WaterFurnaceDeviceData(
+        realtime=coordinator, energy=energy_coordinator
+    )
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, entry: WaterFurnaceConfigEntry
+) -> None:
+    """Set up WaterFurnace from a config entry."""
+    username = entry.data[CONF_USERNAME]
+    password = entry.data[CONF_PASSWORD]
+
+    client = WaterFurnace(username, password)
+
+    try:
+        await hass.async_add_executor_job(client.login)
+    except WFCredentialError as err:
+        raise ConfigEntryAuthFailed(
+            "Authentication failed. Please update your credentials."
+        ) from err
+
+    device_count = len(client.devices) if client.devices else 0
+
+    results = await asyncio.gather(
+        *[
+            _async_setup_coordinator(hass, username, password, index, entry)
+            for index in range(device_count)
+        ]
+    )
+    entry.runtime_data = dict(results)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, entry: WaterFurnaceConfigEntry
+) -> None:
+    """Unload a WaterFurnace config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: WaterFurnaceConfigEntry
+) -> None:
+    """Migrate old entry."""
+
+    if entry.version == 1 and entry.minor_version < 2:
+        # Migrate from gwid-based unique_id to account_id-based unique_id
+        client = WaterFurnace(entry.data[CONF_USERNAME], entry.data[CONF_PASSWORD])
+        try:
+            await hass.async_add_executor_job(client.login)
+        except WFCredentialError as err:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_auth",
+                translation_placeholders={"username": entry.data[CONF_USERNAME]},
+            ) from err
+        except WFException as err:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="login_failed",
+                translation_placeholders={"username": entry.data[CONF_USERNAME]},
+            ) from err
+
+        if client.account_id is None:
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_account_id",
+            )
+
+        hass.config_entries.async_update_entry(
+            entry, unique_id=str(client.account_id), minor_version=2
+        )
+        _LOGGER.info("Migrated config entry unique_id to account_id")

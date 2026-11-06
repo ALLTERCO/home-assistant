@@ -1,225 +1,163 @@
-"""
-Timer component.
+"""Support for Timers."""
 
-For more details about this component, please refer to the documentation
-at https://home-assistant.io/components/timer/
-"""
+from dataclasses import dataclass
 import logging
-from datetime import timedelta
+from typing import Any, override
 
-import voluptuous as vol
+import probatio
 
-import homeassistant.util.dt as dt_util
-import homeassistant.helpers.config_validation as cv
-from homeassistant.const import (ATTR_ENTITY_ID, CONF_ICON, CONF_NAME)
-from homeassistant.helpers.entity import Entity
+from homeassistant.const import CONF_ICON, CONF_ID, CONF_NAME, SERVICE_RELOAD
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import collection, config_validation as cv
 from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.helpers.event import async_track_point_in_utc_time
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.typing import ConfigType, VolDictType
 
+from .const import (
+    CONF_DURATION,
+    CONF_RESTORE,
+    DATA_TIMER,
+    DEFAULT_DURATION,
+    DEFAULT_RESTORE,
+    DOMAIN,
+    SERVICE_CANCEL,
+    SERVICE_CHANGE,
+    SERVICE_FINISH,
+    SERVICE_PAUSE,
+    SERVICE_START,
+    TimerEntityStateAttribute,
+    TimerService,
+    TimerServiceArgument,
+)
+from .entity import Timer, _format_timedelta
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = 'timer'
-ENTITY_ID_FORMAT = DOMAIN + '.{}'
 
-DEFAULT_DURATION = 0
-ATTR_DURATION = 'duration'
-ATTR_REMAINING = 'remaining'
-CONF_DURATION = 'duration'
+STORAGE_KEY = DOMAIN
+STORAGE_VERSION = 1
 
-STATUS_IDLE = 'idle'
-STATUS_ACTIVE = 'active'
-STATUS_PAUSED = 'paused'
+STORAGE_FIELDS: VolDictType = {
+    probatio.Required(CONF_NAME): cv.string,
+    probatio.Optional(CONF_ICON): cv.icon,
+    probatio.Optional(CONF_DURATION, default=DEFAULT_DURATION): cv.time_period,
+    probatio.Optional(CONF_RESTORE, default=DEFAULT_RESTORE): cv.boolean,
+}
 
-EVENT_TIMER_FINISHED = 'timer.finished'
-EVENT_TIMER_CANCELLED = 'timer.cancelled'
-
-SERVICE_START = 'start'
-SERVICE_PAUSE = 'pause'
-SERVICE_CANCEL = 'cancel'
-SERVICE_FINISH = 'finish'
-
-SERVICE_SCHEMA = vol.Schema({
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-})
-
-SERVICE_SCHEMA_DURATION = vol.Schema({
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-    vol.Optional(ATTR_DURATION,
-                 default=timedelta(DEFAULT_DURATION)): cv.time_period,
-})
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: vol.Schema({
-        cv.slug: vol.Any({
-            vol.Optional(CONF_NAME): cv.string,
-            vol.Optional(CONF_ICON): cv.icon,
-            vol.Optional(CONF_DURATION, timedelta(DEFAULT_DURATION)):
-                cv.time_period,
-        }, None)
-    })
-}, extra=vol.ALLOW_EXTRA)
+__all__ = [
+    "CONF_DURATION",
+    "DOMAIN",
+    "SERVICE_CANCEL",
+    "SERVICE_CHANGE",
+    "SERVICE_FINISH",
+    "SERVICE_PAUSE",
+    "SERVICE_RELOAD",
+    "SERVICE_START",
+    "STORAGE_FIELDS",
+    "Timer",
+    "TimerEntityStateAttribute",
+    "TimerService",
+    "TimerServiceArgument",
+    "TimerStorageCollection",
+]
 
 
-async def async_setup(hass, config):
-    """Set up a timer."""
-    component = EntityComponent(_LOGGER, DOMAIN, hass)
+def _none_to_empty_dict[_T](value: _T | None) -> _T | dict[Any, Any]:
+    if value is None:
+        return {}
+    return value
 
-    entities = []
 
-    for object_id, cfg in config[DOMAIN].items():
-        if not cfg:
-            cfg = {}
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        DOMAIN: cv.schema_with_slug_keys(
+            probatio.All(
+                _none_to_empty_dict,
+                {
+                    probatio.Optional(CONF_NAME): cv.string,
+                    probatio.Optional(CONF_ICON): cv.icon,
+                    probatio.Optional(
+                        CONF_DURATION, default=DEFAULT_DURATION
+                    ): probatio.All(cv.time_period, _format_timedelta),
+                    probatio.Optional(
+                        CONF_RESTORE, default=DEFAULT_RESTORE
+                    ): cv.boolean,
+                },
+            )
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
+)
 
-        name = cfg.get(CONF_NAME)
-        icon = cfg.get(CONF_ICON)
-        duration = cfg.get(CONF_DURATION)
 
-        entities.append(Timer(hass, object_id, name, icon, duration))
+@dataclass(slots=True)
+class TimerData:
+    """Runtime data for the timer integration."""
 
-    if not entities:
-        return False
+    component: EntityComponent[Timer]
+    yaml_collection: collection.YamlCollection
 
-    component.async_register_entity_service(
-        SERVICE_START, SERVICE_SCHEMA_DURATION,
-        'async_start')
-    component.async_register_entity_service(
-        SERVICE_PAUSE, SERVICE_SCHEMA,
-        'async_pause')
-    component.async_register_entity_service(
-        SERVICE_CANCEL, SERVICE_SCHEMA,
-        'async_cancel')
-    component.async_register_entity_service(
-        SERVICE_FINISH, SERVICE_SCHEMA,
-        'async_finish')
 
-    await component.async_add_entities(entities)
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up an input select."""
+    component = EntityComponent[Timer](_LOGGER, DOMAIN, hass)
+    id_manager = collection.IDManager()
+
+    yaml_collection = collection.YamlCollection(
+        logging.getLogger(f"{__name__}.yaml_collection"), id_manager
+    )
+    collection.sync_entity_lifecycle(
+        hass, DOMAIN, DOMAIN, component, yaml_collection, Timer
+    )
+
+    storage_collection = TimerStorageCollection(
+        Store(hass, STORAGE_VERSION, STORAGE_KEY),
+        id_manager,
+    )
+    collection.sync_entity_lifecycle(
+        hass, DOMAIN, DOMAIN, component, storage_collection, Timer
+    )
+
+    await yaml_collection.async_load(
+        [{CONF_ID: id_, **cfg} for id_, cfg in config.get(DOMAIN, {}).items()]
+    )
+    await storage_collection.async_load()
+
+    collection.DictStorageCollectionWebsocket(
+        storage_collection, DOMAIN, DOMAIN, STORAGE_FIELDS, STORAGE_FIELDS
+    ).async_setup(hass)
+
+    hass.data[DATA_TIMER] = TimerData(component, yaml_collection)
+
+    async_setup_services(hass)
     return True
 
 
-class Timer(Entity):
-    """Representation of a timer."""
+class TimerStorageCollection(collection.DictStorageCollection):
+    """Timer storage based collection."""
 
-    def __init__(self, hass, object_id, name, icon, duration):
-        """Initialize a timer."""
-        self.entity_id = ENTITY_ID_FORMAT.format(object_id)
-        self._name = name
-        self._state = STATUS_IDLE
-        self._duration = duration
-        self._remaining = self._duration
-        self._icon = icon
-        self._hass = hass
-        self._end = None
-        self._listener = None
+    CREATE_UPDATE_SCHEMA = probatio.Schema(STORAGE_FIELDS)
 
-    @property
-    def should_poll(self):
-        """If entity should be polled."""
-        return False
+    @override
+    async def _process_create_data(self, data: dict) -> dict:
+        """Validate the config is valid."""
+        data = self.CREATE_UPDATE_SCHEMA(data)
+        # make duration JSON serializeable
+        data[CONF_DURATION] = _format_timedelta(data[CONF_DURATION])
+        return data
 
-    @property
-    def name(self):
-        """Return name of the timer."""
-        return self._name
+    @callback
+    @override
+    def _get_suggested_id(self, info: dict) -> str:
+        """Suggest an ID based on the config."""
+        return info[CONF_NAME]  # type: ignore[no-any-return]
 
-    @property
-    def icon(self):
-        """Return the icon to be used for this entity."""
-        return self._icon
-
-    @property
-    def state(self):
-        """Return the current value of the timer."""
-        return self._state
-
-    @property
-    def state_attributes(self):
-        """Return the state attributes."""
-        return {
-            ATTR_DURATION: str(self._duration),
-            ATTR_REMAINING: str(self._remaining)
-        }
-
-    async def async_added_to_hass(self):
-        """Call when entity is about to be added to Home Assistant."""
-        # If not None, we got an initial value.
-        if self._state is not None:
-            return
-
-        restore_state = self._hass.helpers.restore_state
-        state = await restore_state.async_get_last_state(self.entity_id)
-        self._state = state and state.state == state
-
-    async def async_start(self, duration):
-        """Start a timer."""
-        if self._listener:
-            self._listener()
-            self._listener = None
-        newduration = None
-        if duration:
-            newduration = duration
-
-        self._state = STATUS_ACTIVE
-        # pylint: disable=redefined-outer-name
-        start = dt_util.utcnow()
-        if self._remaining and newduration is None:
-            self._end = start + self._remaining
-        else:
-            if newduration:
-                self._duration = newduration
-                self._remaining = newduration
-            else:
-                self._remaining = self._duration
-            self._end = start + self._duration
-        self._listener = async_track_point_in_utc_time(self._hass,
-                                                       self.async_finished,
-                                                       self._end)
-        await self.async_update_ha_state()
-
-    async def async_pause(self):
-        """Pause a timer."""
-        if self._listener is None:
-            return
-
-        self._listener()
-        self._listener = None
-        self._remaining = self._end - dt_util.utcnow()
-        self._state = STATUS_PAUSED
-        self._end = None
-        await self.async_update_ha_state()
-
-    async def async_cancel(self):
-        """Cancel a timer."""
-        if self._listener:
-            self._listener()
-            self._listener = None
-        self._state = STATUS_IDLE
-        self._end = None
-        self._remaining = timedelta()
-        self._hass.bus.async_fire(EVENT_TIMER_CANCELLED,
-                                  {"entity_id": self.entity_id})
-        await self.async_update_ha_state()
-
-    async def async_finish(self):
-        """Reset and updates the states, fire finished event."""
-        if self._state != STATUS_ACTIVE:
-            return
-
-        self._listener = None
-        self._state = STATUS_IDLE
-        self._remaining = timedelta()
-        self._hass.bus.async_fire(EVENT_TIMER_FINISHED,
-                                  {"entity_id": self.entity_id})
-        await self.async_update_ha_state()
-
-    async def async_finished(self, time):
-        """Reset and updates the states, fire finished event."""
-        if self._state != STATUS_ACTIVE:
-            return
-
-        self._listener = None
-        self._state = STATUS_IDLE
-        self._remaining = timedelta()
-        self._hass.bus.async_fire(EVENT_TIMER_FINISHED,
-                                  {"entity_id": self.entity_id})
-        await self.async_update_ha_state()
+    @override
+    async def _update_data(self, item: dict, update_data: dict) -> dict:
+        """Return a new updated data object."""
+        data = {CONF_ID: item[CONF_ID]} | self.CREATE_UPDATE_SCHEMA(update_data)
+        # make duration JSON serializeable
+        if CONF_DURATION in update_data:
+            data[CONF_DURATION] = _format_timedelta(data[CONF_DURATION])
+        return data  # type: ignore[no-any-return]

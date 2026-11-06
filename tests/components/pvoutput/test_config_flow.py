@@ -1,0 +1,265 @@
+"""Tests for the PVOutput config flow."""
+
+from unittest.mock import AsyncMock, MagicMock
+
+from pvo import PVOutputAuthenticationError, PVOutputConnectionError
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+
+from homeassistant.components.pvoutput.const import CONF_SYSTEM_ID, DOMAIN
+from homeassistant.config_entries import SOURCE_USER
+from homeassistant.const import CONF_API_KEY
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+
+
+async def test_full_user_flow(
+    hass: HomeAssistant,
+    mock_pvoutput: MagicMock,
+    mock_setup_entry: AsyncMock,
+) -> None:
+    """Test the full user configuration flow."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "user"
+
+    result2 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_SYSTEM_ID: 12345,
+            CONF_API_KEY: "tadaaa",
+        },
+    )
+
+    assert result2.get("type") is FlowResultType.CREATE_ENTRY
+    assert result2.get("title") == "Frenck's Solar Farm"
+    assert result2.get("data") == {
+        CONF_SYSTEM_ID: 12345,
+        CONF_API_KEY: "tadaaa",
+    }
+    assert result2["result"].unique_id == "12345"
+
+    assert len(mock_setup_entry.mock_calls) == 1
+    assert len(mock_pvoutput.system.mock_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "expected_error"),
+    [
+        (PVOutputAuthenticationError, {"base": "invalid_auth"}),
+        (PVOutputConnectionError, {"base": "cannot_connect"}),
+    ],
+)
+async def test_user_flow_errors(
+    hass: HomeAssistant,
+    mock_pvoutput: MagicMock,
+    mock_setup_entry: AsyncMock,
+    side_effect: type[Exception],
+    expected_error: dict[str, str],
+) -> None:
+    """Test the user flow recovers from errors."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    mock_pvoutput.system.side_effect = side_effect
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_SYSTEM_ID: 12345,
+            CONF_API_KEY: "tadaaa",
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+    assert result["errors"] == expected_error
+
+    assert len(mock_setup_entry.mock_calls) == 0
+
+    mock_pvoutput.system.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_SYSTEM_ID: 12345,
+            CONF_API_KEY: "tadaaa",
+        },
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Frenck's Solar Farm"
+    assert result["data"] == {
+        CONF_SYSTEM_ID: 12345,
+        CONF_API_KEY: "tadaaa",
+    }
+    assert result["result"].unique_id == "12345"
+
+    assert len(mock_setup_entry.mock_calls) == 1
+
+
+async def test_already_configured(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_pvoutput: MagicMock,
+) -> None:
+    """Test we abort if the PVOutput system is already configured."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    result2 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_SYSTEM_ID: 12345,
+            CONF_API_KEY: "tadaaa",
+        },
+    )
+
+    assert result2.get("type") is FlowResultType.ABORT
+    assert result2.get("reason") == "already_configured"
+
+
+async def test_reauth_flow(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_pvoutput: MagicMock,
+    mock_setup_entry: AsyncMock,
+) -> None:
+    """Test the reauthentication configuration flow."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+    assert result.get("type") is FlowResultType.FORM
+    assert result.get("step_id") == "reauth_confirm"
+
+    result2 = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_API_KEY: "some_new_key"},
+    )
+    await hass.async_block_till_done()
+
+    assert result2.get("type") is FlowResultType.ABORT
+    assert result2.get("reason") == "reauth_successful"
+    assert mock_config_entry.data == {
+        CONF_SYSTEM_ID: 12345,
+        CONF_API_KEY: "some_new_key",
+    }
+
+    assert len(mock_setup_entry.mock_calls) == 1
+    assert len(mock_pvoutput.system.mock_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "expected_error"),
+    [
+        (PVOutputAuthenticationError, {"base": "invalid_auth"}),
+        (PVOutputConnectionError, {"base": "cannot_connect"}),
+    ],
+)
+async def test_reauth_flow_errors(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_pvoutput: MagicMock,
+    mock_setup_entry: AsyncMock,
+    side_effect: type[Exception],
+    expected_error: dict[str, str],
+) -> None:
+    """Test the reauthentication flow recovers from errors."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await mock_config_entry.start_reauth_flow(hass)
+
+    mock_pvoutput.system.side_effect = side_effect
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_API_KEY: "invalid_key"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+    assert result["errors"] == expected_error
+
+    assert len(mock_setup_entry.mock_calls) == 0
+
+    mock_pvoutput.system.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_API_KEY: "valid_key"},
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert mock_config_entry.data == {
+        CONF_SYSTEM_ID: 12345,
+        CONF_API_KEY: "valid_key",
+    }
+
+    assert len(mock_setup_entry.mock_calls) == 1
+
+
+@pytest.mark.usefixtures("mock_pvoutput")
+async def test_reconfigure_flow(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test reconfiguring an existing PVOutput entry."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_API_KEY: "new-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert mock_config_entry.data[CONF_API_KEY] == "new-api-key"
+    assert mock_config_entry.data[CONF_SYSTEM_ID] == 12345
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "expected_error"),
+    [
+        (PVOutputAuthenticationError, {"base": "invalid_auth"}),
+        (PVOutputConnectionError, {"base": "cannot_connect"}),
+    ],
+)
+async def test_reconfigure_flow_errors(
+    hass: HomeAssistant,
+    mock_pvoutput: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    side_effect: type[Exception],
+    expected_error: dict[str, str],
+) -> None:
+    """Test reconfigure flow recovers from errors."""
+    mock_config_entry.add_to_hass(hass)
+
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+
+    mock_pvoutput.system.side_effect = side_effect
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_API_KEY: "new-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == expected_error
+
+    mock_pvoutput.system.side_effect = None
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_API_KEY: "new-api-key"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"

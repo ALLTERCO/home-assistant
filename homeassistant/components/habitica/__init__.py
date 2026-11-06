@@ -1,158 +1,176 @@
-"""
-The Habitica API component.
+"""The habitica integration."""
 
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/habitica/
-"""
+from typing import TYPE_CHECKING
+from uuid import UUID
 
-import logging
-from collections import namedtuple
+from habiticalib import Habitica
+from yarl import URL
 
-import voluptuous as vol
-from homeassistant.const import \
-    CONF_NAME, CONF_URL, CONF_SENSORS, CONF_PATH, CONF_API_KEY
+from homeassistant.components.notify import DOMAIN as NOTIFY_DOMAIN
+from homeassistant.const import CONF_API_KEY, CONF_URL, CONF_VERIFY_SSL, Platform
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers import \
-    config_validation as cv, discovery
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util.hass_dict import HassKey
 
-REQUIREMENTS = ['habitipy==0.2.0']
-_LOGGER = logging.getLogger(__name__)
-DOMAIN = "habitica"
+from .const import CONF_API_USER, DOMAIN, MANUFACTURER, NAME, X_CLIENT
+from .coordinator import (
+    HabiticaConfigEntry,
+    HabiticaDataUpdateCoordinator,
+    HabiticaPartyCoordinator,
+)
+from .services import async_setup_services
 
-CONF_API_USER = "api_user"
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+HABITICA_KEY: HassKey[dict[UUID, HabiticaPartyCoordinator]] = HassKey(DOMAIN)
 
-ST = SensorType = namedtuple('SensorType', [
-    "name", "icon", "unit", "path"
-])
-
-SENSORS_TYPES = {
-    'name': ST('Name', None, '', ["profile", "name"]),
-    'hp': ST('HP', 'mdi:heart', 'HP', ["stats", "hp"]),
-    'maxHealth': ST('max HP', 'mdi:heart', 'HP', ["stats", "maxHealth"]),
-    'mp': ST('Mana', 'mdi:auto-fix', 'MP', ["stats", "mp"]),
-    'maxMP': ST('max Mana', 'mdi:auto-fix', 'MP', ["stats", "maxMP"]),
-    'exp': ST('EXP', 'mdi:star', 'EXP', ["stats", "exp"]),
-    'toNextLevel': ST(
-        'Next Lvl', 'mdi:star', 'EXP', ["stats", "toNextLevel"]),
-    'lvl': ST(
-        'Lvl', 'mdi:arrow-up-bold-circle-outline', 'Lvl', ["stats", "lvl"]),
-    'gp': ST('Gold', 'mdi:coin', 'Gold', ["stats", "gp"]),
-    'class': ST('Class', 'mdi:sword', '', ["stats", "class"])
-}
-
-INSTANCE_SCHEMA = vol.Schema({
-    vol.Optional(CONF_URL, default='https://habitica.com'): cv.url,
-    vol.Optional(CONF_NAME): cv.string,
-    vol.Required(CONF_API_USER): cv.string,
-    vol.Required(CONF_API_KEY): cv.string,
-    vol.Optional(CONF_SENSORS, default=list(SENSORS_TYPES)):
-        vol.All(
-            cv.ensure_list,
-            vol.Unique(),
-            [vol.In(list(SENSORS_TYPES))])
-})
-
-has_unique_values = vol.Schema(vol.Unique())  # pylint: disable=invalid-name
-# because we want a handy alias
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.CALENDAR,
+    Platform.IMAGE,
+    Platform.NOTIFY,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.TODO,
+]
 
 
-def has_all_unique_users(value):
-    """Validate that all `api_user`s are unique."""
-    api_users = [user[CONF_API_USER] for user in value]
-    has_unique_values(api_users)
-    return value
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Habitica service."""
 
-
-def has_all_unique_users_names(value):
-    """Validate that all user's names are unique and set if any is set."""
-    names = [user.get(CONF_NAME) for user in value]
-    if None in names and any(name is not None for name in names):
-        raise vol.Invalid(
-            'user names of all users must be set if any is set')
-    if not all(name is None for name in names):
-        has_unique_values(names)
-    return value
-
-
-INSTANCE_LIST_SCHEMA = vol.All(
-    cv.ensure_list,
-    has_all_unique_users,
-    has_all_unique_users_names,
-    [INSTANCE_SCHEMA])
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: INSTANCE_LIST_SCHEMA
-}, extra=vol.ALLOW_EXTRA)
-
-SERVICE_API_CALL = 'api_call'
-ATTR_NAME = CONF_NAME
-ATTR_PATH = CONF_PATH
-ATTR_ARGS = "args"
-EVENT_API_CALL_SUCCESS = "{0}_{1}_{2}".format(
-    DOMAIN, SERVICE_API_CALL, "success")
-
-SERVICE_API_CALL_SCHEMA = vol.Schema({
-    vol.Required(ATTR_NAME): str,
-    vol.Required(ATTR_PATH): vol.All(cv.ensure_list, [str]),
-    vol.Optional(ATTR_ARGS): dict
-})
-
-
-async def async_setup(hass, config):
-    """Set up the habitica service."""
-    conf = config[DOMAIN]
-    data = hass.data[DOMAIN] = {}
-    websession = async_get_clientsession(hass)
-    from habitipy.aio import HabitipyAsync
-
-    class HAHabitipyAsync(HabitipyAsync):
-        """Closure API class to hold session."""
-
-        def __call__(self, **kwargs):
-            return super().__call__(websession, **kwargs)
-
-    for instance in conf:
-        url = instance[CONF_URL]
-        username = instance[CONF_API_USER]
-        password = instance[CONF_API_KEY]
-        name = instance.get(CONF_NAME)
-        config_dict = {"url": url, "login": username, "password": password}
-        api = HAHabitipyAsync(config_dict)
-        user = await api.user.get()
-        if name is None:
-            name = user['profile']['name']
-        data[name] = api
-        if CONF_SENSORS in instance:
-            hass.async_create_task(
-                discovery.async_load_platform(
-                    hass, "sensor", DOMAIN,
-                    {"name": name, "sensors": instance[CONF_SENSORS]},
-                    config))
-
-    async def handle_api_call(call):
-        name = call.data[ATTR_NAME]
-        path = call.data[ATTR_PATH]
-        api = hass.data[DOMAIN].get(name)
-        if api is None:
-            _LOGGER.error(
-                "API_CALL: User '%s' not configured", name)
-            return
-        try:
-            for element in path:
-                api = api[element]
-        except KeyError:
-            _LOGGER.error(
-                "API_CALL: Path %s is invalid"
-                " for api on '{%s}' element", path, element)
-            return
-        kwargs = call.data.get(ATTR_ARGS, {})
-        data = await api(**kwargs)
-        hass.bus.async_fire(EVENT_API_CALL_SUCCESS, {
-            "name": name, "path": path, "data": data
-        })
-
-    hass.services.async_register(
-        DOMAIN, SERVICE_API_CALL,
-        handle_api_call,
-        schema=SERVICE_API_CALL_SCHEMA)
+    async_setup_services(hass)
     return True
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, config_entry: HabiticaConfigEntry
+) -> None:
+    """Set up habitica from a config entry."""
+    party_added_by_this_entry: UUID | None = None
+    device_reg = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
+
+    session = async_get_clientsession(
+        hass, verify_ssl=config_entry.data.get(CONF_VERIFY_SSL, True)
+    )
+
+    api = Habitica(
+        session,
+        api_user=config_entry.data[CONF_API_USER],
+        api_key=config_entry.data[CONF_API_KEY],
+        url=config_entry.data[CONF_URL],
+        x_client=X_CLIENT,
+    )
+
+    coordinator = HabiticaDataUpdateCoordinator(hass, config_entry, api)
+    await coordinator.async_config_entry_first_refresh()
+
+    config_entry.runtime_data = coordinator
+
+    if TYPE_CHECKING:
+        assert config_entry.unique_id
+
+    # Register the user device so children (party device) can resolve it
+    # deterministically as their via_device parent before platforms are set up.
+    device_reg.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        entry_type=dr.DeviceEntryType.SERVICE,
+        manufacturer=MANUFACTURER,
+        model=NAME,
+        name=coordinator.data.user.profile.name,
+        configuration_url=(
+            URL(config_entry.data[CONF_URL]) / "profile" / config_entry.unique_id
+        ),
+        identifiers={(DOMAIN, config_entry.unique_id)},
+    )
+
+    party = coordinator.data.user.party.id
+    hass.data.setdefault(HABITICA_KEY, {})
+
+    if party is not None and party not in hass.data[HABITICA_KEY]:
+        party_coordinator = HabiticaPartyCoordinator(hass, config_entry, api)
+        await party_coordinator.async_config_entry_first_refresh()
+
+        hass.data[HABITICA_KEY][party] = party_coordinator
+        party_added_by_this_entry = party
+
+    if party is not None:
+        # Register the party device so party member devices can resolve it
+        # deterministically as their via_device parent.
+        device_reg.async_get_or_create(
+            config_entry_id=config_entry.entry_id,
+            entry_type=dr.DeviceEntryType.SERVICE,
+            manufacturer=MANUFACTURER,
+            model=NAME,
+            name=hass.data[HABITICA_KEY][party].data.party.summary,
+            identifiers={(DOMAIN, f"{config_entry.unique_id}_{party!s}")},
+            via_device_id=dr.async_get_device_id_by_identifier(
+                hass,
+                (DOMAIN, config_entry.unique_id),
+                config_entry_id=config_entry.entry_id,
+            ),
+        )
+
+    @callback
+    def _party_update_listener() -> None:
+        """On party change, unload coordinator, remove device and reload."""
+        nonlocal party, party_added_by_this_entry
+        party_updated = coordinator.data.user.party.id
+
+        if (
+            party is not None and (party not in hass.data[HABITICA_KEY])
+        ) or party != party_updated:
+            if party_added_by_this_entry:
+                config_entry.async_create_task(
+                    hass, shutdown_party_coordinator(hass, party_added_by_this_entry)
+                )
+                party_added_by_this_entry = None
+            if party:
+                identifier = (DOMAIN, f"{config_entry.unique_id}_{party!s}")
+                if device := device_reg.async_get_device_by_identifier(
+                    identifier, config_entry.entry_id
+                ):
+                    device_reg.async_remove_device(device.id)
+
+                notify_entities = [
+                    entry.entity_id
+                    for entry in entity_registry.entities.values()
+                    if entry.domain == NOTIFY_DOMAIN
+                    and entry.config_entry_id == config_entry.entry_id
+                ]
+                for entity_id in notify_entities:
+                    entity_registry.async_remove(entity_id)
+
+            hass.config_entries.async_schedule_reload(config_entry.entry_id)
+
+    coordinator.async_add_listener(_party_update_listener)
+
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+
+    config_entry.async_on_unload(
+        config_entry.add_update_listener(_async_update_listener)
+    )
+
+
+async def _async_update_listener(
+    hass: HomeAssistant, entry: HabiticaConfigEntry
+) -> None:
+    """Handle update."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def shutdown_party_coordinator(hass: HomeAssistant, party_added: UUID) -> None:
+    """Handle party coordinator shutdown."""
+    await hass.data[HABITICA_KEY][party_added].async_shutdown()
+    hass.data[HABITICA_KEY].pop(party_added)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: HabiticaConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

@@ -1,0 +1,348 @@
+"""Config flow for AVM FRITZ!SmartHome."""
+
+from collections.abc import Mapping
+import ipaddress
+from typing import Any, Self, override
+
+import probatio
+from pyfritzhome import Fritzhome, LoginError
+from requests.exceptions import HTTPError
+from yarl import URL
+
+from homeassistant.config_entries import SOURCE_IGNORE, ConfigFlow, ConfigFlowResult
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_PASSWORD,
+    CONF_URL,
+    CONF_USERNAME,
+    CONF_VERIFY_SSL,
+)
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
+from homeassistant.helpers.service_info.ssdp import (
+    ATTR_UPNP_FRIENDLY_NAME,
+    ATTR_UPNP_UDN,
+    SsdpServiceInfo,
+)
+
+from .const import DEFAULT_URL, DEFAULT_USERNAME, DEFAULT_VERIFY_SSL, DOMAIN
+
+DATA_SCHEMA_USER = probatio.Schema(
+    {
+        probatio.Required(CONF_URL, default=DEFAULT_URL): TextSelector(
+            config=TextSelectorConfig(type=TextSelectorType.URL)
+        ),
+        probatio.Required(CONF_USERNAME, default=DEFAULT_USERNAME): str,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): TextSelector(
+            config=TextSelectorConfig(type=TextSelectorType.PASSWORD)
+        ),
+        probatio.Required(CONF_VERIFY_SSL, default=DEFAULT_VERIFY_SSL): bool,
+    }
+)
+
+DATA_SCHEMA_CONFIRM = probatio.Schema(
+    {
+        probatio.Required(CONF_USERNAME, default=DEFAULT_USERNAME): str,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): TextSelector(
+            config=TextSelectorConfig(type=TextSelectorType.PASSWORD)
+        ),
+    }
+)
+
+RESULT_INVALID_AUTH = "invalid_auth"
+RESULT_NO_DEVICES_FOUND = "no_devices_found"
+RESULT_NOT_SUPPORTED = "not_supported"
+RESULT_SUCCESS = "success"
+
+
+def _is_ip(host: str, ipv6_link_local: bool = False) -> bool:
+    """Return whether host is an IP address, optionally requiring IPv6 link-local."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if ipv6_link_local:
+        return ip.version == 6 and ip.is_link_local
+    return True
+
+
+async def _async_resolves_to(hass: HomeAssistant, host: str, ip: str) -> bool:
+    """Return whether host resolves to the given IP address."""
+    try:
+        addresses = await hass.loop.getaddrinfo(host, None)
+    except OSError:
+        return False
+    return any(address[4][0] == ip for address in addresses)
+
+
+class FritzboxConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a AVM FRITZ!SmartHome config flow."""
+
+    VERSION = 1
+    MINOR_VERSION = 2
+
+    _name: str
+
+    def __init__(self) -> None:
+        """Initialize flow."""
+        self._url: str | None = None
+        self._password: str | None = None
+        self._username: str | None = None
+        self._verify_ssl: bool = DEFAULT_VERIFY_SSL
+
+    def _get_entry(self, name: str) -> ConfigFlowResult:
+        return self.async_create_entry(
+            title=name,
+            data={
+                CONF_HOST: self._url,
+                CONF_PASSWORD: self._password,
+                CONF_USERNAME: self._username,
+                CONF_VERIFY_SSL: self._verify_ssl,
+            },
+        )
+
+    async def async_try_connect(self) -> str:
+        """Try to connect and check auth."""
+        return await self.hass.async_add_executor_job(self._try_connect)
+
+    def _try_connect(self) -> str:
+        """Try to connect and check auth."""
+        fritzbox = Fritzhome(
+            host=self._url,
+            user=self._username,
+            password=self._password,
+            ssl_verify=self._verify_ssl,
+        )
+        try:
+            fritzbox.login()
+            fritzbox.get_device_elements()
+            fritzbox.logout()
+        except LoginError:
+            return RESULT_INVALID_AUTH
+        except HTTPError:
+            return RESULT_NOT_SUPPORTED
+        except OSError:
+            return RESULT_NO_DEVICES_FOUND
+        return RESULT_SUCCESS
+
+    async def async_has_smarthome_capabilities(self) -> bool | None:
+        """Test if the device has smarthome capabilities."""
+        return await self.hass.async_add_executor_job(self._has_smarthome_capabilities)
+
+    def _has_smarthome_capabilities(self) -> bool | None:
+        """Test if the device has smarthome capabilities."""
+        fritzbox = Fritzhome(
+            host=self._url,
+            user=None,
+            password=None,
+            ssl_verify=False,
+        )
+        return fritzbox.has_smarthome_capabilities()  # type: ignore[no-any-return]
+
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a flow initialized by the user."""
+        errors = {}
+
+        if user_input is not None:
+            self._url = user_input[CONF_URL]
+            self._verify_ssl = user_input[CONF_VERIFY_SSL]
+            self._password = user_input[CONF_PASSWORD]
+            self._username = user_input[CONF_USERNAME]
+            self._name = str(self._url)
+
+            self._async_abort_entries_match({CONF_HOST: self._url})
+
+            result = await self.async_try_connect()
+
+            if result == RESULT_SUCCESS:
+                return self._get_entry(self._name)
+            if result != RESULT_INVALID_AUTH:
+                return self.async_abort(reason=result)
+            errors["base"] = result
+
+        return self.async_show_form(
+            step_id="user", data_schema=DATA_SCHEMA_USER, errors=errors
+        )
+
+    @override
+    async def async_step_ssdp(
+        self, discovery_info: SsdpServiceInfo
+    ) -> ConfigFlowResult:
+        """Handle a flow initialized by discovery."""
+        assert isinstance(discovery_info.ssdp_location, str)
+        ssdp_host = URL(discovery_info.ssdp_location).host
+        assert isinstance(ssdp_host, str)
+
+        self._url = str(URL.build(scheme="http", host=ssdp_host))
+
+        if _is_ip(ssdp_host, ipv6_link_local=True):
+            return self.async_abort(reason="ignore_ip6_link_local")
+
+        if uuid := discovery_info.upnp.get(ATTR_UPNP_UDN):
+            uuid = uuid.removeprefix("uuid:")
+            updates = None
+            if (
+                (existing_entry := await self.async_set_unique_id(uuid))
+                and existing_entry.source != SOURCE_IGNORE
+                and (existing_host := URL(existing_entry.data[CONF_HOST]).host)
+                and _is_ip(existing_host)
+                and _is_ip(ssdp_host)
+            ):
+                # keep user-configured hostnames
+                updates = {CONF_HOST: self._url}
+            self._abort_if_unique_id_configured(updates)
+
+        if self.hass.config_entries.flow.async_has_matching_flow(self):
+            return self.async_abort(
+                reason="already_in_progress", translation_domain=HOMEASSISTANT_DOMAIN
+            )
+
+        # update old and user-configured config entries
+        for entry in self._async_current_entries(include_ignore=False):
+            if (entry_host := URL(entry.data[CONF_HOST]).host) and (
+                (entry_host == ssdp_host)
+                or (
+                    _is_ip(entry_host)
+                    and await _async_resolves_to(self.hass, ssdp_host, entry_host)
+                )
+                or (
+                    _is_ip(ssdp_host)
+                    and await _async_resolves_to(self.hass, entry_host, ssdp_host)
+                )
+            ):
+                if uuid and not entry.unique_id:
+                    self.hass.config_entries.async_update_entry(entry, unique_id=uuid)
+                return self.async_abort(reason="already_configured")
+
+        if await self.async_has_smarthome_capabilities() is False:
+            return self.async_abort(reason="not_supported")
+
+        self._name = str(discovery_info.upnp.get(ATTR_UPNP_FRIENDLY_NAME) or self._url)
+
+        self.context["title_placeholders"] = {"name": self._name}
+        return await self.async_step_confirm()
+
+    @override
+    def is_matching(self, other_flow: Self) -> bool:
+        """Return True if other_flow is matching this flow."""
+        return other_flow._url == self._url
+
+    async def async_step_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle user-confirmation of discovered node."""
+        errors = {}
+
+        if user_input is not None:
+            self._password = user_input[CONF_PASSWORD]
+            self._username = user_input[CONF_USERNAME]
+            result = await self.async_try_connect()
+
+            if result == RESULT_SUCCESS:
+                return self._get_entry(self._name)
+            if result != RESULT_INVALID_AUTH:
+                return self.async_abort(reason=result)
+            errors["base"] = result
+
+        return self.async_show_form(
+            step_id="confirm",
+            data_schema=DATA_SCHEMA_CONFIRM,
+            description_placeholders={"name": self._name},
+            errors=errors,
+        )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Trigger a reauthentication flow."""
+        self._url = entry_data[CONF_HOST]
+        self._verify_ssl = entry_data[CONF_VERIFY_SSL]
+        self._name = str(entry_data[CONF_HOST])
+        self._username = entry_data[CONF_USERNAME]
+
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reauthorization flow."""
+        errors = {}
+
+        if user_input is not None:
+            self._password = user_input[CONF_PASSWORD]
+            self._username = user_input[CONF_USERNAME]
+
+            result = await self.async_try_connect()
+
+            if result == RESULT_SUCCESS:
+                return self.async_update_reload_and_abort(
+                    self._get_reauth_entry(),
+                    data_updates={
+                        CONF_PASSWORD: self._password,
+                        CONF_USERNAME: self._username,
+                    },
+                )
+            if result != RESULT_INVALID_AUTH:
+                return self.async_abort(reason=result)
+            errors["base"] = result
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(CONF_USERNAME, default=self._username): str,
+                    probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
+                }
+            ),
+            description_placeholders={"name": self._name},
+            errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a reconfiguration flow initialized by the user."""
+        errors = {}
+        reconfigure_entry = self._get_reconfigure_entry()
+
+        self._url = reconfigure_entry.data[CONF_HOST]
+        self._verify_ssl = reconfigure_entry.data[CONF_VERIFY_SSL]
+        self._username = reconfigure_entry.data[CONF_USERNAME]
+        self._password = reconfigure_entry.data[CONF_PASSWORD]
+
+        if user_input is not None:
+            self._url = user_input[CONF_URL]
+            self._verify_ssl = user_input[CONF_VERIFY_SSL]
+
+            result = await self.async_try_connect()
+
+            if result == RESULT_SUCCESS:
+                return self.async_update_reload_and_abort(
+                    reconfigure_entry,
+                    data_updates={
+                        CONF_HOST: self._url,
+                        CONF_VERIFY_SSL: self._verify_ssl,
+                    },
+                )
+            errors["base"] = result
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(CONF_URL, default=self._url): TextSelector(
+                        config=TextSelectorConfig(type=TextSelectorType.URL)
+                    ),
+                    probatio.Required(CONF_VERIFY_SSL, default=self._verify_ssl): bool,
+                }
+            ),
+            description_placeholders={"name": self._url},
+            errors=errors,
+        )

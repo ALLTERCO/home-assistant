@@ -1,93 +1,381 @@
-"""Implement the Smart Home traits."""
-import logging
+"""Implement the Google Smart Home traits."""
 
-from homeassistant.core import DOMAIN as HA_DOMAIN
+from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
+import logging
+from typing import Any, override
+
 from homeassistant.components import (
+    binary_sensor,
+    camera,
     climate,
     cover,
-    group,
+    event,
     fan,
-    input_boolean,
-    media_player,
+    lawn_mower,
     light,
-    scene,
-    script,
-    switch,
+    media_player,
+    sensor,
+    vacuum,
+    valve,
+)
+from homeassistant.components.alarm_control_panel import (
+    DOMAIN as ALARM_CONTROL_PANEL_DOMAIN,
+    AlarmControlPanelEntityFeature,
+    AlarmControlPanelEntityStateAttribute,
+    AlarmControlPanelService,
+    AlarmControlPanelServiceArgument,
+    AlarmControlPanelState,
+)
+from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
+from homeassistant.components.button import DOMAIN as BUTTON_DOMAIN, ButtonService
+from homeassistant.components.camera import DOMAIN as CAMERA_DOMAIN, CameraEntityFeature
+from homeassistant.components.climate import (
+    DOMAIN as CLIMATE_DOMAIN,
+    ClimateEntityCapabilityAttribute,
+    ClimateEntityFeature,
+    ClimateEntityStateAttribute,
+    ClimateService,
+    ClimateServiceArgument,
+)
+from homeassistant.components.cover import (
+    DOMAIN as COVER_DOMAIN,
+    CoverEntityFeature,
+    CoverEntityStateAttribute,
+    CoverService,
+    CoverServiceArgument,
+)
+from homeassistant.components.event import DOMAIN as EVENT_DOMAIN
+from homeassistant.components.fan import (
+    DOMAIN as FAN_DOMAIN,
+    FanEntityCapabilityAttribute,
+    FanEntityFeature,
+    FanEntityStateAttribute,
+    FanService,
+    FanServiceArgument,
+)
+from homeassistant.components.group import DOMAIN as GROUP_DOMAIN
+from homeassistant.components.humidifier import (
+    DOMAIN as HUMIDIFIER_DOMAIN,
+    HumidifierEntityCapabilityAttribute,
+    HumidifierEntityFeature,
+    HumidifierEntityStateAttribute,
+    HumidifierService,
+    HumidifierServiceArgument,
+)
+from homeassistant.components.input_boolean import DOMAIN as INPUT_BOOLEAN_DOMAIN
+from homeassistant.components.input_button import (
+    DOMAIN as INPUT_BUTTON_DOMAIN,
+    InputButtonService,
+)
+from homeassistant.components.input_select import (
+    DOMAIN as INPUT_SELECT_DOMAIN,
+    InputSelectService,
+    InputSelectServiceArgument,
+)
+from homeassistant.components.lawn_mower import (
+    DOMAIN as LAWN_MOWER_DOMAIN,
+    LawnMowerEntityFeature,
+    LawnMowerService,
+)
+from homeassistant.components.light import (
+    DOMAIN as LIGHT_DOMAIN,
+    LightEntityCapabilityAttribute,
+    LightEntityFeature,
+    LightEntityStateAttribute,
+    LightService,
+    LightServiceArgument,
+)
+from homeassistant.components.lock import DOMAIN as LOCK_DOMAIN, LockService, LockState
+from homeassistant.components.media_player import (
+    DOMAIN as MEDIA_PLAYER_DOMAIN,
+    MediaPlayerEntityCapabilityAttribute,
+    MediaPlayerEntityFeature,
+    MediaPlayerEntityStateAttribute,
+    MediaPlayerService,
+    MediaPlayerServiceArgument,
+    MediaType,
+)
+from homeassistant.components.scene import DOMAIN as SCENE_DOMAIN
+from homeassistant.components.script import DOMAIN as SCRIPT_DOMAIN
+from homeassistant.components.select import (
+    DOMAIN as SELECT_DOMAIN,
+    SelectEntityCapabilityAttribute,
+    SelectService,
+    SelectServiceArgument,
+)
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
+from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
+from homeassistant.components.vacuum import (
+    DOMAIN as VACUUM_DOMAIN,
+    VacuumEntityFeature,
+    VacuumService,
+)
+from homeassistant.components.valve import (
+    DOMAIN as VALVE_DOMAIN,
+    ValveEntityFeature,
+    ValveEntityStateAttribute,
+    ValveService,
+    ValveServiceArgument,
+)
+from homeassistant.components.water_heater import (
+    DOMAIN as WATER_HEATER_DOMAIN,
+    WaterHeaterCapabilityAttribute,
+    WaterHeaterEntityFeature,
+    WaterHeaterService,
+    WaterHeaterServiceArgument,
+    WaterHeaterStateAttribute,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
+    CAST_APP_ID_HOMEASSISTANT_MEDIA,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
+    STATE_IDLE,
     STATE_OFF,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
+    STATE_ON,
+    STATE_PAUSED,
+    STATE_PLAYING,
+    STATE_STANDBY,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    EntityStateAttribute,
+    UnitOfTemperature,
 )
-from homeassistant.util import color as color_util, temperature as temp_util
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.helpers import area_registry as ar, entity_registry as er
+from homeassistant.helpers.network import get_url
+from homeassistant.util import color as color_util, dt as dt_util
+from homeassistant.util.dt import utcnow
+from homeassistant.util.percentage import (
+    ordered_list_item_to_percentage,
+    percentage_to_ordered_list_item,
+)
+from homeassistant.util.unit_conversion import TemperatureConverter
 
-from .const import ERR_VALUE_OUT_OF_RANGE
-from .helpers import SmartHomeError
+from .const import (
+    CHALLENGE_FAILED_PIN_NEEDED,
+    CHALLENGE_PIN_NEEDED,
+    ERR_ALREADY_ARMED,
+    ERR_ALREADY_DISARMED,
+    ERR_ALREADY_STOPPED,
+    ERR_CHALLENGE_NOT_SETUP,
+    ERR_FUNCTION_NOT_SUPPORTED,
+    ERR_NO_AVAILABLE_CHANNEL,
+    ERR_NOT_SUPPORTED,
+    ERR_UNSUPPORTED_INPUT,
+    ERR_VALUE_OUT_OF_RANGE,
+    FAN_SPEEDS,
+)
+from .error import ChallengeNeeded, SmartHomeError
 
 _LOGGER = logging.getLogger(__name__)
 
-PREFIX_TRAITS = 'action.devices.traits.'
-TRAIT_ONOFF = PREFIX_TRAITS + 'OnOff'
-TRAIT_BRIGHTNESS = PREFIX_TRAITS + 'Brightness'
-TRAIT_COLOR_SPECTRUM = PREFIX_TRAITS + 'ColorSpectrum'
-TRAIT_COLOR_TEMP = PREFIX_TRAITS + 'ColorTemperature'
-TRAIT_SCENE = PREFIX_TRAITS + 'Scene'
-TRAIT_TEMPERATURE_SETTING = PREFIX_TRAITS + 'TemperatureSetting'
+PREFIX_TRAITS = "action.devices.traits."
+TRAIT_ARM_DISARM = f"{PREFIX_TRAITS}ArmDisarm"
+TRAIT_BRIGHTNESS = f"{PREFIX_TRAITS}Brightness"
+TRAIT_CAMERA_STREAM = f"{PREFIX_TRAITS}CameraStream"
+TRAIT_CHANNEL = f"{PREFIX_TRAITS}Channel"
+TRAIT_COLOR_SETTING = f"{PREFIX_TRAITS}ColorSetting"
+TRAIT_DOCK = f"{PREFIX_TRAITS}Dock"
+TRAIT_ENERGY_STORAGE = f"{PREFIX_TRAITS}EnergyStorage"
+TRAIT_FAN_SPEED = f"{PREFIX_TRAITS}FanSpeed"
+TRAIT_HUMIDITY_SETTING = f"{PREFIX_TRAITS}HumiditySetting"
+TRAIT_INPUT_SELECTOR = f"{PREFIX_TRAITS}InputSelector"
+TRAIT_LOCATOR = f"{PREFIX_TRAITS}Locator"
+TRAIT_LOCK_UNLOCK = f"{PREFIX_TRAITS}LockUnlock"
+TRAIT_MEDIA_STATE = f"{PREFIX_TRAITS}MediaState"
+TRAIT_MODES = f"{PREFIX_TRAITS}Modes"
+TRAIT_OBJECT_DETECTION = f"{PREFIX_TRAITS}ObjectDetection"
+TRAIT_ON_OFF = f"{PREFIX_TRAITS}OnOff"
+TRAIT_OPEN_CLOSE = f"{PREFIX_TRAITS}OpenClose"
+TRAIT_SCENE = f"{PREFIX_TRAITS}Scene"
+TRAIT_SENSOR_STATE = f"{PREFIX_TRAITS}SensorState"
+TRAIT_START_STOP = f"{PREFIX_TRAITS}StartStop"
+TRAIT_TEMPERATURE_CONTROL = f"{PREFIX_TRAITS}TemperatureControl"
+TRAIT_TEMPERATURE_SETTING = f"{PREFIX_TRAITS}TemperatureSetting"
+TRAIT_TRANSPORT_CONTROL = f"{PREFIX_TRAITS}TransportControl"
+TRAIT_VOLUME = f"{PREFIX_TRAITS}Volume"
 
-PREFIX_COMMANDS = 'action.devices.commands.'
-COMMAND_ONOFF = PREFIX_COMMANDS + 'OnOff'
-COMMAND_BRIGHTNESS_ABSOLUTE = PREFIX_COMMANDS + 'BrightnessAbsolute'
-COMMAND_COLOR_ABSOLUTE = PREFIX_COMMANDS + 'ColorAbsolute'
-COMMAND_ACTIVATE_SCENE = PREFIX_COMMANDS + 'ActivateScene'
+PREFIX_COMMANDS = "action.devices.commands."
+COMMAND_ACTIVATE_SCENE = f"{PREFIX_COMMANDS}ActivateScene"
+COMMAND_ARM_DISARM = f"{PREFIX_COMMANDS}ArmDisarm"
+COMMAND_BRIGHTNESS_ABSOLUTE = f"{PREFIX_COMMANDS}BrightnessAbsolute"
+COMMAND_CHARGE = f"{PREFIX_COMMANDS}Charge"
+COMMAND_COLOR_ABSOLUTE = f"{PREFIX_COMMANDS}ColorAbsolute"
+COMMAND_DOCK = f"{PREFIX_COMMANDS}Dock"
+COMMAND_GET_CAMERA_STREAM = f"{PREFIX_COMMANDS}GetCameraStream"
+COMMAND_LOCK_UNLOCK = f"{PREFIX_COMMANDS}LockUnlock"
+COMMAND_LOCATE = f"{PREFIX_COMMANDS}Locate"
+COMMAND_NEXT_INPUT = f"{PREFIX_COMMANDS}NextInput"
+COMMAND_MEDIA_NEXT = f"{PREFIX_COMMANDS}mediaNext"
+COMMAND_MEDIA_PAUSE = f"{PREFIX_COMMANDS}mediaPause"
+COMMAND_MEDIA_PREVIOUS = f"{PREFIX_COMMANDS}mediaPrevious"
+COMMAND_MEDIA_RESUME = f"{PREFIX_COMMANDS}mediaResume"
+COMMAND_MEDIA_SEEK_RELATIVE = f"{PREFIX_COMMANDS}mediaSeekRelative"
+COMMAND_MEDIA_SEEK_TO_POSITION = f"{PREFIX_COMMANDS}mediaSeekToPosition"
+COMMAND_MEDIA_SHUFFLE = f"{PREFIX_COMMANDS}mediaShuffle"
+COMMAND_MEDIA_STOP = f"{PREFIX_COMMANDS}mediaStop"
+COMMAND_MUTE = f"{PREFIX_COMMANDS}mute"
+COMMAND_OPEN_CLOSE = f"{PREFIX_COMMANDS}OpenClose"
+COMMAND_ON_OFF = f"{PREFIX_COMMANDS}OnOff"
+COMMAND_OPEN_CLOSE_RELATIVE = f"{PREFIX_COMMANDS}OpenCloseRelative"
+COMMAND_PAUSE_UNPAUSE = f"{PREFIX_COMMANDS}PauseUnpause"
+COMMAND_REVERSE = f"{PREFIX_COMMANDS}Reverse"
+COMMAND_PREVIOUS_INPUT = f"{PREFIX_COMMANDS}PreviousInput"
+COMMAND_SELECT_CHANNEL = f"{PREFIX_COMMANDS}selectChannel"
+COMMAND_SET_TEMPERATURE = f"{PREFIX_COMMANDS}SetTemperature"
+COMMAND_SET_FAN_SPEED = f"{PREFIX_COMMANDS}SetFanSpeed"
+COMMAND_SET_FAN_SPEED_RELATIVE = f"{PREFIX_COMMANDS}SetFanSpeedRelative"
+COMMAND_SET_HUMIDITY = f"{PREFIX_COMMANDS}SetHumidity"
+COMMAND_SET_INPUT = f"{PREFIX_COMMANDS}SetInput"
+COMMAND_SET_MODES = f"{PREFIX_COMMANDS}SetModes"
+COMMAND_SET_VOLUME = f"{PREFIX_COMMANDS}setVolume"
+COMMAND_START_STOP = f"{PREFIX_COMMANDS}StartStop"
+COMMAND_THERMOSTAT_SET_MODE = f"{PREFIX_COMMANDS}ThermostatSetMode"
 COMMAND_THERMOSTAT_TEMPERATURE_SETPOINT = (
-    PREFIX_COMMANDS + 'ThermostatTemperatureSetpoint')
+    f"{PREFIX_COMMANDS}ThermostatTemperatureSetpoint"
+)
 COMMAND_THERMOSTAT_TEMPERATURE_SET_RANGE = (
-    PREFIX_COMMANDS + 'ThermostatTemperatureSetRange')
-COMMAND_THERMOSTAT_SET_MODE = PREFIX_COMMANDS + 'ThermostatSetMode'
+    f"{PREFIX_COMMANDS}ThermostatTemperatureSetRange"
+)
+COMMAND_VOLUME_RELATIVE = f"{PREFIX_COMMANDS}volumeRelative"
+
+TRAITS: list[type[_Trait]] = []
+
+FAN_SPEED_MAX_SPEED_COUNT = 5
+
+COVER_VALVE_STATES = {
+    COVER_DOMAIN: {
+        "closed": cover.CoverState.CLOSED.value,
+        "closing": cover.CoverState.CLOSING.value,
+        "open": cover.CoverState.OPEN.value,
+        "opening": cover.CoverState.OPENING.value,
+    },
+    VALVE_DOMAIN: {
+        "closed": valve.STATE_CLOSED,
+        "closing": valve.STATE_CLOSING,
+        "open": valve.STATE_OPEN,
+        "opening": valve.STATE_OPENING,
+    },
+}
+
+SERVICE_STOP_COVER_VALVE = {
+    COVER_DOMAIN: CoverService.STOP,
+    VALVE_DOMAIN: ValveService.STOP,
+}
+SERVICE_OPEN_COVER_VALVE = {
+    COVER_DOMAIN: CoverService.OPEN,
+    VALVE_DOMAIN: ValveService.OPEN,
+}
+SERVICE_CLOSE_COVER_VALVE = {
+    COVER_DOMAIN: CoverService.CLOSE,
+    VALVE_DOMAIN: ValveService.CLOSE,
+}
+SERVICE_TOGGLE_COVER_VALVE = {
+    COVER_DOMAIN: CoverService.TOGGLE,
+    VALVE_DOMAIN: ValveService.TOGGLE,
+}
+SERVICE_SET_POSITION_COVER_VALVE = {
+    COVER_DOMAIN: CoverService.SET_POSITION,
+    VALVE_DOMAIN: ValveService.SET_POSITION,
+}
+
+COVER_VALVE_CURRENT_POSITION = {
+    COVER_DOMAIN: CoverEntityStateAttribute.CURRENT_POSITION,
+    VALVE_DOMAIN: ValveEntityStateAttribute.CURRENT_POSITION,
+}
+
+COVER_VALVE_POSITION = {
+    COVER_DOMAIN: CoverServiceArgument.POSITION,
+    VALVE_DOMAIN: ValveServiceArgument.POSITION,
+}
+
+COVER_VALVE_SET_POSITION_FEATURE = {
+    COVER_DOMAIN: CoverEntityFeature.SET_POSITION,
+    VALVE_DOMAIN: ValveEntityFeature.SET_POSITION,
+}
+COVER_VALVE_STOP_FEATURE = {
+    COVER_DOMAIN: CoverEntityFeature.STOP,
+    VALVE_DOMAIN: ValveEntityFeature.STOP,
+}
+
+COVER_VALVE_DOMAINS = {COVER_DOMAIN, VALVE_DOMAIN}
+
+FRIENDLY_DOMAIN = {COVER_DOMAIN: "Cover", VALVE_DOMAIN: "Valve"}
 
 
-TRAITS = []
-
-
-def register_trait(trait):
-    """Decorate a function to register a trait."""
+def register_trait[_TraitT: _Trait](trait: type[_TraitT]) -> type[_TraitT]:
+    """Decorate a class to register a trait."""
     TRAITS.append(trait)
     return trait
 
 
 def _google_temp_unit(units):
     """Return Google temperature unit."""
-    if units == TEMP_FAHRENHEIT:
-        return 'F'
-    return 'C'
+    if units == UnitOfTemperature.FAHRENHEIT:
+        return "F"
+    return "C"
 
 
-class _Trait:
+def _next_selected(items: list[str], selected: str | None) -> str | None:
+    """Return the next item in an item list starting at given value.
+
+    If selected is missing in items, None is returned
+    """
+    if selected is None:
+        return None
+    try:
+        index = items.index(selected)
+    except ValueError:
+        return None
+
+    next_item = 0 if index == len(items) - 1 else index + 1
+    return items[next_item]
+
+
+class _Trait(ABC):
     """Represents a Trait inside Google Assistant skill."""
 
-    commands = []
+    name: str
+    commands: list[str] = []
 
-    def __init__(self, hass, state):
+    @staticmethod
+    def might_2fa(domain, features, device_class):
+        """Return if the trait might ask for 2FA."""
+        return False
+
+    @staticmethod
+    @abstractmethod
+    def supported(domain, features, device_class, attributes):
+        """Test if state is supported."""
+
+    def __init__(self, hass: HomeAssistant, state, config) -> None:
         """Initialize a trait for a state."""
         self.hass = hass
         self.state = state
+        self.config = config
 
-    def sync_attributes(self):
+    def sync_attributes(self) -> dict[str, Any]:
         """Return attributes for a sync request."""
         raise NotImplementedError
 
-    def query_attributes(self):
+    def sync_options(self) -> dict[str, Any]:
+        """Add options for the sync request."""
+        return {}
+
+    def query_attributes(self) -> dict[str, Any]:
         """Return the attributes of this trait for this entity."""
         raise NotImplementedError
+
+    def query_notifications(self) -> dict[str, Any] | None:  # noqa: B027
+        """Return notifications payload."""
 
     def can_execute(self, command, params):
         """Test if command can be executed."""
         return command in self.commands
 
-    async def execute(self, command, params):
+    async def execute(self, command, data, params, challenge):
         """Execute a trait command."""
         raise NotImplementedError
 
@@ -100,73 +388,161 @@ class BrightnessTrait(_Trait):
     """
 
     name = TRAIT_BRIGHTNESS
-    commands = [
-        COMMAND_BRIGHTNESS_ABSOLUTE
-    ]
+    commands = [COMMAND_BRIGHTNESS_ABSOLUTE]
 
     @staticmethod
-    def supported(domain, features):
+    @override
+    def supported(domain, features, device_class, attributes):
         """Test if state is supported."""
-        if domain == light.DOMAIN:
-            return features & light.SUPPORT_BRIGHTNESS
-        if domain == cover.DOMAIN:
-            return features & cover.SUPPORT_SET_POSITION
-        if domain == media_player.DOMAIN:
-            return features & media_player.SUPPORT_VOLUME_SET
+        if domain == LIGHT_DOMAIN:
+            color_modes = attributes.get(
+                LightEntityCapabilityAttribute.SUPPORTED_COLOR_MODES
+            )
+            return light.brightness_supported(color_modes)
 
         return False
 
-    def sync_attributes(self):
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
         """Return brightness attributes for a sync request."""
         return {}
 
-    def query_attributes(self):
+    @override
+    def query_attributes(self) -> dict[str, Any]:
         """Return brightness query attributes."""
         domain = self.state.domain
         response = {}
 
-        if domain == light.DOMAIN:
-            brightness = self.state.attributes.get(light.ATTR_BRIGHTNESS)
+        if domain == LIGHT_DOMAIN:
+            brightness = self.state.attributes.get(LightEntityStateAttribute.BRIGHTNESS)
             if brightness is not None:
-                response['brightness'] = int(100 * (brightness / 255))
-
-        elif domain == cover.DOMAIN:
-            position = self.state.attributes.get(cover.ATTR_CURRENT_POSITION)
-            if position is not None:
-                response['brightness'] = position
-
-        elif domain == media_player.DOMAIN:
-            level = self.state.attributes.get(
-                media_player.ATTR_MEDIA_VOLUME_LEVEL)
-            if level is not None:
-                # Convert 0.0-1.0 to 0-255
-                response['brightness'] = int(level * 100)
+                response["brightness"] = round(100 * (brightness / 255))
 
         return response
 
-    async def execute(self, command, params):
+    @override
+    async def execute(self, command, data, params, challenge):
         """Execute a brightness command."""
-        domain = self.state.domain
+        if self.state.domain == LIGHT_DOMAIN:
+            await self.hass.services.async_call(
+                LIGHT_DOMAIN,
+                LightService.TURN_ON,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    LightServiceArgument.BRIGHTNESS_PCT: params["brightness"],
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
 
-        if domain == light.DOMAIN:
-            await self.hass.services.async_call(
-                light.DOMAIN, light.SERVICE_TURN_ON, {
-                    ATTR_ENTITY_ID: self.state.entity_id,
-                    light.ATTR_BRIGHTNESS_PCT: params['brightness']
-                }, blocking=True)
-        elif domain == cover.DOMAIN:
-            await self.hass.services.async_call(
-                cover.DOMAIN, cover.SERVICE_SET_COVER_POSITION, {
-                    ATTR_ENTITY_ID: self.state.entity_id,
-                    cover.ATTR_POSITION: params['brightness']
-                }, blocking=True)
-        elif domain == media_player.DOMAIN:
-            await self.hass.services.async_call(
-                media_player.DOMAIN, media_player.SERVICE_VOLUME_SET, {
-                    ATTR_ENTITY_ID: self.state.entity_id,
-                    media_player.ATTR_MEDIA_VOLUME_LEVEL:
-                    params['brightness'] / 100
-                }, blocking=True)
+
+@register_trait
+class CameraStreamTrait(_Trait):
+    """Trait to stream from cameras.
+
+    https://developers.google.com/actions/smarthome/traits/camerastream
+    """
+
+    name = TRAIT_CAMERA_STREAM
+    commands = [COMMAND_GET_CAMERA_STREAM]
+
+    stream_info: dict[str, str] | None = None
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        if domain == CAMERA_DOMAIN:
+            return features & CameraEntityFeature.STREAM
+
+        return False
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return stream attributes for a sync request."""
+        return {
+            "cameraStreamSupportedProtocols": ["hls"],
+            "cameraStreamNeedAuthToken": False,
+            "cameraStreamNeedDrmEncryption": False,
+        }
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return camera stream attributes."""
+        return self.stream_info or {}
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute a get camera stream command."""
+        url = await camera.async_request_stream(self.hass, self.state.entity_id, "hls")
+        self.stream_info = {
+            "cameraStreamAccessUrl": f"{get_url(self.hass)}{url}",
+            "cameraStreamReceiverAppId": CAST_APP_ID_HOMEASSISTANT_MEDIA,
+        }
+
+
+@register_trait
+class ObjectDetection(_Trait):
+    """Trait to object detection.
+
+    https://developers.google.com/actions/smarthome/traits/objectdetection
+    """
+
+    name = TRAIT_OBJECT_DETECTION
+    commands = []
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _) -> bool:
+        """Test if state is supported."""
+        return (
+            domain == EVENT_DOMAIN and device_class == event.EventDeviceClass.DOORBELL
+        )
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return ObjectDetection attributes for a sync request."""
+        return {}
+
+    @override
+    def sync_options(self) -> dict[str, Any]:
+        """Add options for the sync request."""
+        return {"notificationSupportedByAgent": True}
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return ObjectDetection query attributes."""
+        return {}
+
+    @override
+    def query_notifications(self) -> dict[str, Any] | None:
+        """Return notifications payload."""
+
+        if self.state.state in {STATE_UNKNOWN, STATE_UNAVAILABLE}:
+            return None
+
+        # Only notify if last event was less then 30 seconds ago
+        time_stamp: datetime = datetime.fromisoformat(self.state.state)
+        if (utcnow() - time_stamp) > timedelta(seconds=30):
+            return None
+
+        # A doorbell event is treated as an object detection of 1 unclassified object.
+        # The implementation follows the pattern from the Smart Home Doorbell Guide:
+        # https://developers.home.google.com/cloud-to-cloud/guides/doorbell
+        # The detectionTimestamp is the time in ms from January 1, 1970, 00:00:00 (UTC)
+        return {
+            "ObjectDetection": {
+                "objects": {
+                    "unclassified": 1,
+                },
+                "priority": 0,
+                "detectionTimestamp": int(time_stamp.timestamp() * 1000),
+            },
+        }
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute an ObjectDetection command."""
 
 
 @register_trait
@@ -176,185 +552,212 @@ class OnOffTrait(_Trait):
     https://developers.google.com/actions/smarthome/traits/onoff
     """
 
-    name = TRAIT_ONOFF
-    commands = [
-        COMMAND_ONOFF
-    ]
+    name = TRAIT_ON_OFF
+    commands = [COMMAND_ON_OFF]
 
     @staticmethod
-    def supported(domain, features):
+    @override
+    def supported(domain, features, device_class, _):
         """Test if state is supported."""
+        if domain == WATER_HEATER_DOMAIN and features & WaterHeaterEntityFeature.ON_OFF:
+            return True
+
+        if domain == CLIMATE_DOMAIN and features & (
+            ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
+        ):
+            return True
+
         return domain in (
-            group.DOMAIN,
-            input_boolean.DOMAIN,
-            switch.DOMAIN,
-            fan.DOMAIN,
-            light.DOMAIN,
-            cover.DOMAIN,
-            media_player.DOMAIN,
+            GROUP_DOMAIN,
+            INPUT_BOOLEAN_DOMAIN,
+            SWITCH_DOMAIN,
+            FAN_DOMAIN,
+            LIGHT_DOMAIN,
+            MEDIA_PLAYER_DOMAIN,
+            HUMIDIFIER_DOMAIN,
         )
 
-    def sync_attributes(self):
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
         """Return OnOff attributes for a sync request."""
+        if self.state.attributes.get(EntityStateAttribute.ASSUMED_STATE, False):
+            return {"commandOnlyOnOff": True}
         return {}
 
-    def query_attributes(self):
+    @override
+    def query_attributes(self) -> dict[str, Any]:
         """Return OnOff query attributes."""
-        if self.state.domain == cover.DOMAIN:
-            return {'on': self.state.state != cover.STATE_CLOSED}
-        return {'on': self.state.state != STATE_OFF}
+        return {"on": self.state.state not in (STATE_OFF, STATE_UNKNOWN)}
 
-    async def execute(self, command, params):
+    @override
+    async def execute(self, command, data, params, challenge):
         """Execute an OnOff command."""
-        domain = self.state.domain
-
-        if domain == cover.DOMAIN:
-            service_domain = domain
-            if params['on']:
-                service = cover.SERVICE_OPEN_COVER
-            else:
-                service = cover.SERVICE_CLOSE_COVER
-
-        elif domain == group.DOMAIN:
-            service_domain = HA_DOMAIN
-            service = SERVICE_TURN_ON if params['on'] else SERVICE_TURN_OFF
+        if (domain := self.state.domain) == GROUP_DOMAIN:
+            service_domain = HOMEASSISTANT_DOMAIN
+            service = SERVICE_TURN_ON if params["on"] else SERVICE_TURN_OFF
 
         else:
             service_domain = domain
-            service = SERVICE_TURN_ON if params['on'] else SERVICE_TURN_OFF
+            service = SERVICE_TURN_ON if params["on"] else SERVICE_TURN_OFF
 
-        await self.hass.services.async_call(service_domain, service, {
-            ATTR_ENTITY_ID: self.state.entity_id
-        }, blocking=True)
-
-
-@register_trait
-class ColorSpectrumTrait(_Trait):
-    """Trait to offer color spectrum functionality.
-
-    https://developers.google.com/actions/smarthome/traits/colorspectrum
-    """
-
-    name = TRAIT_COLOR_SPECTRUM
-    commands = [
-        COMMAND_COLOR_ABSOLUTE
-    ]
-
-    @staticmethod
-    def supported(domain, features):
-        """Test if state is supported."""
-        if domain != light.DOMAIN:
-            return False
-
-        return features & light.SUPPORT_COLOR
-
-    def sync_attributes(self):
-        """Return color spectrum attributes for a sync request."""
-        # Other colorModel is hsv
-        return {'colorModel': 'rgb'}
-
-    def query_attributes(self):
-        """Return color spectrum query attributes."""
-        response = {}
-
-        color_hs = self.state.attributes.get(light.ATTR_HS_COLOR)
-        if color_hs is not None:
-            response['color'] = {
-                'spectrumRGB': int(color_util.color_rgb_to_hex(
-                    *color_util.color_hs_to_RGB(*color_hs)), 16),
-            }
-
-        return response
-
-    def can_execute(self, command, params):
-        """Test if command can be executed."""
-        return (command in self.commands and
-                'spectrumRGB' in params.get('color', {}))
-
-    async def execute(self, command, params):
-        """Execute a color spectrum command."""
-        # Convert integer to hex format and left pad with 0's till length 6
-        hex_value = "{0:06x}".format(params['color']['spectrumRGB'])
-        color = color_util.color_RGB_to_hs(
-            *color_util.rgb_hex_to_rgb_list(hex_value))
-
-        await self.hass.services.async_call(light.DOMAIN, SERVICE_TURN_ON, {
-            ATTR_ENTITY_ID: self.state.entity_id,
-            light.ATTR_HS_COLOR: color
-        }, blocking=True)
+        await self.hass.services.async_call(
+            service_domain,
+            service,
+            {ATTR_ENTITY_ID: self.state.entity_id},
+            blocking=not self.config.should_report_state,
+            context=data.context,
+        )
 
 
 @register_trait
-class ColorTemperatureTrait(_Trait):
+class ColorSettingTrait(_Trait):
     """Trait to offer color temperature functionality.
 
     https://developers.google.com/actions/smarthome/traits/colortemperature
     """
 
-    name = TRAIT_COLOR_TEMP
-    commands = [
-        COMMAND_COLOR_ABSOLUTE
-    ]
+    name = TRAIT_COLOR_SETTING
+    commands = [COMMAND_COLOR_ABSOLUTE]
 
     @staticmethod
-    def supported(domain, features):
+    @override
+    def supported(domain, features, device_class, attributes):
         """Test if state is supported."""
-        if domain != light.DOMAIN:
+        if domain != LIGHT_DOMAIN:
             return False
 
-        return features & light.SUPPORT_COLOR_TEMP
+        color_modes = attributes.get(
+            LightEntityCapabilityAttribute.SUPPORTED_COLOR_MODES
+        )
+        return light.color_temp_supported(color_modes) or light.color_supported(
+            color_modes
+        )
 
-    def sync_attributes(self):
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
         """Return color temperature attributes for a sync request."""
         attrs = self.state.attributes
-        # Max Kelvin is Min Mireds K = 1000000 / mireds
-        # Min Kevin is Max Mireds K = 1000000 / mireds
-        return {
-            'temperatureMaxK': color_util.color_temperature_mired_to_kelvin(
-                attrs.get(light.ATTR_MIN_MIREDS)),
-            'temperatureMinK': color_util.color_temperature_mired_to_kelvin(
-                attrs.get(light.ATTR_MAX_MIREDS)),
-        }
+        color_modes = attrs.get(LightEntityCapabilityAttribute.SUPPORTED_COLOR_MODES)
+        response: dict[str, Any] = {}
 
-    def query_attributes(self):
-        """Return color temperature query attributes."""
-        response = {}
+        if light.color_supported(color_modes):
+            response["colorModel"] = "hsv"
 
-        temp = self.state.attributes.get(light.ATTR_COLOR_TEMP)
-        # Some faulty integrations might put 0 in here, raising exception.
-        if temp == 0:
-            _LOGGER.warning('Entity %s has incorrect color temperature %s',
-                            self.state.entity_id, temp)
-        elif temp is not None:
-            response['color'] = {
-                'temperature':
-                    color_util.color_temperature_mired_to_kelvin(temp)
+        if light.color_temp_supported(color_modes):
+            response["colorTemperatureRange"] = {
+                "temperatureMaxK": int(
+                    attrs.get(LightEntityCapabilityAttribute.MAX_COLOR_TEMP_KELVIN)
+                ),
+                "temperatureMinK": int(
+                    attrs.get(LightEntityCapabilityAttribute.MIN_COLOR_TEMP_KELVIN)
+                ),
             }
 
         return response
 
-    def can_execute(self, command, params):
-        """Test if command can be executed."""
-        return (command in self.commands and
-                'temperature' in params.get('color', {}))
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return color temperature query attributes."""
+        color_mode = self.state.attributes.get(LightEntityStateAttribute.COLOR_MODE)
 
-    async def execute(self, command, params):
+        color: dict[str, Any] = {}
+
+        if light.color_supported([color_mode]):
+            color_hs = self.state.attributes.get(LightEntityStateAttribute.HS_COLOR)
+            brightness = self.state.attributes.get(
+                LightEntityStateAttribute.BRIGHTNESS, 1
+            )
+            if color_hs is not None:
+                color["spectrumHsv"] = {
+                    "hue": color_hs[0],
+                    "saturation": color_hs[1] / 100,
+                    "value": brightness / 255,
+                }
+
+        if light.color_temp_supported([color_mode]):
+            temp = self.state.attributes.get(
+                LightEntityStateAttribute.COLOR_TEMP_KELVIN
+            )
+            # Some faulty integrations might put 0 in here, raising exception.
+            if temp == 0:
+                _LOGGER.warning(
+                    "Entity %s has incorrect color temperature %s",
+                    self.state.entity_id,
+                    temp,
+                )
+            elif temp is not None:
+                color["temperatureK"] = temp
+
+        response = {}
+
+        if color:
+            response["color"] = color
+
+        return response
+
+    @override
+    async def execute(self, command, data, params, challenge):
         """Execute a color temperature command."""
-        temp = color_util.color_temperature_kelvin_to_mired(
-            params['color']['temperature'])
-        min_temp = self.state.attributes[light.ATTR_MIN_MIREDS]
-        max_temp = self.state.attributes[light.ATTR_MAX_MIREDS]
+        if "temperature" in params["color"]:
+            temp = params["color"]["temperature"]
+            max_temp = self.state.attributes[
+                LightEntityCapabilityAttribute.MAX_COLOR_TEMP_KELVIN
+            ]
+            min_temp = self.state.attributes[
+                LightEntityCapabilityAttribute.MIN_COLOR_TEMP_KELVIN
+            ]
 
-        if temp < min_temp or temp > max_temp:
-            raise SmartHomeError(
-                ERR_VALUE_OUT_OF_RANGE,
-                "Temperature should be between {} and {}".format(min_temp,
-                                                                 max_temp))
+            if temp < min_temp or temp > max_temp:
+                raise SmartHomeError(
+                    ERR_VALUE_OUT_OF_RANGE,
+                    f"Temperature should be between {min_temp} and {max_temp}",
+                )
 
-        await self.hass.services.async_call(light.DOMAIN, SERVICE_TURN_ON, {
-            ATTR_ENTITY_ID: self.state.entity_id,
-            light.ATTR_COLOR_TEMP: temp,
-        }, blocking=True)
+            await self.hass.services.async_call(
+                LIGHT_DOMAIN,
+                LightService.TURN_ON,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    LightServiceArgument.COLOR_TEMP_KELVIN: temp,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+        elif "spectrumRGB" in params["color"]:
+            # Convert integer to hex format and left pad with 0's till length 6
+            hex_value = f"{params['color']['spectrumRGB']:06x}"
+            color = color_util.color_RGB_to_hs(
+                *color_util.rgb_hex_to_rgb_list(hex_value)
+            )
+
+            await self.hass.services.async_call(
+                LIGHT_DOMAIN,
+                LightService.TURN_ON,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    LightServiceArgument.HS_COLOR: color,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+        elif "spectrumHSV" in params["color"]:
+            color = params["color"]["spectrumHSV"]
+            saturation = color["saturation"] * 100
+            brightness = color["value"] * 255
+
+            await self.hass.services.async_call(
+                LIGHT_DOMAIN,
+                LightService.TURN_ON,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    LightServiceArgument.HS_COLOR: [color["hue"], saturation],
+                    LightServiceArgument.BRIGHTNESS: brightness,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
 
 
 @register_trait
@@ -365,31 +768,548 @@ class SceneTrait(_Trait):
     """
 
     name = TRAIT_SCENE
-    commands = [
-        COMMAND_ACTIVATE_SCENE
-    ]
+    commands = [COMMAND_ACTIVATE_SCENE]
 
     @staticmethod
-    def supported(domain, features):
+    @override
+    def supported(domain, features, device_class, _):
         """Test if state is supported."""
-        return domain in (scene.DOMAIN, script.DOMAIN)
+        return domain in (
+            BUTTON_DOMAIN,
+            INPUT_BUTTON_DOMAIN,
+            SCENE_DOMAIN,
+            SCRIPT_DOMAIN,
+        )
 
-    def sync_attributes(self):
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
         """Return scene attributes for a sync request."""
-        # Neither supported domain can support sceneReversible
+        # None of the supported domains can support sceneReversible
         return {}
 
-    def query_attributes(self):
+    @override
+    def query_attributes(self) -> dict[str, Any]:
         """Return scene query attributes."""
         return {}
 
-    async def execute(self, command, params):
+    @override
+    async def execute(self, command, data, params, challenge):
         """Execute a scene command."""
-        # Don't block for scripts as they can be slow.
+        service = SERVICE_TURN_ON
+        if self.state.domain == BUTTON_DOMAIN:
+            service = ButtonService.PRESS
+        elif self.state.domain == INPUT_BUTTON_DOMAIN:
+            service = InputButtonService.PRESS
+
+        # Don't block for scripts or buttons, as they can be slow.
         await self.hass.services.async_call(
-            self.state.domain, SERVICE_TURN_ON, {
-                ATTR_ENTITY_ID: self.state.entity_id
-            }, blocking=self.state.domain != script.DOMAIN)
+            self.state.domain,
+            service,
+            {ATTR_ENTITY_ID: self.state.entity_id},
+            blocking=(not self.config.should_report_state)
+            and self.state.domain
+            not in (BUTTON_DOMAIN, INPUT_BUTTON_DOMAIN, SCRIPT_DOMAIN),
+            context=data.context,
+        )
+
+
+@register_trait
+class DockTrait(_Trait):
+    """Trait to offer dock functionality.
+
+    https://developers.google.com/actions/smarthome/traits/dock
+    """
+
+    name = TRAIT_DOCK
+    commands = [COMMAND_DOCK]
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        return domain in (VACUUM_DOMAIN, LAWN_MOWER_DOMAIN)
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return dock attributes for a sync request."""
+        return {}
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return dock query attributes."""
+        domain = self.state.domain
+        state = self.state.state
+        if domain == VACUUM_DOMAIN:
+            return {"isDocked": state == vacuum.VacuumActivity.DOCKED}
+        if domain == LAWN_MOWER_DOMAIN:
+            return {"isDocked": state == lawn_mower.LawnMowerActivity.DOCKED}
+        raise NotImplementedError(f"Unsupported domain {domain}")
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute a dock command."""
+        domain = self.state.domain
+        service: str | None = None
+
+        if domain == VACUUM_DOMAIN:
+            service = VacuumService.RETURN_TO_BASE
+        elif domain == LAWN_MOWER_DOMAIN:
+            service = LawnMowerService.DOCK
+
+        if service:
+            await self.hass.services.async_call(
+                self.state.domain,
+                service,
+                {ATTR_ENTITY_ID: self.state.entity_id},
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+
+@register_trait
+class LocatorTrait(_Trait):
+    """Trait to offer locate functionality.
+
+    https://developers.google.com/actions/smarthome/traits/locator
+    """
+
+    name = TRAIT_LOCATOR
+    commands = [COMMAND_LOCATE]
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        return domain == VACUUM_DOMAIN and features & VacuumEntityFeature.LOCATE
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return locator attributes for a sync request."""
+        return {}
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return locator query attributes."""
+        return {}
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute a locate command."""
+        if params.get("silence", False):
+            raise SmartHomeError(
+                ERR_FUNCTION_NOT_SUPPORTED,
+                "Silencing a Locate request is not yet supported",
+            )
+
+        await self.hass.services.async_call(
+            self.state.domain,
+            VacuumService.LOCATE,
+            {ATTR_ENTITY_ID: self.state.entity_id},
+            blocking=not self.config.should_report_state,
+            context=data.context,
+        )
+
+
+@register_trait
+class StartStopTrait(_Trait):
+    """Trait to offer StartStop functionality.
+
+    https://developers.google.com/actions/smarthome/traits/startstop
+    """
+
+    name = TRAIT_START_STOP
+    commands = [COMMAND_START_STOP, COMMAND_PAUSE_UNPAUSE]
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        if domain in (VACUUM_DOMAIN, LAWN_MOWER_DOMAIN):
+            return True
+
+        if (
+            domain in COVER_VALVE_DOMAINS
+            and features & COVER_VALVE_STOP_FEATURE[domain]
+        ):
+            return True
+
+        return False
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return StartStop attributes for a sync request."""
+        domain = self.state.domain
+        if domain == VACUUM_DOMAIN:
+            sync_attributes = {
+                "pausable": self.state.attributes.get(
+                    EntityStateAttribute.SUPPORTED_FEATURES, 0
+                )
+                & VacuumEntityFeature.PAUSE
+                != 0
+            }
+            features = self.state.attributes.get(
+                EntityStateAttribute.SUPPORTED_FEATURES, 0
+            )
+            if features & VacuumEntityFeature.CLEAN_AREA:
+                available_zones = []
+                entity_registry = er.async_get(self.hass)
+                entry = entity_registry.async_get(self.state.entity_id)
+                area_registry = ar.async_get(self.hass)
+                if (
+                    entry
+                    and VACUUM_DOMAIN in entry.options
+                    and "area_mapping" in entry.options[VACUUM_DOMAIN]
+                ):
+                    area_mapping = entry.options[VACUUM_DOMAIN]["area_mapping"]
+                    for area_id in area_mapping:
+                        area = area_registry.async_get_area(area_id)
+                        if area:
+                            available_zones.append(area.name)
+                sync_attributes["availableZones"] = available_zones
+            return sync_attributes
+        if domain == LAWN_MOWER_DOMAIN:
+            return {
+                "pausable": self.state.attributes.get(
+                    EntityStateAttribute.SUPPORTED_FEATURES, 0
+                )
+                & LawnMowerEntityFeature.PAUSE
+                != 0
+            }
+        if domain in COVER_VALVE_DOMAINS:
+            return {}
+
+        raise NotImplementedError(f"Unsupported domain {domain}")
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return StartStop query attributes."""
+        domain = self.state.domain
+        state = self.state.state
+
+        if domain == VACUUM_DOMAIN:
+            return {
+                "isRunning": state == vacuum.VacuumActivity.CLEANING,
+                "isPaused": state == vacuum.VacuumActivity.PAUSED,
+            }
+        if domain == LAWN_MOWER_DOMAIN:
+            return {
+                "isRunning": state == lawn_mower.LawnMowerActivity.MOWING,
+                "isPaused": state == lawn_mower.LawnMowerActivity.PAUSED,
+            }
+
+        if domain in COVER_VALVE_DOMAINS:
+            assumed_state_or_set_position = bool(
+                (
+                    self.state.attributes.get(
+                        EntityStateAttribute.SUPPORTED_FEATURES, 0
+                    )
+                    & COVER_VALVE_SET_POSITION_FEATURE[domain]
+                )
+                or self.state.attributes.get(EntityStateAttribute.ASSUMED_STATE)
+            )
+
+            return {
+                "isRunning": state
+                in (
+                    COVER_VALVE_STATES[domain]["closing"],
+                    COVER_VALVE_STATES[domain]["opening"],
+                )
+                or assumed_state_or_set_position
+            }
+
+        raise NotImplementedError(f"Unsupported domain {domain}")
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute a StartStop command."""
+        domain = self.state.domain
+        if domain == VACUUM_DOMAIN:
+            await self._execute_vacuum(command, data, params, challenge)
+            return
+        if domain == LAWN_MOWER_DOMAIN:
+            await self._execute_lawn_mower(command, data, params, challenge)
+            return
+        if domain in COVER_VALVE_DOMAINS:
+            await self._execute_cover_or_valve(command, data, params, challenge)
+            return
+
+    async def _execute_vacuum(self, command, data, params, challenge):
+        """Execute a StartStop command."""
+        service: str | None = None
+        service_data: dict[str, Any] = {ATTR_ENTITY_ID: self.state.entity_id}
+        if command == COMMAND_START_STOP:
+            service = VacuumService.START if params["start"] else VacuumService.STOP
+            if params["start"]:
+                zones: list[str] = []
+                if "zone" in params:
+                    zones.append(params["zone"])
+                elif "multipleZones" in params:
+                    zones = params["multipleZones"]
+                if zones:
+                    entity_registry = er.async_get(self.hass)
+                    entry = entity_registry.async_get(self.state.entity_id)
+                    area_mapping: dict[str, list[str]] = {}
+                    if (
+                        entry
+                        and VACUUM_DOMAIN in entry.options
+                        and "area_mapping" in entry.options[VACUUM_DOMAIN]
+                    ):
+                        area_mapping = entry.options[VACUUM_DOMAIN]["area_mapping"]
+                    area_registry = ar.async_get(self.hass)
+                    name_to_area_id = {
+                        area.name: area.id
+                        for area_id in area_mapping
+                        if (area := area_registry.async_get_area(area_id)) is not None
+                    }
+                    area_ids: list[str] = []
+                    for zone in zones:
+                        area_id = name_to_area_id.get(zone)
+                        if area_id is None:
+                            raise SmartHomeError(
+                                ERR_UNSUPPORTED_INPUT,
+                                f"Zone {zone} is not configured for this vacuum",
+                            )
+                        area_ids.append(area_id)
+                    service_data["cleaning_area_id"] = area_ids
+                    service = VacuumService.CLEAN_AREA
+        elif command == COMMAND_PAUSE_UNPAUSE:
+            service = VacuumService.PAUSE if params["pause"] else VacuumService.START
+        if service:
+            await self.hass.services.async_call(
+                self.state.domain,
+                service,
+                service_data,
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+    async def _execute_lawn_mower(self, command, data, params, challenge):
+        """Execute a StartStop command."""
+        service: str | None = None
+        if command == COMMAND_START_STOP:
+            service = (
+                LawnMowerService.START_MOWING
+                if params["start"]
+                else LawnMowerService.DOCK
+            )
+        elif command == COMMAND_PAUSE_UNPAUSE:
+            service = (
+                LawnMowerService.PAUSE
+                if params["pause"]
+                else LawnMowerService.START_MOWING
+            )
+        if service:
+            await self.hass.services.async_call(
+                self.state.domain,
+                service,
+                {ATTR_ENTITY_ID: self.state.entity_id},
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+    async def _execute_cover_or_valve(self, command, data, params, challenge):
+        """Execute a StartStop command."""
+        domain = self.state.domain
+        if command == COMMAND_START_STOP:
+            assumed_state_or_set_position = bool(
+                (
+                    self.state.attributes.get(
+                        EntityStateAttribute.SUPPORTED_FEATURES, 0
+                    )
+                    & COVER_VALVE_SET_POSITION_FEATURE[domain]
+                )
+                or self.state.attributes.get(EntityStateAttribute.ASSUMED_STATE)
+            )
+
+            if params["start"] is False:
+                if (
+                    self.state.state
+                    in (
+                        COVER_VALVE_STATES[domain]["closing"],
+                        COVER_VALVE_STATES[domain]["opening"],
+                    )
+                    or assumed_state_or_set_position
+                ):
+                    await self.hass.services.async_call(
+                        domain,
+                        SERVICE_STOP_COVER_VALVE[domain],
+                        {ATTR_ENTITY_ID: self.state.entity_id},
+                        blocking=not self.config.should_report_state,
+                        context=data.context,
+                    )
+                else:
+                    raise SmartHomeError(
+                        ERR_ALREADY_STOPPED,
+                        f"{FRIENDLY_DOMAIN[domain]} is already stopped",
+                    )
+            elif (
+                self.state.state
+                in (
+                    COVER_VALVE_STATES[domain]["open"],
+                    COVER_VALVE_STATES[domain]["closed"],
+                )
+                or assumed_state_or_set_position
+            ):
+                await self.hass.services.async_call(
+                    domain,
+                    SERVICE_TOGGLE_COVER_VALVE[domain],
+                    {ATTR_ENTITY_ID: self.state.entity_id},
+                    blocking=not self.config.should_report_state,
+                    context=data.context,
+                )
+        else:
+            raise SmartHomeError(
+                ERR_NOT_SUPPORTED, f"Command {command} is not supported"
+            )
+
+
+@register_trait
+class TemperatureControlTrait(_Trait):
+    """Trait for devices (other than thermostats) that support controlling temperature.
+
+    Control the target temperature of water heaters.
+    Offers a workaround for Temperature sensors by setting queryOnlyTemperatureControl
+    in the response.
+
+    https://developers.google.com/assistant/smarthome/traits/temperaturecontrol
+    """
+
+    name = TRAIT_TEMPERATURE_CONTROL
+
+    commands = [
+        COMMAND_SET_TEMPERATURE,
+    ]
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        return (
+            domain == WATER_HEATER_DOMAIN
+            and features & WaterHeaterEntityFeature.TARGET_TEMPERATURE
+        ) or (
+            domain == SENSOR_DOMAIN
+            and device_class == sensor.SensorDeviceClass.TEMPERATURE
+        )
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return temperature attributes for a sync request."""
+        response = {}
+        domain = self.state.domain
+        attrs = self.state.attributes
+        unit = self.hass.config.units.temperature_unit
+        response["temperatureUnitForUX"] = _google_temp_unit(unit)
+
+        if domain == WATER_HEATER_DOMAIN:
+            min_temp = round(
+                TemperatureConverter.convert(
+                    float(attrs[WaterHeaterCapabilityAttribute.MIN_TEMP]),
+                    unit,
+                    UnitOfTemperature.CELSIUS,
+                ),
+                1,
+            )
+            max_temp = round(
+                TemperatureConverter.convert(
+                    float(attrs[WaterHeaterCapabilityAttribute.MAX_TEMP]),
+                    unit,
+                    UnitOfTemperature.CELSIUS,
+                ),
+                1,
+            )
+            response["temperatureRange"] = {
+                "minThresholdCelsius": min_temp,
+                "maxThresholdCelsius": max_temp,
+            }
+        else:
+            response["queryOnlyTemperatureControl"] = True
+            response["temperatureRange"] = {
+                "minThresholdCelsius": -100,
+                "maxThresholdCelsius": 100,
+            }
+
+        return response
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return temperature states."""
+        response = {}
+        domain = self.state.domain
+        unit = self.hass.config.units.temperature_unit
+        if domain == WATER_HEATER_DOMAIN:
+            target_temp = self.state.attributes[WaterHeaterStateAttribute.TEMPERATURE]
+            current_temp = self.state.attributes[
+                WaterHeaterStateAttribute.CURRENT_TEMPERATURE
+            ]
+            if target_temp not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                response["temperatureSetpointCelsius"] = round(
+                    TemperatureConverter.convert(
+                        float(target_temp),
+                        unit,
+                        UnitOfTemperature.CELSIUS,
+                    ),
+                    1,
+                )
+            if current_temp is not None:
+                response["temperatureAmbientCelsius"] = round(
+                    TemperatureConverter.convert(
+                        float(current_temp),
+                        unit,
+                        UnitOfTemperature.CELSIUS,
+                    ),
+                    1,
+                )
+            return response
+
+        # domain == SENSOR_DOMAIN
+        current_temp = self.state.state
+        if current_temp not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            temp = round(
+                TemperatureConverter.convert(
+                    float(current_temp), unit, UnitOfTemperature.CELSIUS
+                ),
+                1,
+            )
+            response["temperatureSetpointCelsius"] = temp
+            response["temperatureAmbientCelsius"] = temp
+
+        return response
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute a temperature point or mode command."""
+        # All sent in temperatures are always in Celsius
+        domain = self.state.domain
+        unit = self.hass.config.units.temperature_unit
+
+        if domain == WATER_HEATER_DOMAIN and command == COMMAND_SET_TEMPERATURE:
+            min_temp = self.state.attributes[WaterHeaterCapabilityAttribute.MIN_TEMP]
+            max_temp = self.state.attributes[WaterHeaterCapabilityAttribute.MAX_TEMP]
+            temp = TemperatureConverter.convert(
+                params["temperature"], UnitOfTemperature.CELSIUS, unit
+            )
+            if unit == UnitOfTemperature.FAHRENHEIT:
+                temp = round(temp)
+            if temp < min_temp or temp > max_temp:
+                raise SmartHomeError(
+                    ERR_VALUE_OUT_OF_RANGE,
+                    f"Temperature should be between {min_temp} and {max_temp}",
+                )
+
+            await self.hass.services.async_call(
+                WATER_HEATER_DOMAIN,
+                WaterHeaterService.SET_TEMPERATURE,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    WaterHeaterServiceArgument.TEMPERATURE: temp,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+            return
+
+        raise SmartHomeError(ERR_NOT_SUPPORTED, f"Execute is not supported by {domain}")
 
 
 @register_trait
@@ -407,127 +1327,1878 @@ class TemperatureSettingTrait(_Trait):
     ]
     # We do not support "on" as we are unable to know how to restore
     # the last mode.
-    hass_to_google = {
-        climate.STATE_HEAT: 'heat',
-        climate.STATE_COOL: 'cool',
-        climate.STATE_OFF: 'off',
-        climate.STATE_AUTO: 'heatcool',
+    hvac_to_google = {
+        climate.HVACMode.HEAT: "heat",
+        climate.HVACMode.COOL: "cool",
+        climate.HVACMode.OFF: "off",
+        climate.HVACMode.AUTO: "auto",
+        climate.HVACMode.HEAT_COOL: "heatcool",
+        climate.HVACMode.FAN_ONLY: "fan-only",
+        climate.HVACMode.DRY: "dry",
     }
-    google_to_hass = {value: key for key, value in hass_to_google.items()}
+    google_to_hvac = {value: key for key, value in hvac_to_google.items()}
+
+    preset_to_google = {climate.PRESET_ECO: "eco"}
+    google_to_preset = {value: key for key, value in preset_to_google.items()}
+
+    action_to_google = {
+        climate.HVACAction.OFF: "off",
+        climate.HVACAction.HEATING: "heat",
+        climate.HVACAction.DEFROSTING: "heat",
+        climate.HVACAction.PREHEATING: "heat",
+        climate.HVACAction.COOLING: "cool",
+        climate.HVACAction.DRYING: "dry",
+        climate.HVACAction.FAN: "fan-only",
+        climate.HVACAction.IDLE: "none",
+    }
 
     @staticmethod
-    def supported(domain, features):
+    @override
+    def supported(domain, features, device_class, _):
         """Test if state is supported."""
-        if domain != climate.DOMAIN:
-            return False
+        return domain == CLIMATE_DOMAIN
 
-        return features & climate.SUPPORT_OPERATION_MODE
-
-    def sync_attributes(self):
-        """Return temperature point and modes attributes for a sync request."""
+    @property
+    def climate_google_modes(self):
+        """Return supported Google modes."""
         modes = []
-        for mode in self.state.attributes.get(climate.ATTR_OPERATION_LIST, []):
-            google_mode = self.hass_to_google.get(mode)
-            if google_mode is not None:
+        attrs = self.state.attributes
+
+        for mode in attrs.get(ClimateEntityCapabilityAttribute.HVAC_MODES) or []:
+            google_mode = self.hvac_to_google.get(mode)
+            if google_mode and google_mode not in modes:
                 modes.append(google_mode)
 
-        return {
-            'availableThermostatModes': ','.join(modes),
-            'thermostatTemperatureUnit': _google_temp_unit(
-                self.hass.config.units.temperature_unit)
+        for preset in attrs.get(ClimateEntityCapabilityAttribute.PRESET_MODES) or []:
+            google_mode = self.preset_to_google.get(preset)
+            if google_mode and google_mode not in modes:
+                modes.append(google_mode)
+
+        return modes
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return temperature point and modes attributes for a sync request."""
+        response = {}
+        attrs = self.state.attributes
+        unit = self.hass.config.units.temperature_unit
+        response["thermostatTemperatureUnit"] = _google_temp_unit(unit)
+
+        min_temp = round(
+            TemperatureConverter.convert(
+                float(attrs[ClimateEntityCapabilityAttribute.MIN_TEMP]),
+                unit,
+                UnitOfTemperature.CELSIUS,
+            ),
+            1,
+        )
+        max_temp = round(
+            TemperatureConverter.convert(
+                float(attrs[ClimateEntityCapabilityAttribute.MAX_TEMP]),
+                unit,
+                UnitOfTemperature.CELSIUS,
+            ),
+            1,
+        )
+        response["thermostatTemperatureRange"] = {
+            "minThresholdCelsius": min_temp,
+            "maxThresholdCelsius": max_temp,
         }
 
-    def query_attributes(self):
-        """Return temperature point and modes query attributes."""
-        attrs = self.state.attributes
-        response = {}
+        modes = self.climate_google_modes
 
-        operation = attrs.get(climate.ATTR_OPERATION_MODE)
-        if operation is not None and operation in self.hass_to_google:
-            response['thermostatMode'] = self.hass_to_google[operation]
+        features = attrs.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+        has_setpoint = features & (
+            ClimateEntityFeature.TARGET_TEMPERATURE
+            | ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+        )
 
-        unit = self.hass.config.units.temperature_unit
+        # A climate entity that can neither set a target temperature nor switch
+        # between modes (e.g. a template climate that only mirrors sensors) can
+        # only be queried; tell Google so it doesn't offer controls that fail.
+        if not has_setpoint and len(modes) <= 1:
+            response["queryOnlyTemperatureSetting"] = True
 
-        current_temp = attrs.get(climate.ATTR_CURRENT_TEMPERATURE)
-        if current_temp is not None:
-            response['thermostatTemperatureAmbient'] = \
-                round(temp_util.convert(current_temp, unit, TEMP_CELSIUS), 1)
+        # Some integrations don't support modes (e.g. opentherm), but Google doesn't
+        # support changing the temperature if we don't have any modes. If there's
+        # only one Google doesn't support changing it, so the default mode here is
+        # only cosmetic.
+        if len(modes) == 0 and has_setpoint:
+            modes.append("heat")
 
-        current_humidity = attrs.get(climate.ATTR_CURRENT_HUMIDITY)
-        if current_humidity is not None:
-            response['thermostatHumidityAmbient'] = current_humidity
-
-        if (operation == climate.STATE_AUTO and
-                climate.ATTR_TARGET_TEMP_HIGH in attrs and
-                climate.ATTR_TARGET_TEMP_LOW in attrs):
-            response['thermostatTemperatureSetpointHigh'] = \
-                round(temp_util.convert(attrs[climate.ATTR_TARGET_TEMP_HIGH],
-                                        unit, TEMP_CELSIUS), 1)
-            response['thermostatTemperatureSetpointLow'] = \
-                round(temp_util.convert(attrs[climate.ATTR_TARGET_TEMP_LOW],
-                                        unit, TEMP_CELSIUS), 1)
-        else:
-            target_temp = attrs.get(climate.ATTR_TEMPERATURE)
-            if target_temp is not None:
-                response['thermostatTemperatureSetpoint'] = round(
-                    temp_util.convert(target_temp, unit, TEMP_CELSIUS), 1)
+        if "off" in modes and any(
+            mode in modes for mode in ("heatcool", "heat", "cool")
+        ):
+            modes.append("on")
+        response["availableThermostatModes"] = modes
 
         return response
 
-    async def execute(self, command, params):
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return temperature point and modes query attributes."""
+        response: dict[str, Any] = {}
+        attrs = self.state.attributes
+        unit = self.hass.config.units.temperature_unit
+
+        operation = self.state.state
+        preset = attrs.get(ClimateEntityStateAttribute.PRESET_MODE)
+        supported = attrs.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+
+        if preset in self.preset_to_google:
+            response["thermostatMode"] = self.preset_to_google[preset]
+        else:
+            response["thermostatMode"] = self.hvac_to_google.get(operation, "none")
+
+        if (
+            action := self.action_to_google.get(
+                attrs.get(ClimateEntityStateAttribute.HVAC_ACTION)
+            )
+        ) is not None:
+            response["activeThermostatMode"] = action
+
+        current_temp = attrs.get(ClimateEntityStateAttribute.CURRENT_TEMPERATURE)
+        if current_temp is not None:
+            response["thermostatTemperatureAmbient"] = round(
+                TemperatureConverter.convert(
+                    current_temp, unit, UnitOfTemperature.CELSIUS
+                ),
+                1,
+            )
+
+        current_humidity = attrs.get(ClimateEntityStateAttribute.CURRENT_HUMIDITY)
+        if current_humidity is not None:
+            response["thermostatHumidityAmbient"] = current_humidity
+
+        if operation in (climate.HVACMode.AUTO, climate.HVACMode.HEAT_COOL):
+            if supported & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE:
+                response["thermostatTemperatureSetpointHigh"] = round(
+                    TemperatureConverter.convert(
+                        attrs[ClimateEntityStateAttribute.TARGET_TEMP_HIGH],
+                        unit,
+                        UnitOfTemperature.CELSIUS,
+                    ),
+                    1,
+                )
+                response["thermostatTemperatureSetpointLow"] = round(
+                    TemperatureConverter.convert(
+                        attrs[ClimateEntityStateAttribute.TARGET_TEMP_LOW],
+                        unit,
+                        UnitOfTemperature.CELSIUS,
+                    ),
+                    1,
+                )
+            elif (
+                target_temp := attrs.get(ClimateEntityStateAttribute.TARGET_TEMPERATURE)
+            ) is not None:
+                target_temp = round(
+                    TemperatureConverter.convert(
+                        target_temp, unit, UnitOfTemperature.CELSIUS
+                    ),
+                    1,
+                )
+                response["thermostatTemperatureSetpointHigh"] = target_temp
+                response["thermostatTemperatureSetpointLow"] = target_temp
+        elif (
+            target_temp := attrs.get(ClimateEntityStateAttribute.TARGET_TEMPERATURE)
+        ) is not None:
+            response["thermostatTemperatureSetpoint"] = round(
+                TemperatureConverter.convert(
+                    target_temp, unit, UnitOfTemperature.CELSIUS
+                ),
+                1,
+            )
+
+        return response
+
+    @override
+    async def execute(self, command, data, params, challenge):
         """Execute a temperature point or mode command."""
         # All sent in temperatures are always in Celsius
         unit = self.hass.config.units.temperature_unit
-        min_temp = self.state.attributes[climate.ATTR_MIN_TEMP]
-        max_temp = self.state.attributes[climate.ATTR_MAX_TEMP]
+        min_temp = self.state.attributes[ClimateEntityCapabilityAttribute.MIN_TEMP]
+        max_temp = self.state.attributes[ClimateEntityCapabilityAttribute.MAX_TEMP]
 
         if command == COMMAND_THERMOSTAT_TEMPERATURE_SETPOINT:
-            temp = temp_util.convert(params['thermostatTemperatureSetpoint'],
-                                     TEMP_CELSIUS, unit)
+            temp = TemperatureConverter.convert(
+                params["thermostatTemperatureSetpoint"], UnitOfTemperature.CELSIUS, unit
+            )
+            if unit == UnitOfTemperature.FAHRENHEIT:
+                temp = round(temp)
 
             if temp < min_temp or temp > max_temp:
                 raise SmartHomeError(
                     ERR_VALUE_OUT_OF_RANGE,
-                    "Temperature should be between {} and {}".format(min_temp,
-                                                                     max_temp))
+                    f"Temperature should be between {min_temp} and {max_temp}",
+                )
 
             await self.hass.services.async_call(
-                climate.DOMAIN, climate.SERVICE_SET_TEMPERATURE, {
+                CLIMATE_DOMAIN,
+                ClimateService.SET_TEMPERATURE,
+                {
                     ATTR_ENTITY_ID: self.state.entity_id,
-                    climate.ATTR_TEMPERATURE: temp
-                }, blocking=True)
+                    ClimateServiceArgument.TEMPERATURE: temp,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
 
         elif command == COMMAND_THERMOSTAT_TEMPERATURE_SET_RANGE:
-            temp_high = temp_util.convert(
-                params['thermostatTemperatureSetpointHigh'], TEMP_CELSIUS,
-                unit)
+            temp_high = TemperatureConverter.convert(
+                params["thermostatTemperatureSetpointHigh"],
+                UnitOfTemperature.CELSIUS,
+                unit,
+            )
+            if unit == UnitOfTemperature.FAHRENHEIT:
+                temp_high = round(temp_high)
 
             if temp_high < min_temp or temp_high > max_temp:
                 raise SmartHomeError(
                     ERR_VALUE_OUT_OF_RANGE,
-                    "Upper bound for temperature range should be between "
-                    "{} and {}".format(min_temp, max_temp))
+                    (
+                        "Upper bound for temperature range should be between "
+                        f"{min_temp} and {max_temp}"
+                    ),
+                )
 
-            temp_low = temp_util.convert(
-                params['thermostatTemperatureSetpointLow'], TEMP_CELSIUS, unit)
+            temp_low = TemperatureConverter.convert(
+                params["thermostatTemperatureSetpointLow"],
+                UnitOfTemperature.CELSIUS,
+                unit,
+            )
+            if unit == UnitOfTemperature.FAHRENHEIT:
+                temp_low = round(temp_low)
 
             if temp_low < min_temp or temp_low > max_temp:
                 raise SmartHomeError(
                     ERR_VALUE_OUT_OF_RANGE,
-                    "Lower bound for temperature range should be between "
-                    "{} and {}".format(min_temp, max_temp))
+                    (
+                        "Lower bound for temperature range should be between "
+                        f"{min_temp} and {max_temp}"
+                    ),
+                )
+
+            supported = self.state.attributes.get(
+                EntityStateAttribute.SUPPORTED_FEATURES
+            )
+            svc_data = {ATTR_ENTITY_ID: self.state.entity_id}
+
+            if supported & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE:
+                svc_data[ClimateServiceArgument.TARGET_TEMP_HIGH] = temp_high
+                svc_data[ClimateServiceArgument.TARGET_TEMP_LOW] = temp_low
+            else:
+                svc_data[ClimateServiceArgument.TEMPERATURE] = (
+                    temp_high + temp_low
+                ) / 2
 
             await self.hass.services.async_call(
-                climate.DOMAIN, climate.SERVICE_SET_TEMPERATURE, {
-                    ATTR_ENTITY_ID: self.state.entity_id,
-                    climate.ATTR_TARGET_TEMP_HIGH: temp_high,
-                    climate.ATTR_TARGET_TEMP_LOW: temp_low,
-                }, blocking=True)
+                CLIMATE_DOMAIN,
+                ClimateService.SET_TEMPERATURE,
+                svc_data,
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
 
         elif command == COMMAND_THERMOSTAT_SET_MODE:
+            target_mode = params["thermostatMode"]
+            supported = self.state.attributes.get(
+                EntityStateAttribute.SUPPORTED_FEATURES
+            )
+
+            if target_mode == "on":
+                await self.hass.services.async_call(
+                    CLIMATE_DOMAIN,
+                    ClimateService.TURN_ON,
+                    {ATTR_ENTITY_ID: self.state.entity_id},
+                    blocking=not self.config.should_report_state,
+                    context=data.context,
+                )
+                return
+
+            if target_mode == "off":
+                await self.hass.services.async_call(
+                    CLIMATE_DOMAIN,
+                    ClimateService.TURN_OFF,
+                    {ATTR_ENTITY_ID: self.state.entity_id},
+                    blocking=not self.config.should_report_state,
+                    context=data.context,
+                )
+                return
+
+            if target_mode in self.google_to_preset:
+                await self.hass.services.async_call(
+                    CLIMATE_DOMAIN,
+                    ClimateService.SET_PRESET_MODE,
+                    {
+                        ClimateServiceArgument.PRESET_MODE: self.google_to_preset[
+                            target_mode
+                        ],
+                        ATTR_ENTITY_ID: self.state.entity_id,
+                    },
+                    blocking=not self.config.should_report_state,
+                    context=data.context,
+                )
+                return
+
             await self.hass.services.async_call(
-                climate.DOMAIN, climate.SERVICE_SET_OPERATION_MODE, {
+                CLIMATE_DOMAIN,
+                ClimateService.SET_HVAC_MODE,
+                {
                     ATTR_ENTITY_ID: self.state.entity_id,
-                    climate.ATTR_OPERATION_MODE:
-                        self.google_to_hass[params['thermostatMode']],
-                }, blocking=True)
+                    ClimateServiceArgument.HVAC_MODE: self.google_to_hvac[target_mode],
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+
+@register_trait
+class HumiditySettingTrait(_Trait):
+    """Trait to offer humidity setting functionality.
+
+    https://developers.google.com/actions/smarthome/traits/humiditysetting
+    """
+
+    name = TRAIT_HUMIDITY_SETTING
+    commands = [COMMAND_SET_HUMIDITY]
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        if domain == HUMIDIFIER_DOMAIN:
+            return True
+
+        return (
+            domain == SENSOR_DOMAIN
+            and device_class == sensor.SensorDeviceClass.HUMIDITY
+        )
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return humidity attributes for a sync request."""
+        response: dict[str, Any] = {}
+        attrs = self.state.attributes
+        domain = self.state.domain
+
+        if domain == SENSOR_DOMAIN:
+            device_class = attrs.get(EntityStateAttribute.DEVICE_CLASS)
+            if device_class == sensor.SensorDeviceClass.HUMIDITY:
+                response["queryOnlyHumiditySetting"] = True
+
+        elif domain == HUMIDIFIER_DOMAIN:
+            response["humiditySetpointRange"] = {
+                "minPercent": round(
+                    float(
+                        self.state.attributes[
+                            HumidifierEntityCapabilityAttribute.MIN_HUMIDITY
+                        ]
+                    )
+                ),
+                "maxPercent": round(
+                    float(
+                        self.state.attributes[
+                            HumidifierEntityCapabilityAttribute.MAX_HUMIDITY
+                        ]
+                    )
+                ),
+            }
+
+        return response
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return humidity query attributes."""
+        response = {}
+        attrs = self.state.attributes
+        domain = self.state.domain
+
+        if domain == SENSOR_DOMAIN:
+            device_class = attrs.get(EntityStateAttribute.DEVICE_CLASS)
+            if device_class == sensor.SensorDeviceClass.HUMIDITY:
+                humidity_state = self.state.state
+                if humidity_state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                    response["humidityAmbientPercent"] = round(float(humidity_state))
+
+        elif domain == HUMIDIFIER_DOMAIN:
+            target_humidity: int | None = attrs.get(
+                HumidifierEntityStateAttribute.HUMIDITY
+            )
+            if target_humidity is not None:
+                response["humiditySetpointPercent"] = target_humidity
+            current_humidity: int | None = attrs.get(
+                HumidifierEntityStateAttribute.CURRENT_HUMIDITY
+            )
+            if current_humidity is not None:
+                response["humidityAmbientPercent"] = current_humidity
+
+        return response
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute a humidity command."""
+        if self.state.domain == SENSOR_DOMAIN:
+            raise SmartHomeError(
+                ERR_NOT_SUPPORTED, "Execute is not supported by sensor"
+            )
+
+        if command == COMMAND_SET_HUMIDITY:
+            await self.hass.services.async_call(
+                HUMIDIFIER_DOMAIN,
+                HumidifierService.SET_HUMIDITY,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    HumidifierServiceArgument.HUMIDITY: params["humidity"],
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+
+@register_trait
+class LockUnlockTrait(_Trait):
+    """Trait to lock or unlock a lock.
+
+    https://developers.google.com/actions/smarthome/traits/lockunlock
+    """
+
+    name = TRAIT_LOCK_UNLOCK
+    commands = [COMMAND_LOCK_UNLOCK]
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        return domain == LOCK_DOMAIN
+
+    @staticmethod
+    @override
+    def might_2fa(domain, features, device_class):
+        """Return if the trait might ask for 2FA."""
+        return True
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return LockUnlock attributes for a sync request."""
+        return {}
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return LockUnlock query attributes."""
+        if self.state.state == LockState.JAMMED:
+            return {"isJammed": True}
+
+        # If its unlocking its not yet unlocked so we consider is locked
+        return {"isLocked": self.state.state in (LockState.UNLOCKING, LockState.LOCKED)}
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute an LockUnlock command."""
+        if params["lock"]:
+            service = LockService.LOCK
+        else:
+            _verify_pin_challenge(data, self.state, challenge)
+            service = LockService.UNLOCK
+
+        await self.hass.services.async_call(
+            LOCK_DOMAIN,
+            service,
+            {ATTR_ENTITY_ID: self.state.entity_id},
+            blocking=not self.config.should_report_state,
+            context=data.context,
+        )
+
+
+@register_trait
+class ArmDisArmTrait(_Trait):
+    """Trait to Arm or Disarm a Security System.
+
+    https://developers.google.com/actions/smarthome/traits/armdisarm
+    """
+
+    name = TRAIT_ARM_DISARM
+    commands = [COMMAND_ARM_DISARM]
+
+    state_to_service = {
+        AlarmControlPanelState.ARMED_HOME: AlarmControlPanelService.ARM_HOME,
+        AlarmControlPanelState.ARMED_NIGHT: AlarmControlPanelService.ARM_NIGHT,
+        AlarmControlPanelState.ARMED_AWAY: AlarmControlPanelService.ARM_AWAY,
+        AlarmControlPanelState.ARMED_CUSTOM_BYPASS: AlarmControlPanelService.ARM_CUSTOM_BYPASS,
+        AlarmControlPanelState.TRIGGERED: AlarmControlPanelService.TRIGGER,
+    }
+
+    state_to_support = {
+        AlarmControlPanelState.ARMED_HOME: AlarmControlPanelEntityFeature.ARM_HOME,
+        AlarmControlPanelState.ARMED_NIGHT: AlarmControlPanelEntityFeature.ARM_NIGHT,
+        AlarmControlPanelState.ARMED_AWAY: AlarmControlPanelEntityFeature.ARM_AWAY,
+        AlarmControlPanelState.ARMED_CUSTOM_BYPASS: (
+            AlarmControlPanelEntityFeature.ARM_CUSTOM_BYPASS
+        ),
+        AlarmControlPanelState.TRIGGERED: AlarmControlPanelEntityFeature.TRIGGER,
+    }
+    """The list of states to support in increasing security state."""
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        return domain == ALARM_CONTROL_PANEL_DOMAIN
+
+    @staticmethod
+    @override
+    def might_2fa(domain, features, device_class):
+        """Return if the trait might ask for 2FA."""
+        return True
+
+    def _supported_states(self):
+        """Return supported states."""
+        features = self.state.attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+        return [
+            state
+            for state, required_feature in self.state_to_support.items()
+            if features & required_feature != 0
+        ]
+
+    def _default_arm_state(self):
+        states = self._supported_states()
+
+        if AlarmControlPanelState.TRIGGERED in states:
+            states.remove(AlarmControlPanelState.TRIGGERED)
+
+        if not states:
+            raise SmartHomeError(ERR_NOT_SUPPORTED, "ArmLevel missing")
+
+        return states[0]
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return ArmDisarm attributes for a sync request."""
+        response = {}
+        levels = []
+        for state in self._supported_states():
+            # level synonyms are generated from state names
+            # 'armed_away' becomes 'armed away' or 'away'
+            level_synonym = [state.replace("_", " ")]
+            if state != AlarmControlPanelState.TRIGGERED:
+                level_synonym.append(state.split("_")[1])
+
+            level = {
+                "level_name": state,
+                "level_values": [{"level_synonym": level_synonym, "lang": "en"}],
+            }
+            levels.append(level)
+
+        response["availableArmLevels"] = {"levels": levels, "ordered": True}
+        return response
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return ArmDisarm query attributes."""
+        armed_state = self.state.attributes.get("next_state", self.state.state)
+
+        if armed_state in self.state_to_service:
+            return {"isArmed": True, "currentArmLevel": armed_state}
+        return {
+            "isArmed": False,
+            "currentArmLevel": self._default_arm_state(),
+        }
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute an ArmDisarm command."""
+        if params["arm"] and not params.get("cancel"):
+            # If no arm level given, we we arm the first supported
+            # level in state_to_support.
+            if not (arm_level := params.get("armLevel")):
+                arm_level = self._default_arm_state()
+
+            if self.state.state == arm_level:
+                raise SmartHomeError(ERR_ALREADY_ARMED, "System is already armed")
+            if self.state.attributes[
+                AlarmControlPanelEntityStateAttribute.CODE_ARM_REQUIRED
+            ]:
+                _verify_pin_challenge(data, self.state, challenge)
+            service = self.state_to_service[arm_level]
+        # disarm the system without asking for code when
+        # 'cancel' arming action is received while current status is pending
+        elif (
+            params["arm"]
+            and params.get("cancel")
+            and self.state.state == AlarmControlPanelState.PENDING
+        ):
+            service = AlarmControlPanelService.DISARM
+        else:
+            if self.state.state == AlarmControlPanelState.DISARMED:
+                raise SmartHomeError(ERR_ALREADY_DISARMED, "System is already disarmed")
+            _verify_pin_challenge(data, self.state, challenge)
+            service = AlarmControlPanelService.DISARM
+
+        await self.hass.services.async_call(
+            ALARM_CONTROL_PANEL_DOMAIN,
+            service,
+            {
+                ATTR_ENTITY_ID: self.state.entity_id,
+                AlarmControlPanelServiceArgument.CODE: data.config.secure_devices_pin,
+            },
+            blocking=not self.config.should_report_state,
+            context=data.context,
+        )
+
+
+def _get_fan_speed(speed_name: str) -> dict[str, Any]:
+    """Return a fan speed synonyms for a speed name."""
+    speed_synonyms = FAN_SPEEDS.get(speed_name, [f"{speed_name}"])
+    return {
+        "speed_name": speed_name,
+        "speed_values": [
+            {
+                "speed_synonym": speed_synonyms,
+                "lang": "en",
+            }
+        ],
+    }
+
+
+@register_trait
+class FanSpeedTrait(_Trait):
+    """Trait to control speed of Fan.
+
+    https://developers.google.com/actions/smarthome/traits/fanspeed
+    """
+
+    name = TRAIT_FAN_SPEED
+    commands = [COMMAND_SET_FAN_SPEED, COMMAND_REVERSE]
+
+    def __init__(self, hass: HomeAssistant, state, config) -> None:
+        """Initialize a trait for a state."""
+        super().__init__(hass, state, config)
+        if state.domain == FAN_DOMAIN:
+            speed_count = round(
+                100
+                / (
+                    self.state.attributes.get(FanEntityStateAttribute.PERCENTAGE_STEP)
+                    or 1.0
+                )
+            )
+            if speed_count <= FAN_SPEED_MAX_SPEED_COUNT:
+                self._ordered_speed = [
+                    f"{speed}/{speed_count}" for speed in range(1, speed_count + 1)
+                ]
+            else:
+                self._ordered_speed = []
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        if domain == FAN_DOMAIN:
+            return features & FanEntityFeature.SET_SPEED
+        if domain == CLIMATE_DOMAIN:
+            return features & ClimateEntityFeature.FAN_MODE
+        return False
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return speed point and modes attributes for a sync request."""
+        domain = self.state.domain
+        speeds = []
+        result: dict[str, Any] = {}
+
+        if domain == FAN_DOMAIN:
+            reversible = bool(
+                self.state.attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+                & FanEntityFeature.DIRECTION
+            )
+
+            result.update(
+                {
+                    "reversible": reversible,
+                    # supportsFanSpeedPercent is mutually exclusive with
+                    # availableFanSpeeds, where supportsFanSpeedPercent takes
+                    # precedence. Report it only when step speeds are not
+                    # supported so Google renders a percent slider (1-100%).
+                    "supportsFanSpeedPercent": not self._ordered_speed,
+                }
+            )
+
+            if self._ordered_speed:
+                result.update(
+                    {
+                        "availableFanSpeeds": {
+                            "speeds": [
+                                _get_fan_speed(speed) for speed in self._ordered_speed
+                            ],
+                            "ordered": True,
+                        },
+                    }
+                )
+
+        elif domain == CLIMATE_DOMAIN:
+            modes = (
+                self.state.attributes.get(ClimateEntityCapabilityAttribute.FAN_MODES)
+                or []
+            )
+            for mode in modes:
+                speed = {
+                    "speed_name": mode,
+                    "speed_values": [{"speed_synonym": [mode], "lang": "en"}],
+                }
+                speeds.append(speed)
+
+            result.update(
+                {
+                    "reversible": False,
+                    "availableFanSpeeds": {"speeds": speeds, "ordered": True},
+                }
+            )
+
+        return result
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return speed point and modes query attributes."""
+
+        attrs = self.state.attributes
+        domain = self.state.domain
+        response = {}
+        if domain == CLIMATE_DOMAIN:
+            speed = attrs.get(ClimateEntityStateAttribute.FAN_MODE) or "off"
+            response["currentFanSpeedSetting"] = speed
+
+        if domain == FAN_DOMAIN:
+            percent = attrs.get(FanEntityStateAttribute.PERCENTAGE) or 0
+            if self._ordered_speed:
+                response["currentFanSpeedSetting"] = percentage_to_ordered_list_item(
+                    self._ordered_speed, percent
+                )
+            else:
+                response["currentFanSpeedPercent"] = percent
+
+        return response
+
+    async def execute_fanspeed(self, data, params):
+        """Execute an SetFanSpeed command."""
+        domain = self.state.domain
+        if domain == CLIMATE_DOMAIN:
+            await self.hass.services.async_call(
+                CLIMATE_DOMAIN,
+                ClimateService.SET_FAN_MODE,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    ClimateServiceArgument.FAN_MODE: params["fanSpeed"],
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+        if domain == FAN_DOMAIN:
+            if self._ordered_speed and (fan_speed := params.get("fanSpeed")):
+                fan_speed_percent = ordered_list_item_to_percentage(
+                    self._ordered_speed, fan_speed
+                )
+            else:
+                fan_speed_percent = params.get("fanSpeedPercent")
+
+            await self.hass.services.async_call(
+                FAN_DOMAIN,
+                FanService.SET_PERCENTAGE,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    FanServiceArgument.PERCENTAGE: fan_speed_percent,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+    async def execute_reverse(self, data, params):
+        """Execute a Reverse command."""
+        if self.state.domain == FAN_DOMAIN:
+            if (
+                self.state.attributes.get(FanEntityStateAttribute.DIRECTION)
+                == fan.DIRECTION_FORWARD
+            ):
+                direction = fan.DIRECTION_REVERSE
+            else:
+                direction = fan.DIRECTION_FORWARD
+
+            await self.hass.services.async_call(
+                FAN_DOMAIN,
+                FanService.SET_DIRECTION,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    FanServiceArgument.DIRECTION: direction,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute a smart home command."""
+        if command == COMMAND_SET_FAN_SPEED:
+            await self.execute_fanspeed(data, params)
+        elif command == COMMAND_REVERSE:
+            await self.execute_reverse(data, params)
+
+
+@register_trait
+class ModesTrait(_Trait):
+    """Trait to set modes.
+
+    https://developers.google.com/actions/smarthome/traits/modes
+    """
+
+    name = TRAIT_MODES
+    commands = [COMMAND_SET_MODES]
+
+    SYNONYMS = {
+        "preset mode": ["preset mode", "mode", "preset"],
+        "sound mode": ["sound mode", "effects"],
+        "option": ["option", "setting", "mode", "value"],
+    }
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        if domain == FAN_DOMAIN and features & FanEntityFeature.PRESET_MODE:
+            return True
+
+        if domain == INPUT_SELECT_DOMAIN:
+            return True
+
+        if domain == SELECT_DOMAIN:
+            return True
+
+        if domain == HUMIDIFIER_DOMAIN and features & HumidifierEntityFeature.MODES:
+            return True
+
+        if domain == LIGHT_DOMAIN and features & LightEntityFeature.EFFECT:
+            return True
+
+        if (
+            domain == WATER_HEATER_DOMAIN
+            and features & WaterHeaterEntityFeature.OPERATION_MODE
+        ):
+            return True
+
+        if domain != MEDIA_PLAYER_DOMAIN:
+            return False
+
+        return features & MediaPlayerEntityFeature.SELECT_SOUND_MODE
+
+    def _generate(self, name, settings):
+        """Generate a list of modes."""
+        mode = {
+            "name": name,
+            "name_values": [
+                {"name_synonym": self.SYNONYMS.get(name, [name]), "lang": "en"}
+            ],
+            "settings": [],
+            "ordered": False,
+        }
+        for setting in settings:
+            mode["settings"].append(
+                {
+                    "setting_name": setting,
+                    "setting_values": [
+                        {
+                            "setting_synonym": self.SYNONYMS.get(setting, [setting]),
+                            "lang": "en",
+                        }
+                    ],
+                }
+            )
+        return mode
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return mode attributes for a sync request."""
+        modes = []
+
+        for domain, attr, name in (
+            (FAN_DOMAIN, FanEntityCapabilityAttribute.PRESET_MODES, "preset mode"),
+            (
+                MEDIA_PLAYER_DOMAIN,
+                MediaPlayerEntityCapabilityAttribute.SOUND_MODE_LIST,
+                "sound mode",
+            ),
+            (INPUT_SELECT_DOMAIN, SelectEntityCapabilityAttribute.OPTIONS, "option"),
+            (SELECT_DOMAIN, SelectEntityCapabilityAttribute.OPTIONS, "option"),
+            (
+                HUMIDIFIER_DOMAIN,
+                HumidifierEntityCapabilityAttribute.AVAILABLE_MODES,
+                "mode",
+            ),
+            (LIGHT_DOMAIN, LightEntityCapabilityAttribute.EFFECT_LIST, "effect"),
+            (
+                WATER_HEATER_DOMAIN,
+                WaterHeaterCapabilityAttribute.OPERATION_LIST,
+                "operation mode",
+            ),
+        ):
+            if self.state.domain != domain:
+                continue
+
+            if (items := self.state.attributes.get(attr)) is not None:
+                modes.append(self._generate(name, items))
+
+            # Shortcut since all domains are currently unique
+            break
+
+        return {"availableModes": modes}
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return current modes."""
+        attrs = self.state.attributes
+        response: dict[str, Any] = {}
+        mode_settings = {}
+
+        if self.state.domain == FAN_DOMAIN:
+            if FanEntityCapabilityAttribute.PRESET_MODES in attrs:
+                mode_settings["preset mode"] = attrs.get(
+                    FanEntityStateAttribute.PRESET_MODE
+                )
+        elif self.state.domain == MEDIA_PLAYER_DOMAIN:
+            if MediaPlayerEntityCapabilityAttribute.SOUND_MODE_LIST in attrs:
+                mode_settings["sound mode"] = attrs.get(
+                    MediaPlayerEntityStateAttribute.SOUND_MODE
+                )
+        elif self.state.domain in (INPUT_SELECT_DOMAIN, SELECT_DOMAIN):
+            mode_settings["option"] = self.state.state
+        elif self.state.domain == HUMIDIFIER_DOMAIN:
+            if HumidifierEntityStateAttribute.MODE in attrs:
+                mode_settings["mode"] = attrs.get(HumidifierEntityStateAttribute.MODE)
+        elif self.state.domain == WATER_HEATER_DOMAIN:
+            if WaterHeaterStateAttribute.OPERATION_MODE in attrs:
+                mode_settings["operation mode"] = attrs.get(
+                    WaterHeaterStateAttribute.OPERATION_MODE
+                )
+        elif self.state.domain == LIGHT_DOMAIN and (
+            effect := attrs.get(LightEntityStateAttribute.EFFECT)
+        ):
+            mode_settings["effect"] = effect
+
+        if mode_settings:
+            response["on"] = self.state.state not in (STATE_OFF, STATE_UNKNOWN)
+            response["currentModeSettings"] = mode_settings
+
+        return response
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute a SetModes command."""
+        settings = params.get("updateModeSettings")
+
+        if self.state.domain == FAN_DOMAIN:
+            preset_mode = settings["preset mode"]
+            await self.hass.services.async_call(
+                FAN_DOMAIN,
+                FanService.SET_PRESET_MODE,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    FanServiceArgument.PRESET_MODE: preset_mode,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+            return
+
+        if self.state.domain == INPUT_SELECT_DOMAIN:
+            option = settings["option"]
+            await self.hass.services.async_call(
+                INPUT_SELECT_DOMAIN,
+                InputSelectService.SELECT_OPTION,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    InputSelectServiceArgument.OPTION: option,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+            return
+
+        if self.state.domain == SELECT_DOMAIN:
+            option = settings["option"]
+            await self.hass.services.async_call(
+                SELECT_DOMAIN,
+                SelectService.SELECT_OPTION,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    SelectServiceArgument.OPTION: option,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+            return
+
+        if self.state.domain == HUMIDIFIER_DOMAIN:
+            requested_mode = settings["mode"]
+            await self.hass.services.async_call(
+                HUMIDIFIER_DOMAIN,
+                HumidifierService.SET_MODE,
+                {
+                    HumidifierServiceArgument.MODE: requested_mode,
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+            return
+
+        if self.state.domain == WATER_HEATER_DOMAIN:
+            requested_mode = settings["operation mode"]
+            await self.hass.services.async_call(
+                WATER_HEATER_DOMAIN,
+                WaterHeaterService.SET_OPERATION_MODE,
+                {
+                    WaterHeaterServiceArgument.OPERATION_MODE: requested_mode,
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+            return
+
+        if self.state.domain == LIGHT_DOMAIN:
+            requested_effect = settings["effect"]
+            await self.hass.services.async_call(
+                LIGHT_DOMAIN,
+                SERVICE_TURN_ON,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    LightServiceArgument.EFFECT: requested_effect,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+            return
+
+        if self.state.domain == MEDIA_PLAYER_DOMAIN and (
+            sound_mode := settings.get("sound mode")
+        ):
+            await self.hass.services.async_call(
+                MEDIA_PLAYER_DOMAIN,
+                MediaPlayerService.SELECT_SOUND_MODE,
+                {
+                    ATTR_ENTITY_ID: self.state.entity_id,
+                    MediaPlayerServiceArgument.SOUND_MODE: sound_mode,
+                },
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+        _LOGGER.info(
+            "Received an Options command for unrecognised domain %s",
+            self.state.domain,
+        )
+        return
+
+
+@register_trait
+class InputSelectorTrait(_Trait):
+    """Trait to set modes.
+
+    https://developers.google.com/assistant/smarthome/traits/inputselector
+    """
+
+    name = TRAIT_INPUT_SELECTOR
+    commands = [COMMAND_SET_INPUT, COMMAND_NEXT_INPUT, COMMAND_PREVIOUS_INPUT]
+
+    SYNONYMS: dict[str, list[str]] = {}
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        if domain == MEDIA_PLAYER_DOMAIN and (
+            features & MediaPlayerEntityFeature.SELECT_SOURCE
+        ):
+            return True
+
+        return False
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return mode attributes for a sync request."""
+        attrs = self.state.attributes
+        sourcelist: list[str] = (
+            attrs.get(MediaPlayerEntityCapabilityAttribute.INPUT_SOURCE_LIST) or []
+        )
+        inputs = [
+            {"key": source, "names": [{"name_synonym": [source], "lang": "en"}]}
+            for source in sourcelist
+        ]
+
+        return {"availableInputs": inputs, "orderedInputs": True}
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return current modes."""
+        attrs = self.state.attributes
+        return {
+            "currentInput": attrs.get(MediaPlayerEntityStateAttribute.INPUT_SOURCE, "")
+        }
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute an SetInputSource command."""
+        sources = (
+            self.state.attributes.get(
+                MediaPlayerEntityCapabilityAttribute.INPUT_SOURCE_LIST
+            )
+            or []
+        )
+        source = self.state.attributes.get(MediaPlayerEntityStateAttribute.INPUT_SOURCE)
+
+        if command == COMMAND_SET_INPUT:
+            requested_source = params.get("newInput")
+        elif command == COMMAND_NEXT_INPUT:
+            requested_source = _next_selected(sources, source)
+        elif command == COMMAND_PREVIOUS_INPUT:
+            requested_source = _next_selected(list(reversed(sources)), source)
+        else:
+            raise SmartHomeError(ERR_NOT_SUPPORTED, "Unsupported command")
+
+        if requested_source not in sources:
+            raise SmartHomeError(ERR_UNSUPPORTED_INPUT, "Unsupported input")
+
+        await self.hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            MediaPlayerService.SELECT_SOURCE,
+            {
+                ATTR_ENTITY_ID: self.state.entity_id,
+                MediaPlayerServiceArgument.SOURCE: requested_source,
+            },
+            blocking=not self.config.should_report_state,
+            context=data.context,
+        )
+
+
+@register_trait
+class OpenCloseTrait(_Trait):
+    """Trait to open and close a cover.
+
+    https://developers.google.com/actions/smarthome/traits/openclose
+    """
+
+    # Cover device classes that require 2FA
+    COVER_2FA = (
+        cover.CoverDeviceClass.DOOR,
+        cover.CoverDeviceClass.GARAGE,
+        cover.CoverDeviceClass.GATE,
+    )
+
+    name = TRAIT_OPEN_CLOSE
+    commands = [COMMAND_OPEN_CLOSE, COMMAND_OPEN_CLOSE_RELATIVE]
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        if domain in COVER_VALVE_DOMAINS:
+            return True
+
+        return domain == BINARY_SENSOR_DOMAIN and device_class in (
+            binary_sensor.BinarySensorDeviceClass.DOOR,
+            binary_sensor.BinarySensorDeviceClass.GARAGE_DOOR,
+            binary_sensor.BinarySensorDeviceClass.LOCK,
+            binary_sensor.BinarySensorDeviceClass.OPENING,
+            binary_sensor.BinarySensorDeviceClass.WINDOW,
+        )
+
+    @staticmethod
+    @override
+    def might_2fa(domain, features, device_class):
+        """Return if the trait might ask for 2FA."""
+        return domain == COVER_DOMAIN and device_class in OpenCloseTrait.COVER_2FA
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return opening direction."""
+        response = {}
+        features = self.state.attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+
+        if self.state.domain == BINARY_SENSOR_DOMAIN:
+            response["queryOnlyOpenClose"] = True
+            response["discreteOnlyOpenClose"] = True
+        elif (
+            self.state.domain == COVER_DOMAIN
+            and features & CoverEntityFeature.SET_POSITION == 0
+        ):
+            response["discreteOnlyOpenClose"] = True
+
+            if (
+                features & CoverEntityFeature.OPEN == 0
+                and features & CoverEntityFeature.CLOSE == 0
+            ):
+                response["queryOnlyOpenClose"] = True
+        elif (
+            self.state.domain == VALVE_DOMAIN
+            and features & ValveEntityFeature.SET_POSITION == 0
+        ):
+            response["discreteOnlyOpenClose"] = True
+
+            if (
+                features & ValveEntityFeature.OPEN == 0
+                and features & ValveEntityFeature.CLOSE == 0
+            ):
+                response["queryOnlyOpenClose"] = True
+
+        if self.state.attributes.get(EntityStateAttribute.ASSUMED_STATE):
+            response["commandOnlyOpenClose"] = True
+
+        return response
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return state query attributes."""
+        domain = self.state.domain
+        response: dict[str, Any] = {}
+
+        # When it's an assumed state, we will return empty state
+        # This shouldn't happen because we set `commandOnlyOpenClose`
+        # but Google still queries. Erroring here will cause device
+        # to show up offline.
+        if self.state.attributes.get(EntityStateAttribute.ASSUMED_STATE):
+            return response
+
+        if domain in COVER_VALVE_DOMAINS:
+            if self.state.state == STATE_UNKNOWN:
+                raise SmartHomeError(
+                    ERR_NOT_SUPPORTED, "Querying state is not supported"
+                )
+
+            position = self.state.attributes.get(COVER_VALVE_CURRENT_POSITION[domain])
+
+            if position is not None:
+                response["openPercent"] = position
+            elif self.state.state != COVER_VALVE_STATES[domain]["closed"]:
+                response["openPercent"] = 100
+            else:
+                response["openPercent"] = 0
+
+        elif domain == BINARY_SENSOR_DOMAIN:
+            if self.state.state == STATE_ON:
+                response["openPercent"] = 100
+            else:
+                response["openPercent"] = 0
+
+        return response
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute an Open, close, Set position command."""
+        domain = self.state.domain
+        features = self.state.attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+
+        if domain in COVER_VALVE_DOMAINS:
+            svc_params = {ATTR_ENTITY_ID: self.state.entity_id}
+            should_verify = False
+            if command == COMMAND_OPEN_CLOSE_RELATIVE:
+                position = self.state.attributes.get(
+                    COVER_VALVE_CURRENT_POSITION[domain]
+                )
+                if position is None:
+                    raise SmartHomeError(
+                        ERR_NOT_SUPPORTED,
+                        "Current position not know for relative command",
+                    )
+                position = max(0, min(100, position + params["openRelativePercent"]))
+            else:
+                position = params["openPercent"]
+
+            if position == 0:
+                service = SERVICE_CLOSE_COVER_VALVE[domain]
+                should_verify = False
+            elif position == 100:
+                service = SERVICE_OPEN_COVER_VALVE[domain]
+                should_verify = True
+            elif features & COVER_VALVE_SET_POSITION_FEATURE[domain]:
+                service = SERVICE_SET_POSITION_COVER_VALVE[domain]
+                if position > 0:
+                    should_verify = True
+                svc_params[COVER_VALVE_POSITION[domain]] = position
+            else:
+                raise SmartHomeError(
+                    ERR_NOT_SUPPORTED, "No support for partial open close"
+                )
+
+            if (
+                should_verify
+                and self.state.attributes.get(EntityStateAttribute.DEVICE_CLASS)
+                in OpenCloseTrait.COVER_2FA
+            ):
+                _verify_pin_challenge(data, self.state, challenge)
+
+            await self.hass.services.async_call(
+                domain,
+                service,
+                svc_params,
+                blocking=not self.config.should_report_state,
+                context=data.context,
+            )
+
+
+@register_trait
+class VolumeTrait(_Trait):
+    """Trait to control volume of a device.
+
+    https://developers.google.com/actions/smarthome/traits/volume
+    """
+
+    name = TRAIT_VOLUME
+    commands = [COMMAND_SET_VOLUME, COMMAND_VOLUME_RELATIVE, COMMAND_MUTE]
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if trait is supported."""
+        if domain == MEDIA_PLAYER_DOMAIN:
+            return features & (
+                MediaPlayerEntityFeature.VOLUME_SET
+                | MediaPlayerEntityFeature.VOLUME_STEP
+            )
+
+        return False
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return volume attributes for a sync request."""
+        features = self.state.attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+        return {
+            "volumeCanMuteAndUnmute": bool(
+                features & MediaPlayerEntityFeature.VOLUME_MUTE
+            ),
+            "commandOnlyVolume": self.state.attributes.get(
+                EntityStateAttribute.ASSUMED_STATE, False
+            ),
+            # Volume amounts in SET_VOLUME and VOLUME_RELATIVE are on a scale
+            # from 0 to this value.
+            "volumeMaxLevel": 100,
+            # Default change for queries like "Hey Google, volume up".
+            # 10% corresponds to the default behavior for the
+            # media_player.volume{up,down} services.
+            "levelStepSize": 10,
+        }
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return volume query attributes."""
+        response = {}
+
+        level = self.state.attributes.get(
+            MediaPlayerEntityStateAttribute.MEDIA_VOLUME_LEVEL
+        )
+        if level is not None:
+            # Convert 0.0-1.0 to 0-100
+            response["currentVolume"] = round(level * 100)
+
+        muted = self.state.attributes.get(
+            MediaPlayerEntityStateAttribute.MEDIA_VOLUME_MUTED
+        )
+        if muted is not None:
+            response["isMuted"] = bool(muted)
+
+        return response
+
+    async def _set_volume_absolute(self, data, level):
+        await self.hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            MediaPlayerService.VOLUME_SET,
+            {
+                ATTR_ENTITY_ID: self.state.entity_id,
+                MediaPlayerServiceArgument.VOLUME_LEVEL: level,
+            },
+            blocking=not self.config.should_report_state,
+            context=data.context,
+        )
+
+    async def _execute_set_volume(self, data, params):
+        level = max(0, min(100, params["volumeLevel"]))
+
+        if not (
+            self.state.attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+            & MediaPlayerEntityFeature.VOLUME_SET
+        ):
+            raise SmartHomeError(ERR_NOT_SUPPORTED, "Command not supported")
+
+        await self._set_volume_absolute(data, level / 100)
+
+    async def _execute_volume_relative(self, data, params):
+        relative = params["relativeSteps"]
+        features = self.state.attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+
+        if features & MediaPlayerEntityFeature.VOLUME_SET:
+            current = self.state.attributes.get(
+                MediaPlayerEntityStateAttribute.MEDIA_VOLUME_LEVEL
+            )
+            target = max(0.0, min(1.0, current + relative / 100))
+
+            await self._set_volume_absolute(data, target)
+
+        elif features & MediaPlayerEntityFeature.VOLUME_STEP:
+            svc = MediaPlayerService.VOLUME_UP
+            if relative < 0:
+                svc = MediaPlayerService.VOLUME_DOWN
+                relative = -relative
+
+            for _ in range(relative):
+                await self.hass.services.async_call(
+                    MEDIA_PLAYER_DOMAIN,
+                    svc,
+                    {ATTR_ENTITY_ID: self.state.entity_id},
+                    blocking=not self.config.should_report_state,
+                    context=data.context,
+                )
+        else:
+            raise SmartHomeError(ERR_NOT_SUPPORTED, "Command not supported")
+
+    async def _execute_mute(self, data, params):
+        mute = params["mute"]
+
+        if not (
+            self.state.attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+            & MediaPlayerEntityFeature.VOLUME_MUTE
+        ):
+            raise SmartHomeError(ERR_NOT_SUPPORTED, "Command not supported")
+
+        await self.hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            MediaPlayerService.VOLUME_MUTE,
+            {
+                ATTR_ENTITY_ID: self.state.entity_id,
+                MediaPlayerServiceArgument.IS_VOLUME_MUTED: mute,
+            },
+            blocking=not self.config.should_report_state,
+            context=data.context,
+        )
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute a volume command."""
+        if command == COMMAND_SET_VOLUME:
+            await self._execute_set_volume(data, params)
+        elif command == COMMAND_VOLUME_RELATIVE:
+            await self._execute_volume_relative(data, params)
+        elif command == COMMAND_MUTE:
+            await self._execute_mute(data, params)
+        else:
+            raise SmartHomeError(ERR_NOT_SUPPORTED, "Command not supported")
+
+
+def _verify_pin_challenge(data, state, challenge):
+    """Verify a pin challenge."""
+    if not data.config.should_2fa(state):
+        return
+    if not data.config.secure_devices_pin:
+        raise SmartHomeError(ERR_CHALLENGE_NOT_SETUP, "Challenge is not set up")
+
+    if not challenge:
+        raise ChallengeNeeded(CHALLENGE_PIN_NEEDED)
+
+    if challenge.get("pin") != data.config.secure_devices_pin:
+        raise ChallengeNeeded(CHALLENGE_FAILED_PIN_NEEDED)
+
+
+MEDIA_COMMAND_SUPPORT_MAPPING = {
+    COMMAND_MEDIA_NEXT: MediaPlayerEntityFeature.NEXT_TRACK,
+    COMMAND_MEDIA_PAUSE: MediaPlayerEntityFeature.PAUSE,
+    COMMAND_MEDIA_PREVIOUS: MediaPlayerEntityFeature.PREVIOUS_TRACK,
+    COMMAND_MEDIA_RESUME: MediaPlayerEntityFeature.PLAY,
+    COMMAND_MEDIA_SEEK_RELATIVE: MediaPlayerEntityFeature.SEEK,
+    COMMAND_MEDIA_SEEK_TO_POSITION: MediaPlayerEntityFeature.SEEK,
+    COMMAND_MEDIA_SHUFFLE: MediaPlayerEntityFeature.SHUFFLE_SET,
+    COMMAND_MEDIA_STOP: MediaPlayerEntityFeature.STOP,
+}
+
+MEDIA_COMMAND_ATTRIBUTES = {
+    COMMAND_MEDIA_NEXT: "NEXT",
+    COMMAND_MEDIA_PAUSE: "PAUSE",
+    COMMAND_MEDIA_PREVIOUS: "PREVIOUS",
+    COMMAND_MEDIA_RESUME: "RESUME",
+    COMMAND_MEDIA_SEEK_RELATIVE: "SEEK_RELATIVE",
+    COMMAND_MEDIA_SEEK_TO_POSITION: "SEEK_TO_POSITION",
+    COMMAND_MEDIA_SHUFFLE: "SHUFFLE",
+    COMMAND_MEDIA_STOP: "STOP",
+}
+
+
+@register_trait
+class TransportControlTrait(_Trait):
+    """Trait to control media playback.
+
+    https://developers.google.com/actions/smarthome/traits/transportcontrol
+    """
+
+    name = TRAIT_TRANSPORT_CONTROL
+    commands = [
+        COMMAND_MEDIA_NEXT,
+        COMMAND_MEDIA_PAUSE,
+        COMMAND_MEDIA_PREVIOUS,
+        COMMAND_MEDIA_RESUME,
+        COMMAND_MEDIA_SEEK_RELATIVE,
+        COMMAND_MEDIA_SEEK_TO_POSITION,
+        COMMAND_MEDIA_SHUFFLE,
+        COMMAND_MEDIA_STOP,
+    ]
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        if domain == MEDIA_PLAYER_DOMAIN:
+            for feature in MEDIA_COMMAND_SUPPORT_MAPPING.values():
+                if features & feature:
+                    return True
+
+        return False
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return opening direction."""
+        response = {}
+
+        if self.state.domain == MEDIA_PLAYER_DOMAIN:
+            features = self.state.attributes.get(
+                EntityStateAttribute.SUPPORTED_FEATURES, 0
+            )
+
+            support = []
+            for command, feature in MEDIA_COMMAND_SUPPORT_MAPPING.items():
+                if features & feature:
+                    support.append(MEDIA_COMMAND_ATTRIBUTES[command])
+            response["transportControlSupportedCommands"] = support
+
+        return response
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return the attributes of this trait for this entity."""
+        return {}
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute a media command."""
+        service_attrs = {ATTR_ENTITY_ID: self.state.entity_id}
+
+        if command == COMMAND_MEDIA_SEEK_RELATIVE:
+            service = MediaPlayerService.MEDIA_SEEK
+
+            rel_position = params["relativePositionMs"] / 1000
+            seconds_since = 0  # Default to 0 seconds
+            if self.state.state == STATE_PLAYING:
+                now = dt_util.utcnow()
+                upd_at = self.state.attributes.get(
+                    MediaPlayerEntityStateAttribute.MEDIA_POSITION_UPDATED_AT, now
+                )
+                seconds_since = (now - upd_at).total_seconds()
+            position = self.state.attributes.get(
+                MediaPlayerEntityStateAttribute.MEDIA_POSITION, 0
+            )
+            max_position = self.state.attributes.get(
+                MediaPlayerEntityStateAttribute.MEDIA_DURATION, 0
+            )
+            service_attrs[MediaPlayerServiceArgument.SEEK_POSITION] = min(
+                max(position + seconds_since + rel_position, 0), max_position
+            )
+        elif command == COMMAND_MEDIA_SEEK_TO_POSITION:
+            service = MediaPlayerService.MEDIA_SEEK
+
+            max_position = self.state.attributes.get(
+                MediaPlayerEntityStateAttribute.MEDIA_DURATION, 0
+            )
+            service_attrs[MediaPlayerServiceArgument.SEEK_POSITION] = min(
+                max(params["absPositionMs"] / 1000, 0), max_position
+            )
+        elif command == COMMAND_MEDIA_NEXT:
+            service = MediaPlayerService.MEDIA_NEXT_TRACK
+        elif command == COMMAND_MEDIA_PAUSE:
+            service = MediaPlayerService.MEDIA_PAUSE
+        elif command == COMMAND_MEDIA_PREVIOUS:
+            service = MediaPlayerService.MEDIA_PREVIOUS_TRACK
+        elif command == COMMAND_MEDIA_RESUME:
+            service = MediaPlayerService.MEDIA_PLAY
+        elif command == COMMAND_MEDIA_SHUFFLE:
+            service = MediaPlayerService.SHUFFLE_SET
+
+            # Google Assistant only supports enabling shuffle
+            service_attrs[MediaPlayerServiceArgument.SHUFFLE] = True
+        elif command == COMMAND_MEDIA_STOP:
+            service = MediaPlayerService.MEDIA_STOP
+        else:
+            raise SmartHomeError(ERR_NOT_SUPPORTED, "Command not supported")
+
+        await self.hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            service,
+            service_attrs,
+            blocking=not self.config.should_report_state,
+            context=data.context,
+        )
+
+
+@register_trait
+class MediaStateTrait(_Trait):
+    """Trait to get media playback state.
+
+    https://developers.google.com/actions/smarthome/traits/mediastate
+    """
+
+    name = TRAIT_MEDIA_STATE
+    commands: list[str] = []
+
+    activity_lookup = {
+        STATE_OFF: "INACTIVE",
+        STATE_IDLE: "STANDBY",
+        STATE_PLAYING: "ACTIVE",
+        STATE_ON: "STANDBY",
+        STATE_PAUSED: "STANDBY",
+        STATE_STANDBY: "STANDBY",
+        STATE_UNAVAILABLE: "INACTIVE",
+        STATE_UNKNOWN: "INACTIVE",
+    }
+
+    playback_lookup = {
+        STATE_OFF: "STOPPED",
+        STATE_IDLE: "STOPPED",
+        STATE_PLAYING: "PLAYING",
+        STATE_ON: "STOPPED",
+        STATE_PAUSED: "PAUSED",
+        STATE_STANDBY: "STOPPED",
+        STATE_UNAVAILABLE: "STOPPED",
+        STATE_UNKNOWN: "STOPPED",
+    }
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        return domain == MEDIA_PLAYER_DOMAIN
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return attributes for a sync request."""
+        return {"supportActivityState": True, "supportPlaybackState": True}
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return the attributes of this trait for this entity."""
+        return {
+            "activityState": self.activity_lookup.get(self.state.state, "INACTIVE"),
+            "playbackState": self.playback_lookup.get(self.state.state, "STOPPED"),
+        }
+
+
+@register_trait
+class ChannelTrait(_Trait):
+    """Trait to get media playback state.
+
+    https://developers.google.com/actions/smarthome/traits/channel
+    """
+
+    name = TRAIT_CHANNEL
+    commands = [COMMAND_SELECT_CHANNEL]
+
+    @staticmethod
+    @override
+    def supported(domain, features, device_class, _):
+        """Test if state is supported."""
+        if (
+            domain == MEDIA_PLAYER_DOMAIN
+            and (features & MediaPlayerEntityFeature.PLAY_MEDIA)
+            and device_class
+            in (
+                media_player.MediaPlayerDeviceClass.TV,
+                media_player.MediaPlayerDeviceClass.PROJECTOR,
+            )
+        ):
+            return True
+
+        return False
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return attributes for a sync request."""
+        return {"availableChannels": [], "commandOnlyChannels": True}
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return channel query attributes."""
+        return {}
+
+    @override
+    async def execute(self, command, data, params, challenge):
+        """Execute an setChannel command."""
+        if command == COMMAND_SELECT_CHANNEL:
+            channel_number = params.get("channelNumber")
+        else:
+            raise SmartHomeError(ERR_NOT_SUPPORTED, "Unsupported command")
+
+        if not channel_number:
+            raise SmartHomeError(
+                ERR_NO_AVAILABLE_CHANNEL,
+                "Channel is not available",
+            )
+
+        await self.hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            MediaPlayerService.PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: self.state.entity_id,
+                MediaPlayerServiceArgument.MEDIA_CONTENT_ID: channel_number,
+                MediaPlayerServiceArgument.MEDIA_CONTENT_TYPE: MediaType.CHANNEL,
+            },
+            blocking=not self.config.should_report_state,
+            context=data.context,
+        )
+
+
+@register_trait
+class SensorStateTrait(_Trait):
+    """Trait to get sensor state.
+
+    https://developers.google.com/actions/smarthome/traits/sensorstate
+    """
+
+    sensor_types = {
+        sensor.SensorDeviceClass.AQI: ("AirQuality", "AQI"),
+        sensor.SensorDeviceClass.CO: ("CarbonMonoxideLevel", "PARTS_PER_MILLION"),
+        sensor.SensorDeviceClass.CO2: ("CarbonDioxideLevel", "PARTS_PER_MILLION"),
+        sensor.SensorDeviceClass.PM25: ("PM2.5", "MICROGRAMS_PER_CUBIC_METER"),
+        sensor.SensorDeviceClass.PM10: ("PM10", "MICROGRAMS_PER_CUBIC_METER"),
+        sensor.SensorDeviceClass.VOLATILE_ORGANIC_COMPOUNDS: (
+            "VolatileOrganicCompounds",
+            "PARTS_PER_MILLION",
+        ),
+    }
+
+    binary_sensor_types = {
+        binary_sensor.BinarySensorDeviceClass.CO: (
+            "CarbonMonoxideLevel",
+            ["carbon monoxide detected", "no carbon monoxide detected", "unknown"],
+        ),
+        binary_sensor.BinarySensorDeviceClass.SMOKE: (
+            "SmokeLevel",
+            ["smoke detected", "no smoke detected", "unknown"],
+        ),
+        binary_sensor.BinarySensorDeviceClass.MOISTURE: (
+            "WaterLeak",
+            ["leak", "no leak", "unknown"],
+        ),
+    }
+
+    name = TRAIT_SENSOR_STATE
+    commands: list[str] = []
+
+    def _air_quality_description_for_aqi(self, aqi: float | None) -> str:
+        if aqi is None or aqi < 0:
+            return "unknown"
+        if aqi <= 50:
+            return "healthy"
+        if aqi <= 100:
+            return "moderate"
+        if aqi <= 150:
+            return "unhealthy for sensitive groups"
+        if aqi <= 200:
+            return "unhealthy"
+        if aqi <= 300:
+            return "very unhealthy"
+
+        return "hazardous"
+
+    @classmethod
+    @override
+    def supported(cls, domain, features, device_class, _):
+        """Test if state is supported."""
+        return (domain == SENSOR_DOMAIN and device_class in cls.sensor_types) or (
+            domain == BINARY_SENSOR_DOMAIN and device_class in cls.binary_sensor_types
+        )
+
+    @override
+    def sync_attributes(self) -> dict[str, Any]:
+        """Return attributes for a sync request."""
+        device_class = self.state.attributes.get(EntityStateAttribute.DEVICE_CLASS)
+
+        def create_sensor_state(
+            name: str,
+            raw_value_unit: str | None = None,
+            available_states: list[str] | None = None,
+        ) -> dict[str, Any]:
+            sensor_state: dict[str, Any] = {
+                "name": name,
+            }
+            if raw_value_unit:
+                sensor_state["numericCapabilities"] = {"rawValueUnit": raw_value_unit}
+            if available_states:
+                sensor_state["descriptiveCapabilities"] = {
+                    "availableStates": available_states
+                }
+            return {"sensorStatesSupported": [sensor_state]}
+
+        if self.state.domain == SENSOR_DOMAIN:
+            sensor_data = self.sensor_types.get(device_class)
+            if device_class is None or sensor_data is None:
+                return {}
+            available_states: list[str] | None = None
+            if device_class == sensor.SensorDeviceClass.AQI:
+                available_states = [
+                    "healthy",
+                    "moderate",
+                    "unhealthy for sensitive groups",
+                    "unhealthy",
+                    "very unhealthy",
+                    "hazardous",
+                    "unknown",
+                ]
+            return create_sensor_state(sensor_data[0], sensor_data[1], available_states)
+        binary_sensor_data = self.binary_sensor_types.get(device_class)
+        if device_class is None or binary_sensor_data is None:
+            return {}
+        return create_sensor_state(
+            binary_sensor_data[0], available_states=binary_sensor_data[1]
+        )
+
+    @override
+    def query_attributes(self) -> dict[str, Any]:
+        """Return the attributes of this trait for this entity."""
+        device_class = self.state.attributes.get(EntityStateAttribute.DEVICE_CLASS)
+
+        def create_sensor_state(
+            name: str, raw_value: float | None = None, current_state: str | None = None
+        ) -> dict[str, Any]:
+            sensor_state: dict[str, Any] = {
+                "name": name,
+                "rawValue": raw_value,
+            }
+            if current_state:
+                sensor_state["currentSensorState"] = current_state
+            return {"currentSensorStateData": [sensor_state]}
+
+        if self.state.domain == SENSOR_DOMAIN:
+            sensor_data = self.sensor_types.get(device_class)
+            if device_class is None or sensor_data is None:
+                return {}
+            try:
+                value = float(self.state.state)
+            except ValueError:
+                value = None
+            if self.state.state == STATE_UNKNOWN:
+                value = None
+            current_state: str | None = None
+            if device_class == sensor.SensorDeviceClass.AQI:
+                current_state = self._air_quality_description_for_aqi(value)
+            return create_sensor_state(sensor_data[0], value, current_state)
+
+        binary_sensor_data = self.binary_sensor_types.get(device_class)
+        if device_class is None or binary_sensor_data is None:
+            return {}
+        value = {
+            STATE_ON: 0,
+            STATE_OFF: 1,
+            STATE_UNKNOWN: 2,
+        }[self.state.state]
+        return create_sensor_state(
+            binary_sensor_data[0], current_state=binary_sensor_data[1][value]
+        )

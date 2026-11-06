@@ -1,263 +1,131 @@
-"""
-Provides functionality to interact with water heater devices.
+"""Support for water heater devices."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/water_heater/
-"""
 from datetime import timedelta
 import logging
-import functools as ft
 
-import voluptuous as vol
-
-from homeassistant.helpers.temperature import display_temp as show_temp
-from homeassistant.util.temperature import convert as convert_temperature
-from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.config_validation import PLATFORM_SCHEMA  # noqa
-import homeassistant.helpers.config_validation as cv
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    ATTR_ENTITY_ID, ATTR_TEMPERATURE, SERVICE_TURN_ON, SERVICE_TURN_OFF,
-    STATE_ON, STATE_OFF, TEMP_CELSIUS, PRECISION_WHOLE,
-    PRECISION_TENTHS, TEMP_FAHRENHEIT)
+    ATTR_TEMPERATURE,
+    SERVICE_TURN_OFF,
+    SERVICE_TURN_ON,
+    STATE_OFF,
+    STATE_ON,
+)
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_component import EntityComponent
+from homeassistant.helpers.typing import ConfigType
 
-DEFAULT_MIN_TEMP = 110
-DEFAULT_MAX_TEMP = 140
+from .const import (
+    ATTR_AWAY_MODE,
+    ATTR_OPERATION_MODE,
+    DATA_COMPONENT,
+    DEFAULT_MAX_TEMP,
+    DEFAULT_MIN_TEMP,
+    DOMAIN,
+    SERVICE_SET_AWAY_MODE,
+    SERVICE_SET_OPERATION_MODE,
+    SERVICE_SET_TEMPERATURE,
+    WaterHeaterCapabilityAttribute,
+    WaterHeaterEntityFeature,
+    WaterHeaterService,
+    WaterHeaterServiceArgument,
+    WaterHeaterStateAttribute,
+)
+from .entity import WaterHeaterEntity, WaterHeaterEntityDescription
+from .services import async_setup_services
 
-DOMAIN = 'water_heater'
-
-ENTITY_ID_FORMAT = DOMAIN + '.{}'
+ENTITY_ID_FORMAT = DOMAIN + ".{}"
+PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA
+PLATFORM_SCHEMA_BASE = cv.PLATFORM_SCHEMA_BASE
 SCAN_INTERVAL = timedelta(seconds=60)
 
-SERVICE_SET_AWAY_MODE = 'set_away_mode'
-SERVICE_SET_TEMPERATURE = 'set_temperature'
-SERVICE_SET_OPERATION_MODE = 'set_operation_mode'
 
-STATE_ECO = 'eco'
-STATE_ELECTRIC = 'electric'
-STATE_PERFORMANCE = 'performance'
-STATE_HIGH_DEMAND = 'high_demand'
-STATE_HEAT_PUMP = 'heat_pump'
-STATE_GAS = 'gas'
+STATE_ECO = "eco"
+STATE_ELECTRIC = "electric"
+STATE_PERFORMANCE = "performance"
+STATE_HIGH_DEMAND = "high_demand"
+STATE_HEAT_PUMP = "heat_pump"
+STATE_GAS = "gas"
 
-SUPPORT_TARGET_TEMPERATURE = 1
-SUPPORT_OPERATION_MODE = 2
-SUPPORT_AWAY_MODE = 4
 
-ATTR_MAX_TEMP = 'max_temp'
-ATTR_MIN_TEMP = 'min_temp'
-ATTR_AWAY_MODE = 'away_mode'
-ATTR_OPERATION_MODE = 'operation_mode'
-ATTR_OPERATION_LIST = 'operation_list'
+ATTR_MAX_TEMP = "max_temp"
+ATTR_MIN_TEMP = "min_temp"
+ATTR_OPERATION_LIST = "operation_list"
+ATTR_TARGET_TEMP_HIGH = "target_temp_high"
+ATTR_TARGET_TEMP_LOW = "target_temp_low"
+ATTR_TARGET_TEMP_STEP = "target_temp_step"
+ATTR_CURRENT_TEMPERATURE = "current_temperature"
 
-CONVERTIBLE_ATTRIBUTE = [
-    ATTR_TEMPERATURE,
-]
 
 _LOGGER = logging.getLogger(__name__)
 
-ON_OFF_SERVICE_SCHEMA = vol.Schema({
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-})
 
-SET_AWAY_MODE_SCHEMA = vol.Schema({
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-    vol.Required(ATTR_AWAY_MODE): cv.boolean,
-})
-SET_TEMPERATURE_SCHEMA = vol.Schema(vol.All(
-    {
-        vol.Required(ATTR_TEMPERATURE, 'temperature'): vol.Coerce(float),
-        vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-        vol.Optional(ATTR_OPERATION_MODE): cv.string,
-    }
-))
-SET_OPERATION_MODE_SCHEMA = vol.Schema({
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-    vol.Required(ATTR_OPERATION_MODE): cv.string,
-})
+__all__ = [
+    "ATTR_AWAY_MODE",
+    "ATTR_CURRENT_TEMPERATURE",
+    "ATTR_MAX_TEMP",
+    "ATTR_MIN_TEMP",
+    "ATTR_OPERATION_LIST",
+    "ATTR_OPERATION_MODE",
+    "ATTR_TARGET_TEMP_HIGH",
+    "ATTR_TARGET_TEMP_LOW",
+    "ATTR_TARGET_TEMP_STEP",
+    "ATTR_TEMPERATURE",
+    "DEFAULT_MAX_TEMP",
+    "DEFAULT_MIN_TEMP",
+    "DOMAIN",
+    "ENTITY_ID_FORMAT",
+    "PLATFORM_SCHEMA",
+    "PLATFORM_SCHEMA_BASE",
+    "SERVICE_SET_AWAY_MODE",
+    "SERVICE_SET_OPERATION_MODE",
+    "SERVICE_SET_TEMPERATURE",
+    "SERVICE_TURN_OFF",
+    "SERVICE_TURN_ON",
+    "STATE_ECO",
+    "STATE_ELECTRIC",
+    "STATE_GAS",
+    "STATE_HEAT_PUMP",
+    "STATE_HIGH_DEMAND",
+    "STATE_OFF",
+    "STATE_ON",
+    "STATE_PERFORMANCE",
+    "WaterHeaterCapabilityAttribute",
+    "WaterHeaterEntity",
+    "WaterHeaterEntityDescription",
+    "WaterHeaterEntityFeature",
+    "WaterHeaterService",
+    "WaterHeaterServiceArgument",
+    "WaterHeaterStateAttribute",
+]
+
+# mypy: disallow-any-generics
 
 
-async def async_setup(hass, config):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up water_heater devices."""
-    component = hass.data[DOMAIN] = \
-        EntityComponent(_LOGGER, DOMAIN, hass, SCAN_INTERVAL)
+    component = hass.data[DATA_COMPONENT] = EntityComponent[WaterHeaterEntity](
+        _LOGGER, DOMAIN, hass, SCAN_INTERVAL
+    )
     await component.async_setup(config)
 
-    component.async_register_entity_service(
-        SERVICE_SET_AWAY_MODE, SET_AWAY_MODE_SCHEMA,
-        async_service_away_mode
-    )
-    component.async_register_entity_service(
-        SERVICE_SET_TEMPERATURE, SET_TEMPERATURE_SCHEMA,
-        async_service_temperature_set
-    )
-    component.async_register_entity_service(
-        SERVICE_SET_OPERATION_MODE, SET_OPERATION_MODE_SCHEMA,
-        'async_set_operation_mode'
-    )
-    component.async_register_entity_service(
-        SERVICE_TURN_OFF, ON_OFF_SERVICE_SCHEMA,
-        'async_turn_off'
-    )
-    component.async_register_entity_service(
-        SERVICE_TURN_ON, ON_OFF_SERVICE_SCHEMA,
-        'async_turn_on'
-    )
+    async_setup_services(hass)
 
     return True
 
 
-async def async_setup_entry(hass, entry):
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Set up a config entry."""
-    return await hass.data[DOMAIN].async_setup_entry(entry)
+    if not await hass.data[DATA_COMPONENT].async_setup_entry(entry):
+        raise ConfigEntryError(
+            translation_domain=HOMEASSISTANT_DOMAIN,
+            translation_key="platform_setup_failed",
+            translation_placeholders={"platform": entry.domain, "domain": DOMAIN},
+        )
 
 
-async def async_unload_entry(hass, entry):
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload a config entry."""
-    return await hass.data[DOMAIN].async_unload_entry(entry)
-
-
-class WaterHeaterDevice(Entity):
-    """Representation of a water_heater device."""
-
-    @property
-    def state(self):
-        """Return the current state."""
-        return self.current_operation
-
-    @property
-    def precision(self):
-        """Return the precision of the system."""
-        if self.hass.config.units.temperature_unit == TEMP_CELSIUS:
-            return PRECISION_TENTHS
-        return PRECISION_WHOLE
-
-    @property
-    def state_attributes(self):
-        """Return the optional state attributes."""
-        data = {
-            ATTR_MIN_TEMP: show_temp(
-                self.hass, self.min_temp, self.temperature_unit,
-                self.precision),
-            ATTR_MAX_TEMP: show_temp(
-                self.hass, self.max_temp, self.temperature_unit,
-                self.precision),
-            ATTR_TEMPERATURE: show_temp(
-                self.hass, self.target_temperature, self.temperature_unit,
-                self.precision),
-        }
-
-        supported_features = self.supported_features
-
-        if supported_features & SUPPORT_OPERATION_MODE:
-            data[ATTR_OPERATION_MODE] = self.current_operation
-            if self.operation_list:
-                data[ATTR_OPERATION_LIST] = self.operation_list
-
-        if supported_features & SUPPORT_AWAY_MODE:
-            is_away = self.is_away_mode_on
-            data[ATTR_AWAY_MODE] = STATE_ON if is_away else STATE_OFF
-
-        return data
-
-    @property
-    def temperature_unit(self):
-        """Return the unit of measurement used by the platform."""
-        raise NotImplementedError
-
-    @property
-    def current_operation(self):
-        """Return current operation ie. eco, electric, performance, ..."""
-        return None
-
-    @property
-    def operation_list(self):
-        """Return the list of available operation modes."""
-        return None
-
-    @property
-    def target_temperature(self):
-        """Return the temperature we try to reach."""
-        return None
-
-    @property
-    def is_away_mode_on(self):
-        """Return true if away mode is on."""
-        return None
-
-    def set_temperature(self, **kwargs):
-        """Set new target temperature."""
-        raise NotImplementedError()
-
-    async def async_set_temperature(self, **kwargs):
-        """Set new target temperature."""
-        await self.hass.async_add_executor_job(
-            ft.partial(self.set_temperature, **kwargs))
-
-    def set_operation_mode(self, operation_mode):
-        """Set new target operation mode."""
-        raise NotImplementedError()
-
-    async def async_set_operation_mode(self, operation_mode):
-        """Set new target operation mode."""
-        await self.hass.async_add_executor_job(self.set_operation_mode,
-                                               operation_mode)
-
-    def turn_away_mode_on(self):
-        """Turn away mode on."""
-        raise NotImplementedError()
-
-    async def async_turn_away_mode_on(self):
-        """Turn away mode on."""
-        await self.hass.async_add_executor_job(self.turn_away_mode_on)
-
-    def turn_away_mode_off(self):
-        """Turn away mode off."""
-        raise NotImplementedError()
-
-    async def async_turn_away_mode_off(self):
-        """Turn away mode off."""
-        await self.hass.async_add_executor_job(self.turn_away_mode_off)
-
-    @property
-    def supported_features(self):
-        """Return the list of supported features."""
-        raise NotImplementedError()
-
-    @property
-    def min_temp(self):
-        """Return the minimum temperature."""
-        return convert_temperature(DEFAULT_MIN_TEMP, TEMP_FAHRENHEIT,
-                                   self.temperature_unit)
-
-    @property
-    def max_temp(self):
-        """Return the maximum temperature."""
-        return convert_temperature(DEFAULT_MAX_TEMP, TEMP_FAHRENHEIT,
-                                   self.temperature_unit)
-
-
-async def async_service_away_mode(entity, service):
-    """Handle away mode service."""
-    if service.data[ATTR_AWAY_MODE]:
-        await entity.async_turn_away_mode_on()
-    else:
-        await entity.async_turn_away_mode_off()
-
-
-async def async_service_temperature_set(entity, service):
-    """Handle set temperature service."""
-    hass = entity.hass
-    kwargs = {}
-
-    for value, temp in service.data.items():
-        if value in CONVERTIBLE_ATTRIBUTE:
-            kwargs[value] = convert_temperature(
-                temp,
-                hass.config.units.temperature_unit,
-                entity.temperature_unit
-            )
-        else:
-            kwargs[value] = temp
-
-    await entity.async_set_temperature(**kwargs)
+    await hass.data[DATA_COMPONENT].async_unload_entry(entry)

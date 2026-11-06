@@ -1,92 +1,161 @@
 """Helpers for sun events."""
-import datetime
 
-from homeassistant.core import callback
+from collections.abc import Callable
+import datetime as dt
+from typing import TYPE_CHECKING, Any, cast
+
+from homeassistant.const import SUN_EVENT_SUNRISE, SUN_EVENT_SUNSET
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
-from homeassistant.loader import bind_hass
 
-DATA_LOCATION_CACHE = 'astral_location_cache'
+from .deprecation import deprecated_function
+
+if TYPE_CHECKING:
+    import astral
+    import astral.location
+
+type _AstralSunEventCallable = Callable[..., dt.datetime]
 
 
+@deprecated_function(
+    "homeassistant.helpers.sun.get_astral_observer",
+    breaks_in_ha_version="2027.7",
+)
 @callback
-@bind_hass
-def get_astral_location(hass):
+def get_astral_location(
+    hass: HomeAssistant,
+) -> tuple[astral.location.Location, astral.Elevation]:
     """Get an astral location for the current Home Assistant configuration."""
-    from astral import Location
+    from astral import LocationInfo  # noqa: PLC0415
+    from astral.location import Location  # noqa: PLC0415
 
     latitude = hass.config.latitude
     longitude = hass.config.longitude
-    timezone = hass.config.time_zone.zone
+    timezone = str(hass.config.time_zone)
     elevation = hass.config.elevation
-    info = ('', '', latitude, longitude, timezone, elevation)
 
-    # Cache astral locations so they aren't recreated with the same args
-    if DATA_LOCATION_CACHE not in hass.data:
-        hass.data[DATA_LOCATION_CACHE] = {}
-
-    if info not in hass.data[DATA_LOCATION_CACHE]:
-        hass.data[DATA_LOCATION_CACHE][info] = Location(info)
-
-    return hass.data[DATA_LOCATION_CACHE][info]
+    return Location(LocationInfo("", "", timezone, latitude, longitude)), elevation
 
 
 @callback
-@bind_hass
-def get_astral_event_next(hass, event, utc_point_in_time=None, offset=None):
-    """Calculate the next specified solar event."""
-    import astral
+def get_astral_observer(hass: HomeAssistant) -> astral.Observer:
+    """Get an astral observer for the current Home Assistant configuration."""
+    from astral import Observer  # noqa: PLC0415
 
-    location = get_astral_location(hass)
+    return Observer(hass.config.latitude, hass.config.longitude, hass.config.elevation)
+
+
+@callback
+def get_astral_event_next(
+    hass: HomeAssistant,
+    event: str,
+    utc_point_in_time: dt.datetime | None = None,
+    offset: dt.timedelta | None = None,
+) -> dt.datetime:
+    """Calculate the next specified solar event."""
+    observer = get_astral_observer(hass)
+    return get_observer_astral_event_next(observer, event, utc_point_in_time, offset)
+
+
+@deprecated_function(
+    "homeassistant.helpers.sun.get_observer_astral_event_next",
+    breaks_in_ha_version="2027.7",
+)
+@callback
+def get_location_astral_event_next(
+    location: astral.location.Location,
+    elevation: astral.Elevation,
+    event: str,
+    utc_point_in_time: dt.datetime | None = None,
+    offset: dt.timedelta | None = None,
+) -> dt.datetime:
+    """Calculate the next specified solar event."""
+    from astral import Observer  # noqa: PLC0415
+
+    observer = Observer(location.latitude, location.longitude, elevation)
+    depression = location.solar_depression if event in ("dawn", "dusk") else None
+    return get_observer_astral_event_next(
+        observer, event, utc_point_in_time, offset, depression
+    )
+
+
+@callback
+def get_observer_astral_event_next(
+    observer: astral.Observer,
+    event: str,
+    utc_point_in_time: dt.datetime | None = None,
+    offset: dt.timedelta | None = None,
+    depression: float | None = None,
+) -> dt.datetime:
+    """Calculate the next specified solar event."""
+    import astral.sun  # noqa: PLC0415
 
     if offset is None:
-        offset = datetime.timedelta()
+        offset = dt.timedelta()
 
     if utc_point_in_time is None:
         utc_point_in_time = dt_util.utcnow()
 
+    event_func = cast(_AstralSunEventCallable, getattr(astral.sun, event))
+    kwargs: dict[str, Any] = {}
+    if depression is not None:
+        kwargs["depression"] = depression
+
     mod = -1
-    while True:
+    first_err = None
+    while mod < 367:
         try:
-            next_dt = getattr(location, event)(
-                dt_util.as_local(utc_point_in_time).date() +
-                datetime.timedelta(days=mod),
-                local=False) + offset
+            next_dt = (
+                event_func(
+                    observer,
+                    dt_util.as_local(utc_point_in_time).date() + dt.timedelta(days=mod),
+                    **kwargs,
+                )
+                + offset
+            )
             if next_dt > utc_point_in_time:
                 return next_dt
-        except astral.AstralError:
-            pass
+        except ValueError as err:
+            if not first_err:
+                first_err = err
         mod += 1
+    raise ValueError(
+        f"Unable to find event after one year, initial ValueError: {first_err}"
+    ) from first_err
 
 
 @callback
-@bind_hass
-def get_astral_event_date(hass, event, date=None):
+def get_astral_event_date(
+    hass: HomeAssistant,
+    event: str,
+    date: dt.date | dt.datetime | None = None,
+) -> dt.datetime | None:
     """Calculate the astral event time for the specified date."""
-    import astral
+    import astral.sun  # noqa: PLC0415
 
-    location = get_astral_location(hass)
+    observer = get_astral_observer(hass)
 
     if date is None:
         date = dt_util.now().date()
 
-    if isinstance(date, datetime.datetime):
+    if isinstance(date, dt.datetime):
         date = dt_util.as_local(date).date()
 
+    event_func = cast(_AstralSunEventCallable, getattr(astral.sun, event))
     try:
-        return getattr(location, event)(date, local=False)
-    except astral.AstralError:
+        return event_func(observer, date)
+    except ValueError:
         # Event never occurs for specified date.
         return None
 
 
 @callback
-@bind_hass
-def is_up(hass, utc_point_in_time=None):
+def is_up(hass: HomeAssistant, utc_point_in_time: dt.datetime | None = None) -> bool:
     """Calculate if the sun is currently up."""
     if utc_point_in_time is None:
         utc_point_in_time = dt_util.utcnow()
 
-    next_sunrise = get_astral_event_next(hass, 'sunrise', utc_point_in_time)
-    next_sunset = get_astral_event_next(hass, 'sunset', utc_point_in_time)
+    next_sunrise = get_astral_event_next(hass, SUN_EVENT_SUNRISE, utc_point_in_time)
+    next_sunset = get_astral_event_next(hass, SUN_EVENT_SUNSET, utc_point_in_time)
 
     return next_sunrise > next_sunset

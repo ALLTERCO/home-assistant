@@ -1,237 +1,271 @@
 """Tests for async util methods from Python source."""
+
 import asyncio
-from unittest.mock import MagicMock, patch
-from unittest import TestCase
+import time
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from pytest_homeassistant.common import extract_stack_to_frame
 
+from homeassistant.core import HomeAssistant
 from homeassistant.util import async_ as hasync
 
 
-@patch('asyncio.coroutines.iscoroutine')
-@patch('concurrent.futures.Future')
-@patch('threading.get_ident')
-def test_run_coroutine_threadsafe_from_inside_event_loop(
-        mock_ident, _, mock_iscoroutine):
-    """Testing calling run_coroutine_threadsafe from inside an event loop."""
-    coro = MagicMock()
-    loop = MagicMock()
-
-    loop._thread_ident = None
-    mock_ident.return_value = 5
-    mock_iscoroutine.return_value = True
-    hasync.run_coroutine_threadsafe(coro, loop)
-    assert len(loop.call_soon_threadsafe.mock_calls) == 1
-
-    loop._thread_ident = 5
-    mock_ident.return_value = 5
-    mock_iscoroutine.return_value = True
-    with pytest.raises(RuntimeError):
-        hasync.run_coroutine_threadsafe(coro, loop)
-    assert len(loop.call_soon_threadsafe.mock_calls) == 1
-
-    loop._thread_ident = 1
-    mock_ident.return_value = 5
-    mock_iscoroutine.return_value = False
-    with pytest.raises(TypeError):
-        hasync.run_coroutine_threadsafe(coro, loop)
-    assert len(loop.call_soon_threadsafe.mock_calls) == 1
-
-    loop._thread_ident = 1
-    mock_ident.return_value = 5
-    mock_iscoroutine.return_value = True
-    hasync.run_coroutine_threadsafe(coro, loop)
-    assert len(loop.call_soon_threadsafe.mock_calls) == 2
-
-
-@patch('asyncio.coroutines.iscoroutine')
-@patch('concurrent.futures.Future')
-@patch('threading.get_ident')
-def test_fire_coroutine_threadsafe_from_inside_event_loop(
-        mock_ident, _, mock_iscoroutine):
-    """Testing calling fire_coroutine_threadsafe from inside an event loop."""
-    coro = MagicMock()
-    loop = MagicMock()
-
-    loop._thread_ident = None
-    mock_ident.return_value = 5
-    mock_iscoroutine.return_value = True
-    hasync.fire_coroutine_threadsafe(coro, loop)
-    assert len(loop.call_soon_threadsafe.mock_calls) == 1
-
-    loop._thread_ident = 5
-    mock_ident.return_value = 5
-    mock_iscoroutine.return_value = True
-    with pytest.raises(RuntimeError):
-        hasync.fire_coroutine_threadsafe(coro, loop)
-    assert len(loop.call_soon_threadsafe.mock_calls) == 1
-
-    loop._thread_ident = 1
-    mock_ident.return_value = 5
-    mock_iscoroutine.return_value = False
-    with pytest.raises(TypeError):
-        hasync.fire_coroutine_threadsafe(coro, loop)
-    assert len(loop.call_soon_threadsafe.mock_calls) == 1
-
-    loop._thread_ident = 1
-    mock_ident.return_value = 5
-    mock_iscoroutine.return_value = True
-    hasync.fire_coroutine_threadsafe(coro, loop)
-    assert len(loop.call_soon_threadsafe.mock_calls) == 2
-
-
-@patch('concurrent.futures.Future')
-@patch('threading.get_ident')
-def test_run_callback_threadsafe_from_inside_event_loop(mock_ident, _):
+@patch("concurrent.futures.Future")
+@patch("threading.get_ident")
+def test_run_callback_threadsafe_from_inside_event_loop(
+    mock_ident: MagicMock, mock_future: MagicMock
+) -> None:
     """Testing calling run_callback_threadsafe from inside an event loop."""
     callback = MagicMock()
-    loop = MagicMock()
 
-    loop._thread_ident = None
+    loop = Mock(spec=["call_soon_threadsafe"])
+
+    loop._thread_id = None
     mock_ident.return_value = 5
     hasync.run_callback_threadsafe(loop, callback)
     assert len(loop.call_soon_threadsafe.mock_calls) == 1
 
-    loop._thread_ident = 5
+    loop._thread_id = 5
     mock_ident.return_value = 5
     with pytest.raises(RuntimeError):
         hasync.run_callback_threadsafe(loop, callback)
     assert len(loop.call_soon_threadsafe.mock_calls) == 1
 
-    loop._thread_ident = 1
+    loop._thread_id = 1
     mock_ident.return_value = 5
     hasync.run_callback_threadsafe(loop, callback)
     assert len(loop.call_soon_threadsafe.mock_calls) == 2
 
 
-class RunThreadsafeTests(TestCase):
-    """Test case for hasync.run_coroutine_threadsafe."""
+async def test_gather_with_limited_concurrency() -> None:
+    """Test gather_with_limited_concurrency limits the number of running tasks."""
 
-    def setUp(self):
-        """Test setup method."""
-        self.loop = asyncio.new_event_loop()
+    runs = 0
+    now_time = time.time()
 
-    def tearDown(self):
-        """Test teardown method."""
-        executor = self.loop._default_executor
-        if executor is not None:
-            executor.shutdown(wait=True)
-        self.loop.close()
+    async def _increment_runs_if_in_time():
+        if time.time() - now_time > 0.1:
+            return -1
 
-    @staticmethod
-    def run_briefly(loop):
-        """Momentarily run a coroutine on the given loop."""
-        @asyncio.coroutine
-        def once():
-            pass
-        gen = once()
-        t = loop.create_task(gen)
-        try:
-            loop.run_until_complete(t)
-        finally:
-            gen.close()
+        nonlocal runs
+        runs += 1
+        await asyncio.sleep(0.1)
+        return runs
 
-    def add_callback(self, a, b, fail, invalid):
-        """Return a + b."""
-        if fail:
-            raise RuntimeError("Fail!")
-        if invalid:
-            raise ValueError("Invalid!")
-        return a + b
+    results = await hasync.gather_with_limited_concurrency(
+        2, *(_increment_runs_if_in_time() for i in range(4))
+    )
 
-    @asyncio.coroutine
-    def add_coroutine(self, a, b, fail, invalid, cancel):
-        """Wait 0.05 second and return a + b."""
-        yield from asyncio.sleep(0.05, loop=self.loop)
-        if cancel:
-            asyncio.tasks.Task.current_task(self.loop).cancel()
-            yield
-        return self.add_callback(a, b, fail, invalid)
+    assert results == [2, 2, -1, -1]
 
-    def target_callback(self, fail=False, invalid=False):
-        """Run add callback in the event loop."""
-        future = hasync.run_callback_threadsafe(
-            self.loop, self.add_callback, 1, 2, fail, invalid)
-        try:
-            return future.result()
-        finally:
-            future.done() or future.cancel()
 
-    def target_coroutine(self, fail=False, invalid=False, cancel=False,
-                         timeout=None, advance_coro=False):
-        """Run add coroutine in the event loop."""
-        coro = self.add_coroutine(1, 2, fail, invalid, cancel)
-        future = hasync.run_coroutine_threadsafe(coro, self.loop)
-        if advance_coro:
-            # this is for test_run_coroutine_threadsafe_task_factory_exception;
-            # otherwise it spills errors and breaks **other** unittests, since
-            # 'target_coroutine' is interacting with threads.
+async def test_wait_shared_future_result() -> None:
+    """Test wait_shared_future returns the result of a pending or done future."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[int] = loop.create_future()
+    loop.call_soon(future.set_result, 42)
 
-            # With this call, `coro` will be advanced, so that
-            # CoroWrapper.__del__ won't do anything when asyncio tests run
-            # in debug mode.
-            self.loop.call_soon_threadsafe(coro.send, None)
-        try:
-            return future.result(timeout)
-        finally:
-            future.done() or future.cancel()
+    assert await hasync.wait_shared_future(future) == 42
+    assert await hasync.wait_shared_future(future) == 42
 
-    def test_run_coroutine_threadsafe(self):
-        """Test coroutine submission from a thread to an event loop."""
-        future = self.loop.run_in_executor(None, self.target_coroutine)
-        result = self.loop.run_until_complete(future)
-        self.assertEqual(result, 3)
 
-    def test_run_coroutine_threadsafe_with_exception(self):
-        """Test coroutine submission from thread to event loop on exception."""
-        future = self.loop.run_in_executor(None, self.target_coroutine, True)
-        with self.assertRaises(RuntimeError) as exc_context:
-            self.loop.run_until_complete(future)
-        self.assertIn("Fail!", exc_context.exception.args)
+async def test_wait_shared_future_exception() -> None:
+    """Test wait_shared_future raises the exception of the future."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[int] = loop.create_future()
+    loop.call_soon(future.set_exception, ValueError("boom"))
 
-    def test_run_coroutine_threadsafe_with_invalid(self):
-        """Test coroutine submission from thread to event loop on invalid."""
-        callback = lambda: self.target_coroutine(invalid=True)  # noqa
-        future = self.loop.run_in_executor(None, callback)
-        with self.assertRaises(ValueError) as exc_context:
-            self.loop.run_until_complete(future)
-        self.assertIn("Invalid!", exc_context.exception.args)
+    with pytest.raises(ValueError, match="boom"):
+        await hasync.wait_shared_future(future)
 
-    def test_run_coroutine_threadsafe_with_timeout(self):
-        """Test coroutine submission from thread to event loop on timeout."""
-        callback = lambda: self.target_coroutine(timeout=0)  # noqa
-        future = self.loop.run_in_executor(None, callback)
-        with self.assertRaises(asyncio.TimeoutError):
-            self.loop.run_until_complete(future)
-        self.run_briefly(self.loop)
-        # Check that there's no pending task (add has been cancelled)
-        for task in asyncio.Task.all_tasks(self.loop):
-            self.assertTrue(task.done())
 
-    def test_run_coroutine_threadsafe_task_cancelled(self):
-        """Test coroutine submission from tread to event loop on cancel."""
-        callback = lambda: self.target_coroutine(cancel=True)  # noqa
-        future = self.loop.run_in_executor(None, callback)
-        with self.assertRaises(asyncio.CancelledError):
-            self.loop.run_until_complete(future)
+async def test_wait_shared_future_waiter_cancelled() -> None:
+    """Test cancelling a waiter leaves the shared future intact and logs nothing."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[int] = loop.create_future()
+    exception_handler = Mock()
+    loop.set_exception_handler(exception_handler)
 
-    def test_run_callback_threadsafe(self):
-        """Test callback submission from a thread to an event loop."""
-        future = self.loop.run_in_executor(None, self.target_callback)
-        result = self.loop.run_until_complete(future)
-        self.assertEqual(result, 3)
+    waiter = asyncio.create_task(hasync.wait_shared_future(future))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
 
-    def test_run_callback_threadsafe_with_exception(self):
-        """Test callback submission from thread to event loop on exception."""
-        future = self.loop.run_in_executor(None, self.target_callback, True)
-        with self.assertRaises(RuntimeError) as exc_context:
-            self.loop.run_until_complete(future)
-        self.assertIn("Fail!", exc_context.exception.args)
+    assert not future.cancelled()
+    future.set_exception(ValueError("boom"))
+    with pytest.raises(ValueError, match="boom"):
+        future.result()
+    await asyncio.sleep(0)
 
-    def test_run_callback_threadsafe_with_invalid(self):
-        """Test callback submission from thread to event loop on invalid."""
-        callback = lambda: self.target_callback(invalid=True)  # noqa
-        future = self.loop.run_in_executor(None, callback)
-        with self.assertRaises(ValueError) as exc_context:
-            self.loop.run_until_complete(future)
-        self.assertIn("Invalid!", exc_context.exception.args)
+    # asyncio.shield would report "exception in shielded future" here
+    exception_handler.assert_not_called()
+
+
+async def test_shutdown_run_callback_threadsafe(hass: HomeAssistant) -> None:
+    """Test we can shutdown run_callback_threadsafe."""
+    hasync.shutdown_run_callback_threadsafe(hass.loop)
+    callback = MagicMock()
+
+    with pytest.raises(RuntimeError):
+        hasync.run_callback_threadsafe(hass.loop, callback)
+
+
+async def test_run_callback_threadsafe(hass: HomeAssistant) -> None:
+    """Test run_callback_threadsafe runs code in the event loop."""
+    it_ran = False
+
+    def callback():
+        nonlocal it_ran
+        it_ran = True
+
+    with patch.dict(hass.loop.__dict__, {"_thread_id": -1}):
+        assert hasync.run_callback_threadsafe(hass.loop, callback)
+    assert it_ran is False
+
+    # Verify that async_block_till_done will flush
+    # out the callback
+    await hass.async_block_till_done()
+    assert it_ran is True
+
+
+async def test_callback_is_always_scheduled(hass: HomeAssistant) -> None:
+    """Test run_callback_threadsafe always calls call_soon_threadsafe.
+
+    Checks that it is called before checking for shutdown.
+    """
+    # We have to check the shutdown state AFTER the callback is scheduled otherwise
+    # the function could continue on and the caller call `future.result()` after
+    # the point in the main thread where callbacks are no longer run.
+
+    callback = MagicMock()
+    hasync.shutdown_run_callback_threadsafe(hass.loop)
+
+    with (
+        patch.dict(hass.loop.__dict__, {"_thread_id": -1}),
+        patch.object(hass.loop, "call_soon_threadsafe") as mock_call_soon_threadsafe,
+        pytest.raises(RuntimeError),
+    ):
+        hasync.run_callback_threadsafe(hass.loop, callback)
+
+    mock_call_soon_threadsafe.assert_called_once()
+
+
+async def test_create_eager_task_312(hass: HomeAssistant) -> None:
+    """Test create_eager_task schedules a task eagerly in the event loop.
+
+    For Python 3.12+, the task is scheduled eagerly in the event loop.
+    """
+    events = []
+
+    async def _normal_task():
+        events.append("normal")
+
+    async def _eager_task():
+        events.append("eager")
+
+    task1 = hasync.create_eager_task(_eager_task())
+    task2 = asyncio.create_task(_normal_task())
+
+    assert events == ["eager"]
+
+    await asyncio.sleep(0)
+    assert events == ["eager", "normal"]
+    await task1
+    await task2
+
+
+async def test_create_eager_task_from_thread(hass: HomeAssistant) -> None:
+    """Test we report trying to create an eager task from a thread."""
+
+    coro = asyncio.sleep(0)
+
+    def create_task():
+        hasync.create_eager_task(coro)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "Detected code that attempted to create an asyncio"
+            " task from a thread. Please report this issue"
+        ),
+    ):
+        await hass.async_add_executor_job(create_task)
+
+    # Avoid `RuntimeWarning: coroutine 'sleep' was never awaited`
+    await coro
+
+
+async def test_create_eager_task_from_thread_in_integration(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test we report trying to create an eager task from a thread."""
+
+    coro = asyncio.sleep(0)
+
+    def create_task():
+        hasync.create_eager_task(coro)
+
+    frames = extract_stack_to_frame(
+        [
+            Mock(
+                filename="/home/paulus/homeassistant/core.py",
+                lineno="23",
+                line="do_something()",
+            ),
+            Mock(
+                filename="/home/paulus/homeassistant/components/hue/light.py",
+                lineno="23",
+                line="self.light.is_on",
+            ),
+            Mock(
+                filename="/home/paulus/aiohue/lights.py",
+                lineno="2",
+                line="something()",
+            ),
+        ]
+    )
+    with (
+        pytest.raises(RuntimeError, match="no running event loop"),
+        patch(
+            "homeassistant.helpers.frame.linecache.getline",
+            return_value="self.light.is_on",
+        ),
+        patch(
+            "homeassistant.util.loop._get_line_from_cache",
+            return_value="mock_line",
+        ),
+        patch(
+            "homeassistant.util.loop.get_current_frame",
+            return_value=frames,
+        ),
+        patch(
+            "homeassistant.helpers.frame.get_current_frame",
+            return_value=frames,
+        ),
+    ):
+        await hass.async_add_executor_job(create_task)
+
+    assert (
+        "Detected that integration 'hue' attempted to create an asyncio task "
+        "from a thread at homeassistant/components/hue/light.py, line 23: "
+        "self.light.is_on"
+    ) in caplog.text
+
+    # Avoid `RuntimeWarning: coroutine 'sleep' was never awaited`
+    await coro
+
+
+async def test_get_scheduled_timer_handles(hass: HomeAssistant) -> None:
+    """Test get_scheduled_timer_handles returns all scheduled timer handles."""
+    loop = hass.loop
+    timer_handle = loop.call_later(10, lambda: None)
+    timer_handle2 = loop.call_later(5, lambda: None)
+    timer_handle3 = loop.call_later(15, lambda: None)
+
+    handles = hasync.get_scheduled_timer_handles(loop)
+    assert set(handles).issuperset({timer_handle, timer_handle2, timer_handle3})
+    timer_handle.cancel()
+    timer_handle2.cancel()
+    timer_handle3.cancel()

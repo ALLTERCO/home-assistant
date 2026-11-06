@@ -1,161 +1,145 @@
-"""
-Support for Blink Home Camera System.
+"""Support for Blink Home Camera System."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/blink/
-"""
+from copy import deepcopy
 import logging
-from datetime import timedelta
-import voluptuous as vol
+from typing import Any
 
-from homeassistant.helpers import (
-    config_validation as cv, discovery)
-from homeassistant.const import (
-    CONF_USERNAME, CONF_PASSWORD, CONF_NAME, CONF_SCAN_INTERVAL,
-    CONF_BINARY_SENSORS, CONF_SENSORS, CONF_FILENAME,
-    CONF_MONITORED_CONDITIONS, TEMP_FAHRENHEIT)
+from blinkpy.auth import Auth
+from blinkpy.blinkpy import Blink
 
-REQUIREMENTS = ['blinkpy==0.9.0']
+from homeassistant.components import persistent_notification
+from homeassistant.const import CONF_SCAN_INTERVAL
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.typing import ConfigType
+
+from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, LEGACY_HARDWARE_ID, PLATFORMS
+from .coordinator import BlinkConfigEntry, BlinkUpdateCoordinator
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = 'blink'
-BLINK_DATA = 'blink'
 
-CONF_CAMERA = 'camera'
-CONF_ALARM_CONTROL_PANEL = 'alarm_control_panel'
-
-DEFAULT_BRAND = 'Blink'
-DEFAULT_ATTRIBUTION = "Data provided by immedia-semi.com"
-SIGNAL_UPDATE_BLINK = "blink_update"
-
-DEFAULT_SCAN_INTERVAL = timedelta(seconds=60)
-
-TYPE_CAMERA_ARMED = 'motion_enabled'
-TYPE_MOTION_DETECTED = 'motion_detected'
-TYPE_TEMPERATURE = 'temperature'
-TYPE_BATTERY = 'battery'
-TYPE_WIFI_STRENGTH = 'wifi_strength'
-TYPE_STATUS = 'status'
-
-SERVICE_REFRESH = 'blink_update'
-SERVICE_TRIGGER = 'trigger_camera'
-SERVICE_SAVE_VIDEO = 'save_video'
-
-BINARY_SENSORS = {
-    TYPE_CAMERA_ARMED: ['Camera Armed', 'mdi:verified'],
-    TYPE_MOTION_DETECTED: ['Motion Detected', 'mdi:run-fast'],
-}
-
-SENSORS = {
-    TYPE_TEMPERATURE: ['Temperature', TEMP_FAHRENHEIT, 'mdi:thermometer'],
-    TYPE_BATTERY: ['Battery', '%', 'mdi:battery-80'],
-    TYPE_WIFI_STRENGTH: ['Wifi Signal', 'dBm', 'mdi:wifi-strength-2'],
-    TYPE_STATUS: ['Status', '', 'mdi:bell']
-}
-
-BINARY_SENSOR_SCHEMA = vol.Schema({
-    vol.Optional(CONF_MONITORED_CONDITIONS, default=list(BINARY_SENSORS)):
-        vol.All(cv.ensure_list, [vol.In(BINARY_SENSORS)])
-})
-
-SENSOR_SCHEMA = vol.Schema({
-    vol.Optional(CONF_MONITORED_CONDITIONS, default=list(SENSORS)):
-        vol.All(cv.ensure_list, [vol.In(SENSORS)])
-})
-
-SERVICE_TRIGGER_SCHEMA = vol.Schema({
-    vol.Required(CONF_NAME): cv.string
-})
-
-SERVICE_SAVE_VIDEO_SCHEMA = vol.Schema({
-    vol.Required(CONF_NAME): cv.string,
-    vol.Required(CONF_FILENAME): cv.string,
-})
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN:
-        vol.Schema({
-            vol.Required(CONF_USERNAME): cv.string,
-            vol.Required(CONF_PASSWORD): cv.string,
-            vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL):
-                cv.time_period,
-            vol.Optional(CONF_BINARY_SENSORS, default={}):
-                BINARY_SENSOR_SCHEMA,
-            vol.Optional(CONF_SENSORS, default={}): SENSOR_SCHEMA,
-        })
-    },
-    extra=vol.ALLOW_EXTRA)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
-def setup(hass, config):
-    """Set up Blink System."""
-    from blinkpy import blinkpy
-    conf = config[BLINK_DATA]
-    username = conf[CONF_USERNAME]
-    password = conf[CONF_PASSWORD]
-    scan_interval = conf[CONF_SCAN_INTERVAL]
-    hass.data[BLINK_DATA] = blinkpy.Blink(username=username,
-                                          password=password)
-    hass.data[BLINK_DATA].refresh_rate = scan_interval.total_seconds()
-    hass.data[BLINK_DATA].start()
+async def _reauth_flow_wrapper(
+    hass: HomeAssistant, entry: BlinkConfigEntry, data: dict[str, Any]
+) -> None:
+    """Reauth flow wrapper."""
+    entry.async_start_reauth(hass, data=data)
+    persistent_notification.async_create(
+        hass,
+        (
+            "Blink configuration migrated to a new version. Please go to the"
+            " integrations page to re-configure (such as sending a new 2FA key)."
+        ),
+        "Blink Migration",
+    )
 
-    platforms = [
-        ('alarm_control_panel', {}),
-        ('binary_sensor', conf[CONF_BINARY_SENSORS]),
-        ('camera', {}),
-        ('sensor', conf[CONF_SENSORS]),
-    ]
 
-    for component, schema in platforms:
-        discovery.load_platform(hass, component, DOMAIN, schema, config)
+async def async_migrate_entry(hass: HomeAssistant, entry: BlinkConfigEntry) -> None:
+    """Handle migration of a previous version config entry."""
+    _LOGGER.debug("Migrating from version %s", entry.version)
+    data = {**entry.data}
+    if entry.version == 1:
+        data.pop("login_response", None)
+        await _reauth_flow_wrapper(hass, entry, data)
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="migration_reauth_required",
+            translation_placeholders={"version": str(entry.version)},
+        )
+    if entry.version == 2:
+        await _reauth_flow_wrapper(hass, entry, data)
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="migration_reauth_required",
+            translation_placeholders={"version": str(entry.version)},
+        )
+    version = entry.version
+    if version == 3:
+        # Migrate device_id to hardware_id for blinkpy 0.25.x OAuth2 compatibility
+        if "device_id" in data:
+            data["hardware_id"] = data.pop("device_id")
+        version = 4
+    if version == 4:
+        # Blink's OAuth endpoint rejects LEGACY_HARDWARE_ID; drop it so blinkpy
+        # mints a fresh per-install UUID on next setup.
+        if data.get("hardware_id") == LEGACY_HARDWARE_ID:
+            data.pop("hardware_id", None)
+        version = 5
 
-    def trigger_camera(call):
-        """Trigger a camera."""
-        cameras = hass.data[BLINK_DATA].sync.cameras
-        name = call.data[CONF_NAME]
-        if name in cameras:
-            cameras[name].snap_picture()
-        hass.data[BLINK_DATA].refresh(force_cache=True)
+    if version != entry.version or data != dict(entry.data):
+        hass.config_entries.async_update_entry(entry, data=data, version=version)
 
-    def blink_refresh(event_time):
-        """Call blink to refresh info."""
-        hass.data[BLINK_DATA].refresh(force_cache=True)
 
-    async def async_save_video(call):
-        """Call save video service handler."""
-        await async_handle_save_video_service(hass, call)
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up Blink."""
 
-    hass.services.register(DOMAIN, SERVICE_REFRESH, blink_refresh)
-    hass.services.register(DOMAIN,
-                           SERVICE_TRIGGER,
-                           trigger_camera,
-                           schema=SERVICE_TRIGGER_SCHEMA)
-    hass.services.register(DOMAIN,
-                           SERVICE_SAVE_VIDEO,
-                           async_save_video,
-                           schema=SERVICE_SAVE_VIDEO_SCHEMA)
+    async_setup_services(hass)
+
     return True
 
 
-async def async_handle_save_video_service(hass, call):
-    """Handle save video service calls."""
-    camera_name = call.data[CONF_NAME]
-    video_path = call.data[CONF_FILENAME]
-    if not hass.config.is_allowed_path(video_path):
-        _LOGGER.error(
-            "Can't write %s, no access to path!", video_path)
-        return
+async def async_setup_entry(hass: HomeAssistant, entry: BlinkConfigEntry) -> None:
+    """Set up Blink via config entry."""
+    _async_import_options_from_data_if_missing(hass, entry)
+    session = async_get_clientsession(hass)
+    blink = Blink(session=session)
+    auth_data = deepcopy(dict(entry.data))
+    blink.auth = Auth(
+        auth_data,
+        no_prompt=True,
+        session=session,
+        callback=lambda: _async_update_entry_data(hass, entry, blink),
+    )
+    blink.refresh_rate = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+    coordinator = BlinkUpdateCoordinator(hass, entry, blink)
 
-    def _write_video(camera_name, video_path):
-        """Call video write."""
-        all_cameras = hass.data[BLINK_DATA].sync.cameras
-        if camera_name in all_cameras:
-            all_cameras[camera_name].video_to_file(video_path)
+    await coordinator.async_config_entry_first_refresh()
 
-    try:
-        await hass.async_add_executor_job(
-            _write_video, camera_name, video_path)
-    except OSError as err:
-        _LOGGER.error("Can't write image to file: %s", err)
+    entry.runtime_data = coordinator
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+@callback
+def _async_update_entry_data(
+    hass: HomeAssistant, entry: BlinkConfigEntry, blink: Blink
+) -> None:
+    """Update the config entry data after token refresh."""
+    hass.config_entries.async_update_entry(entry, data=blink.auth.login_attributes)
+
+
+@callback
+def _async_import_options_from_data_if_missing(
+    hass: HomeAssistant, entry: BlinkConfigEntry
+) -> None:
+    options = dict(entry.options)
+    if CONF_SCAN_INTERVAL not in entry.options:
+        options[CONF_SCAN_INTERVAL] = entry.data.get(
+            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+        )
+        hass.config_entries.async_update_entry(entry, options=options)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: BlinkConfigEntry) -> None:
+    """Unload Blink entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: BlinkConfigEntry, device_entry: dr.AnyDeviceEntry
+) -> bool:
+    """Allow removal of a device that is no longer on the Blink account."""
+    blink = entry.runtime_data.api
+    serials = {camera.serial for camera in blink.cameras.values()} | {
+        sync_module.serial for sync_module in blink.sync.values()
+    }
+    return not any(
+        identifier[0] == DOMAIN and identifier[1] in serials
+        for identifier in device_entry.identifiers
+    )

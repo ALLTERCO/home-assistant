@@ -1,0 +1,21 @@
+{
+  "domain": "goalzero",
+  "name": "Goal Zero Yeti",
+  "categories": ["energy.backup_power"],
+  "codeowners": ["@tkdrob"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dhcp": [
+    {
+      "registered_devices": true
+    },
+    {
+      "hostname": "yeti*"
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/goalzero",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["goalzero"],
+  "requirements": ["goalzero==0.2.2"]
+}

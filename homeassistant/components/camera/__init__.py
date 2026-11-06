@@ -1,380 +1,326 @@
-"""
-Component to interface with cameras.
+"""Component to interface with cameras."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/camera/
-"""
 import asyncio
-import base64
-import collections
 from contextlib import suppress
-from datetime import timedelta
+from dataclasses import asdict
+from datetime import datetime, timedelta
 import logging
-import hashlib
-from random import SystemRandom
+from typing import Any, Final, override
 
+from aiohttp import hdrs, web
 import attr
-from aiohttp import web
-import async_timeout
-import voluptuous as vol
+import probatio
 
-from homeassistant.core import callback
-from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, \
-    SERVICE_TURN_ON
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.loader import bind_hass
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.helpers.config_validation import PLATFORM_SCHEMA  # noqa
-from homeassistant.components.http import HomeAssistantView, KEY_AUTHENTICATED
 from homeassistant.components import websocket_api
-import homeassistant.helpers.config_validation as cv
+from homeassistant.components.http import KEY_AUTHENTICATED, HomeAssistantView
+from homeassistant.components.stream import OUTPUT_FORMATS, Orientation
+from homeassistant.components.websocket_api import ActiveConnection
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    CONF_FILENAME,
+    EVENT_HOMEASSISTANT_STARTED,
+    EVENT_HOMEASSISTANT_STOP,
+    SERVICE_TURN_OFF,
+    SERVICE_TURN_ON,
+)
+from homeassistant.core import (
+    DOMAIN as HOMEASSISTANT_DOMAIN,
+    Event,
+    HomeAssistant,
+    callback,
+)
+from homeassistant.exceptions import ConfigEntryError, HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_component import EntityComponent
+from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.typing import ConfigType
 
-DOMAIN = 'camera'
-DEPENDENCIES = ['http']
+from .const import (
+    ATTR_FILENAME,
+    ATTR_FORMAT,
+    ATTR_MEDIA_PLAYER,
+    CAMERA_IMAGE_TIMEOUT,
+    CONF_DURATION,
+    CONF_LOOKBACK,
+    DATA_CAMERA_PREFS,
+    DATA_COMPONENT,
+    DEFAULT_CONTENT_TYPE,
+    DOMAIN,
+    MIN_STREAM_INTERVAL,
+    PREF_ORIENTATION,
+    PREF_PRELOAD_STREAM,
+    SERVICE_DISABLE_MOTION,
+    SERVICE_ENABLE_MOTION,
+    SERVICE_PLAY_STREAM,
+    SERVICE_RECORD,
+    SERVICE_SNAPSHOT,
+    CameraEntityFeature,
+    CameraEntityStateAttribute,
+    CameraService,
+    CameraServiceArgument,
+    CameraState,
+    StreamType,
+)
+from .entity import (
+    Camera,
+    CameraCapabilities,
+    CameraEntityCapabilities,
+    CameraEntityDescription,
+    async_get_still_stream,
+)
+from .helper import (
+    async_get_stream_image,
+    async_stream_endpoint_url,
+    get_camera_from_entity_id,
+)
+from .img_util import TurboJPEGSingleton, scale_jpeg_camera_image
+from .prefs import (
+    CameraPreferences,
+    DynamicStreamSettings,
+    get_dynamic_camera_stream_settings,
+)
+from .services import async_setup_services
+from .webrtc import (
+    CameraWebRTCProvider,
+    WebRTCAnswer,
+    WebRTCCandidate,
+    WebRTCClientConfiguration,
+    WebRTCError,
+    WebRTCMessage,
+    WebRTCSendMessage,
+    async_call_webrtc_provider,
+    async_register_webrtc_provider,
+    async_register_ws,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-SERVICE_ENABLE_MOTION = 'enable_motion_detection'
-SERVICE_DISABLE_MOTION = 'disable_motion_detection'
-SERVICE_SNAPSHOT = 'snapshot'
 
-SCAN_INTERVAL = timedelta(seconds=30)
-ENTITY_ID_FORMAT = DOMAIN + '.{}'
+ENTITY_ID_FORMAT: Final = DOMAIN + ".{}"
+PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA
+PLATFORM_SCHEMA_BASE = cv.PLATFORM_SCHEMA_BASE
+SCAN_INTERVAL: Final = timedelta(seconds=30)
 
-ATTR_FILENAME = 'filename'
 
-STATE_RECORDING = 'recording'
-STATE_STREAMING = 'streaming'
-STATE_IDLE = 'idle'
+TOKEN_CHANGE_INTERVAL: Final = timedelta(minutes=5)
 
-# Bitfield of features supported by the camera entity
-SUPPORT_ON_OFF = 1
 
-DEFAULT_CONTENT_TYPE = 'image/jpeg'
-ENTITY_IMAGE_URL = '/api/camera_proxy/{0}?token={1}'
-
-TOKEN_CHANGE_INTERVAL = timedelta(minutes=5)
-_RND = SystemRandom()
-
-FALLBACK_STREAM_INTERVAL = 1  # seconds
-MIN_STREAM_INTERVAL = 0.5  # seconds
-
-CAMERA_SERVICE_SCHEMA = vol.Schema({
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-})
-
-CAMERA_SERVICE_SNAPSHOT = CAMERA_SERVICE_SCHEMA.extend({
-    vol.Required(ATTR_FILENAME): cv.template
-})
-
-WS_TYPE_CAMERA_THUMBNAIL = 'camera_thumbnail'
-SCHEMA_WS_CAMERA_THUMBNAIL = websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend({
-    vol.Required('type'): WS_TYPE_CAMERA_THUMBNAIL,
-    vol.Required('entity_id'): cv.entity_id
-})
+__all__ = [
+    "ATTR_FILENAME",
+    "ATTR_FORMAT",
+    "ATTR_MEDIA_PLAYER",
+    "CAMERA_IMAGE_TIMEOUT",
+    "CONF_DURATION",
+    "CONF_FILENAME",
+    "CONF_LOOKBACK",
+    "DEFAULT_CONTENT_TYPE",
+    "DOMAIN",
+    "ENTITY_ID_FORMAT",
+    "PLATFORM_SCHEMA",
+    "PLATFORM_SCHEMA_BASE",
+    "SERVICE_DISABLE_MOTION",
+    "SERVICE_ENABLE_MOTION",
+    "SERVICE_PLAY_STREAM",
+    "SERVICE_RECORD",
+    "SERVICE_SNAPSHOT",
+    "SERVICE_TURN_OFF",
+    "SERVICE_TURN_ON",
+    "TOKEN_CHANGE_INTERVAL",
+    "Camera",
+    "CameraCapabilities",
+    "CameraEntityCapabilities",
+    "CameraEntityDescription",
+    "CameraEntityFeature",
+    "CameraEntityStateAttribute",
+    "CameraImageView",
+    "CameraService",
+    "CameraServiceArgument",
+    "CameraState",
+    "CameraView",
+    "CameraWebRTCProvider",
+    "DynamicStreamSettings",
+    "Image",
+    "StreamType",
+    "TurboJPEGSingleton",
+    "WebRTCAnswer",
+    "WebRTCCandidate",
+    "WebRTCClientConfiguration",
+    "WebRTCError",
+    "WebRTCMessage",
+    "WebRTCSendMessage",
+    "async_get_image",
+    "async_get_mjpeg_stream",
+    "async_get_still_stream",
+    "async_get_stream_source",
+    "async_register_webrtc_provider",
+    "async_request_stream",
+    "get_camera_from_entity_id",
+    "get_dynamic_camera_stream_settings",
+]
 
 
 @attr.s
 class Image:
     """Represent an image."""
 
-    content_type = attr.ib(type=str)
-    content = attr.ib(type=bytes)
+    content_type: str = attr.ib()
+    content: bytes = attr.ib()
 
 
-@bind_hass
-async def async_get_image(hass, entity_id, timeout=10):
-    """Fetch an image from a camera entity."""
-    camera = _get_camera_from_entity_id(hass, entity_id)
-
-    with suppress(asyncio.CancelledError, asyncio.TimeoutError):
-        with async_timeout.timeout(timeout, loop=hass.loop):
-            image = await camera.async_camera_image()
-
-            if image:
-                return Image(camera.content_type, image)
-
-    raise HomeAssistantError('Unable to get image')
+async def async_request_stream(hass: HomeAssistant, entity_id: str, fmt: str) -> str:
+    """Request a stream for a camera entity."""
+    camera = get_camera_from_entity_id(hass, entity_id)
+    return await async_stream_endpoint_url(hass, camera, fmt)
 
 
-@bind_hass
-async def async_get_mjpeg_stream(hass, request, entity_id):
-    """Fetch an mjpeg stream from a camera entity."""
-    camera = _get_camera_from_entity_id(hass, entity_id)
+async def _async_get_image(
+    camera: Camera,
+    timeout: int = 10,
+    width: int | None = None,
+    height: int | None = None,
+) -> Image:
+    """Fetch a snapshot image from a camera.
 
-    return await camera.handle_async_mjpeg_stream(request)
-
-
-async def async_get_still_stream(request, image_cb, content_type, interval):
-    """Generate an HTTP MJPEG stream from camera images.
-
-    This method must be run in the event loop.
+    If width and height are passed, an attempt to scale
+    the image will be made on a best effort basis.
+    Not all cameras can scale images or return jpegs
+    that we can scale, however the majority of cases
+    are handled.
     """
-    response = web.StreamResponse()
-    response.content_type = ('multipart/x-mixed-replace; '
-                             'boundary=--frameboundary')
-    await response.prepare(request)
+    with suppress(TimeoutError):
+        async with asyncio.timeout(timeout):
+            image_bytes = (
+                await async_get_stream_image(
+                    camera, width=width, height=height, wait_for_next_keyframe=False
+                )
+                if camera.use_stream_for_stills
+                else await camera.async_camera_image(width=width, height=height)
+            )
+            if image_bytes:
+                content_type = camera.content_type
+                image = Image(content_type, image_bytes)
+                if (
+                    width is not None
+                    and height is not None
+                    and ("jpeg" in content_type or "jpg" in content_type)
+                ):
+                    assert width is not None
+                    assert height is not None
+                    return Image(
+                        content_type, scale_jpeg_camera_image(image, width, height)
+                    )
 
-    async def write_to_mjpeg_stream(img_bytes):
-        """Write image to stream."""
-        await response.write(bytes(
-            '--frameboundary\r\n'
-            'Content-Type: {}\r\n'
-            'Content-Length: {}\r\n\r\n'.format(
-                content_type, len(img_bytes)),
-            'utf-8') + img_bytes + b'\r\n')
+                return image
 
-    last_image = None
-
-    while True:
-        img_bytes = await image_cb()
-        if not img_bytes:
-            break
-
-        if img_bytes != last_image:
-            await write_to_mjpeg_stream(img_bytes)
-
-            # Chrome seems to always ignore first picture,
-            # print it twice.
-            if last_image is None:
-                await write_to_mjpeg_stream(img_bytes)
-            last_image = img_bytes
-
-        await asyncio.sleep(interval)
-
-    return response
+    raise HomeAssistantError("Unable to get image")
 
 
-def _get_camera_from_entity_id(hass, entity_id):
-    """Get camera component from entity_id."""
-    component = hass.data.get(DOMAIN)
+async def async_get_image(
+    hass: HomeAssistant,
+    entity_id: str,
+    timeout: int = 10,
+    width: int | None = None,
+    height: int | None = None,
+) -> Image:
+    """Fetch an image from a camera entity.
 
-    if component is None:
-        raise HomeAssistantError('Camera component not set up')
-
-    camera = component.get_entity(entity_id)
-
-    if camera is None:
-        raise HomeAssistantError('Camera not found')
-
-    if not camera.is_on:
-        raise HomeAssistantError('Camera is off')
-
-    return camera
+    width and height will be passed to the underlying camera.
+    """
+    camera = get_camera_from_entity_id(hass, entity_id)
+    return await _async_get_image(camera, timeout, width, height)
 
 
-async def async_setup(hass, config):
+async def async_get_stream_source(hass: HomeAssistant, entity_id: str) -> str | None:
+    """Fetch the stream source for a camera entity."""
+    camera = get_camera_from_entity_id(hass, entity_id)
+    return await camera.stream_source()
+
+
+async def async_get_mjpeg_stream(
+    hass: HomeAssistant, request: web.Request, entity_id: str
+) -> web.StreamResponse | None:
+    """Fetch an mjpeg stream from a camera entity."""
+    camera = get_camera_from_entity_id(hass, entity_id)
+
+    try:
+        stream = await camera.handle_async_mjpeg_stream(request)
+    except ConnectionResetError:
+        stream = None
+        _LOGGER.debug("Error while writing MJPEG stream to transport")
+    return stream
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the camera component."""
-    component = hass.data[DOMAIN] = \
-        EntityComponent(_LOGGER, DOMAIN, hass, SCAN_INTERVAL)
+    component = hass.data[DATA_COMPONENT] = EntityComponent[Camera](
+        _LOGGER, DOMAIN, hass, SCAN_INTERVAL
+    )
+
+    prefs = CameraPreferences(hass)
+    await prefs.async_load()
+    hass.data[DATA_CAMERA_PREFS] = prefs
 
     hass.http.register_view(CameraImageView(component))
     hass.http.register_view(CameraMjpegStream(component))
-    hass.components.websocket_api.async_register_command(
-        WS_TYPE_CAMERA_THUMBNAIL, websocket_camera_thumbnail,
-        SCHEMA_WS_CAMERA_THUMBNAIL
-    )
+
+    websocket_api.async_register_command(hass, ws_camera_stream)
+    websocket_api.async_register_command(hass, websocket_get_prefs)
+    websocket_api.async_register_command(hass, websocket_update_prefs)
+    websocket_api.async_register_command(hass, ws_camera_capabilities)
+    async_register_ws(hass)
 
     await component.async_setup(config)
 
+    async def preload_stream(_event: Event) -> None:
+        """Load stream prefs and start stream if preload_stream is True."""
+        for camera in list(component.entities):
+            stream_prefs = await prefs.get_dynamic_stream_settings(camera.entity_id)
+            if not stream_prefs.preload_stream:
+                continue
+            stream = await camera.async_create_stream()
+            if not stream:
+                continue
+            stream.add_provider("hls")
+            await stream.start()
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, preload_stream)
+
     @callback
-    def update_tokens(time):
+    def update_tokens(t: datetime) -> None:
         """Update tokens of the entities."""
         for entity in component.entities:
             entity.async_update_token()
-            hass.async_create_task(entity.async_update_ha_state())
+            entity.async_write_ha_state()
 
-    hass.helpers.event.async_track_time_interval(
-        update_tokens, TOKEN_CHANGE_INTERVAL)
+    unsub = async_track_time_interval(
+        hass, update_tokens, TOKEN_CHANGE_INTERVAL, name="Camera update tokens"
+    )
 
-    component.async_register_entity_service(
-        SERVICE_ENABLE_MOTION, CAMERA_SERVICE_SCHEMA,
-        'async_enable_motion_detection'
-    )
-    component.async_register_entity_service(
-        SERVICE_DISABLE_MOTION, CAMERA_SERVICE_SCHEMA,
-        'async_disable_motion_detection'
-    )
-    component.async_register_entity_service(
-        SERVICE_TURN_OFF, CAMERA_SERVICE_SCHEMA,
-        'async_turn_off'
-    )
-    component.async_register_entity_service(
-        SERVICE_TURN_ON, CAMERA_SERVICE_SCHEMA,
-        'async_turn_on'
-    )
-    component.async_register_entity_service(
-        SERVICE_SNAPSHOT, CAMERA_SERVICE_SNAPSHOT,
-        async_handle_snapshot_service
-    )
+    @callback
+    def unsub_track_time_interval(_event: Event) -> None:
+        """Unsubscribe track time interval timer."""
+        unsub()
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, unsub_track_time_interval)
+
+    async_setup_services(hass)
 
     return True
 
 
-async def async_setup_entry(hass, entry):
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Set up a config entry."""
-    return await hass.data[DOMAIN].async_setup_entry(entry)
+    if not await hass.data[DATA_COMPONENT].async_setup_entry(entry):
+        raise ConfigEntryError(
+            translation_domain=HOMEASSISTANT_DOMAIN,
+            translation_key="platform_setup_failed",
+            translation_placeholders={"platform": entry.domain, "domain": DOMAIN},
+        )
 
 
-async def async_unload_entry(hass, entry):
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload a config entry."""
-    return await hass.data[DOMAIN].async_unload_entry(entry)
-
-
-class Camera(Entity):
-    """The base class for camera entities."""
-
-    def __init__(self):
-        """Initialize a camera."""
-        self.is_streaming = False
-        self.content_type = DEFAULT_CONTENT_TYPE
-        self.access_tokens = collections.deque([], 2)
-        self.async_update_token()
-
-    @property
-    def should_poll(self):
-        """No need to poll cameras."""
-        return False
-
-    @property
-    def entity_picture(self):
-        """Return a link to the camera feed as entity picture."""
-        return ENTITY_IMAGE_URL.format(self.entity_id, self.access_tokens[-1])
-
-    @property
-    def supported_features(self):
-        """Flag supported features."""
-        return 0
-
-    @property
-    def is_recording(self):
-        """Return true if the device is recording."""
-        return False
-
-    @property
-    def brand(self):
-        """Return the camera brand."""
-        return None
-
-    @property
-    def motion_detection_enabled(self):
-        """Return the camera motion detection status."""
-        return None
-
-    @property
-    def model(self):
-        """Return the camera model."""
-        return None
-
-    @property
-    def frame_interval(self):
-        """Return the interval between frames of the mjpeg stream."""
-        return 0.5
-
-    def camera_image(self):
-        """Return bytes of camera image."""
-        raise NotImplementedError()
-
-    @callback
-    def async_camera_image(self):
-        """Return bytes of camera image.
-
-        This method must be run in the event loop and returns a coroutine.
-        """
-        return self.hass.async_add_job(self.camera_image)
-
-    async def handle_async_still_stream(self, request, interval):
-        """Generate an HTTP MJPEG stream from camera images.
-
-        This method must be run in the event loop.
-        """
-        return await async_get_still_stream(request, self.async_camera_image,
-                                            self.content_type, interval)
-
-    async def handle_async_mjpeg_stream(self, request):
-        """Serve an HTTP MJPEG stream from the camera.
-
-        This method can be overridden by camera plaforms to proxy
-        a direct stream from the camera.
-        This method must be run in the event loop.
-        """
-        await self.handle_async_still_stream(request, self.frame_interval)
-
-    @property
-    def state(self):
-        """Return the camera state."""
-        if self.is_recording:
-            return STATE_RECORDING
-        if self.is_streaming:
-            return STATE_STREAMING
-        return STATE_IDLE
-
-    @property
-    def is_on(self):
-        """Return true if on."""
-        return True
-
-    def turn_off(self):
-        """Turn off camera."""
-        raise NotImplementedError()
-
-    @callback
-    def async_turn_off(self):
-        """Turn off camera."""
-        return self.hass.async_add_job(self.turn_off)
-
-    def turn_on(self):
-        """Turn off camera."""
-        raise NotImplementedError()
-
-    @callback
-    def async_turn_on(self):
-        """Turn off camera."""
-        return self.hass.async_add_job(self.turn_on)
-
-    def enable_motion_detection(self):
-        """Enable motion detection in the camera."""
-        raise NotImplementedError()
-
-    @callback
-    def async_enable_motion_detection(self):
-        """Call the job and enable motion detection."""
-        return self.hass.async_add_job(self.enable_motion_detection)
-
-    def disable_motion_detection(self):
-        """Disable motion detection in camera."""
-        raise NotImplementedError()
-
-    @callback
-    def async_disable_motion_detection(self):
-        """Call the job and disable motion detection."""
-        return self.hass.async_add_job(self.disable_motion_detection)
-
-    @property
-    def state_attributes(self):
-        """Return the camera state attributes."""
-        attrs = {
-            'access_token': self.access_tokens[-1],
-        }
-
-        if self.model:
-            attrs['model_name'] = self.model
-
-        if self.brand:
-            attrs['brand'] = self.brand
-
-        if self.motion_detection_enabled:
-            attrs['motion_detection'] = self.motion_detection_enabled
-
-        return attrs
-
-    @callback
-    def async_update_token(self):
-        """Update the used token."""
-        self.access_tokens.append(
-            hashlib.sha256(
-                _RND.getrandbits(256).to_bytes(32, 'little')).hexdigest())
+    await hass.data[DATA_COMPONENT].async_unload_entry(entry)
 
 
 class CameraView(HomeAssistantView):
@@ -382,119 +328,200 @@ class CameraView(HomeAssistantView):
 
     requires_auth = False
 
-    def __init__(self, component):
+    def __init__(self, component: EntityComponent[Camera]) -> None:
         """Initialize a basic camera view."""
         self.component = component
 
-    async def get(self, request, entity_id):
+    async def get(self, request: web.Request, entity_id: str) -> web.StreamResponse:
         """Start a GET request."""
-        camera = self.component.get_entity(entity_id)
+        if (camera := self.component.get_entity(entity_id)) is None:
+            raise (
+                web.HTTPNotFound if request[KEY_AUTHENTICATED] else web.HTTPUnauthorized
+            )
 
-        if camera is None:
-            raise web.HTTPNotFound()
-
-        authenticated = (request[KEY_AUTHENTICATED] or
-                         request.query.get('token') in camera.access_tokens)
+        authenticated = (
+            request[KEY_AUTHENTICATED]
+            or request.query.get("token") in camera.access_tokens
+        )
 
         if not authenticated:
-            raise web.HTTPUnauthorized()
+            if hdrs.AUTHORIZATION in request.headers:
+                # A failed request that carried an Authorization header is a real
+                # Bearer auth attempt — return 401 and let the ban middleware count
+                # it as a wrong login.
+                raise web.HTTPUnauthorized
+            # No Authorization header: most likely a benign signed-URL / query-
+            # token request whose token has expired (e.g. a browser tab left
+            # open that re-fetches resources later). Return 403 so it doesn't
+            # register as a wrong login and ban the user's own IP.
+            raise web.HTTPForbidden
 
         if not camera.is_on:
-            _LOGGER.debug('Camera is off.')
-            raise web.HTTPServiceUnavailable()
+            _LOGGER.debug("Camera is off")
+            raise web.HTTPServiceUnavailable
 
         return await self.handle(request, camera)
 
-    async def handle(self, request, camera):
+    async def handle(self, request: web.Request, camera: Camera) -> web.StreamResponse:
         """Handle the camera request."""
-        raise NotImplementedError()
+        raise NotImplementedError
 
 
 class CameraImageView(CameraView):
     """Camera view to serve an image."""
 
-    url = '/api/camera_proxy/{entity_id}'
-    name = 'api:camera:image'
+    url = "/api/camera_proxy/{entity_id}"
+    name = "api:camera:image"
 
-    async def handle(self, request, camera):
+    @override
+    async def handle(self, request: web.Request, camera: Camera) -> web.Response:
         """Serve camera image."""
-        with suppress(asyncio.CancelledError, asyncio.TimeoutError):
-            with async_timeout.timeout(10, loop=request.app['hass'].loop):
-                image = await camera.async_camera_image()
+        width = request.query.get("width")
+        height = request.query.get("height")
+        try:
+            image = await _async_get_image(
+                camera,
+                CAMERA_IMAGE_TIMEOUT,
+                int(width) if width else None,
+                int(height) if height else None,
+            )
+        except (HomeAssistantError, ValueError) as ex:
+            raise web.HTTPInternalServerError from ex
 
-            if image:
-                return web.Response(body=image,
-                                    content_type=camera.content_type)
-
-        raise web.HTTPInternalServerError()
+        return web.Response(body=image.content, content_type=image.content_type)
 
 
 class CameraMjpegStream(CameraView):
     """Camera View to serve an MJPEG stream."""
 
-    url = '/api/camera_proxy_stream/{entity_id}'
-    name = 'api:camera:stream'
+    url = "/api/camera_proxy_stream/{entity_id}"
+    name = "api:camera:stream"
 
-    async def handle(self, request, camera):
+    @override
+    async def handle(self, request: web.Request, camera: Camera) -> web.StreamResponse:
         """Serve camera stream, possibly with interval."""
-        interval = request.query.get('interval')
-        if interval is None:
-            return await camera.handle_async_mjpeg_stream(request)
+        if (interval_str := request.query.get("interval")) is None:
+            try:
+                stream = await camera.handle_async_mjpeg_stream(request)
+            except ConnectionResetError:
+                stream = None
+                _LOGGER.debug("Error while writing MJPEG stream to transport")
+            if stream is None:
+                raise web.HTTPBadGateway
+            return stream
 
         try:
             # Compose camera stream from stills
-            interval = float(request.query.get('interval'))
+            interval = float(interval_str)
             if interval < MIN_STREAM_INTERVAL:
-                raise ValueError("Stream interval must be be > {}"
-                                 .format(MIN_STREAM_INTERVAL))
+                raise ValueError(f"Stream interval must be > {MIN_STREAM_INTERVAL}")  # noqa: TRY301
             return await camera.handle_async_still_stream(request, interval)
-        except ValueError:
-            raise web.HTTPBadRequest()
+        except ValueError as err:
+            raise web.HTTPBadRequest from err
 
 
+@websocket_api.websocket_command(
+    {
+        probatio.Required("type"): "camera/capabilities",
+        probatio.Required("entity_id"): cv.entity_id,
+    }
+)
 @websocket_api.async_response
-async def websocket_camera_thumbnail(hass, connection, msg):
-    """Handle get camera thumbnail websocket command.
+async def ws_camera_capabilities(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Handle get camera capabilities websocket command.
+
+    Async friendly.
+    """
+    camera = get_camera_from_entity_id(hass, msg["entity_id"])
+    connection.send_result(msg["id"], asdict(camera.camera_capabilities))
+
+
+@websocket_api.websocket_command(
+    {
+        probatio.Required("type"): "camera/stream",
+        probatio.Required("entity_id"): cv.entity_id,
+        probatio.Optional("format", default="hls"): probatio.In(OUTPUT_FORMATS),
+    }
+)
+@websocket_api.async_response
+async def ws_camera_stream(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Handle get camera stream websocket command.
 
     Async friendly.
     """
     try:
-        image = await async_get_image(hass, msg['entity_id'])
-        connection.send_message(websocket_api.result_message(
-            msg['id'], {
-                'content_type': image.content_type,
-                'content': base64.b64encode(image.content).decode('utf-8')
-            }
-        ))
-    except HomeAssistantError:
-        connection.send_message(websocket_api.error_message(
-            msg['id'], 'image_fetch_failed', 'Unable to fetch image'))
+        entity_id = msg["entity_id"]
+        camera = get_camera_from_entity_id(hass, entity_id)
+        url = await async_stream_endpoint_url(hass, camera, fmt=msg["format"])
+        connection.send_result(msg["id"], {"url": url})
+    except HomeAssistantError as ex:
+        _LOGGER.error("Error requesting stream: %s", ex)
+        connection.send_error(
+            msg["id"],
+            "start_stream_failed",
+            str(ex),
+            translation_domain=ex.translation_domain,
+            translation_key=ex.translation_key,
+            translation_placeholders=ex.translation_placeholders,
+        )
+    except TimeoutError:
+        _LOGGER.error("Timeout getting stream source")
+        connection.send_error(
+            msg["id"], "start_stream_failed", "Timeout getting stream source"
+        )
 
 
-async def async_handle_snapshot_service(camera, service):
-    """Handle snapshot services calls."""
-    hass = camera.hass
-    filename = service.data[ATTR_FILENAME]
-    filename.hass = hass
+@websocket_api.websocket_command(
+    {
+        probatio.Required("type"): "camera/get_prefs",
+        probatio.Required("entity_id"): cv.entity_id,
+    }
+)
+@websocket_api.async_response
+async def websocket_get_prefs(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Handle request for account info."""
+    stream_prefs = await get_dynamic_camera_stream_settings(hass, msg["entity_id"])
+    connection.send_result(msg["id"], asdict(stream_prefs))
 
-    snapshot_file = filename.async_render(
-        variables={ATTR_ENTITY_ID: camera})
 
-    # check if we allow to access to that file
-    if not hass.config.is_allowed_path(snapshot_file):
-        _LOGGER.error(
-            "Can't write %s, no access to path!", snapshot_file)
-        return
-
-    image = await camera.async_camera_image()
-
-    def _write_image(to_file, image_data):
-        """Executor helper to write image."""
-        with open(to_file, 'wb') as img_file:
-            img_file.write(image_data)
-
+@websocket_api.websocket_command(
+    {
+        probatio.Required("type"): "camera/update_prefs",
+        probatio.Required("entity_id"): cv.entity_id,
+        probatio.Optional(PREF_PRELOAD_STREAM): bool,
+        probatio.Optional(PREF_ORIENTATION): probatio.Coerce(Orientation),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_update_prefs(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Handle request for account info."""
+    changes = dict(msg)
+    changes.pop("id")
+    changes.pop("type")
+    entity_id = changes.pop("entity_id")
     try:
-        await hass.async_add_executor_job(
-            _write_image, snapshot_file, image)
-    except OSError as err:
-        _LOGGER.error("Can't write image to file: %s", err)
+        entity_prefs = await hass.data[DATA_CAMERA_PREFS].async_update(
+            entity_id, **changes
+        )
+    except HomeAssistantError as ex:
+        _LOGGER.error("Error setting camera preferences: %s", ex)
+        connection.send_error(msg["id"], "update_failed", str(ex))
+    else:
+        if (camera := hass.data[DATA_COMPONENT].get_entity(entity_id)) and (
+            provider := camera.webrtc_provider
+        ):
+            await async_call_webrtc_provider(
+                provider.async_on_camera_prefs_update(camera),
+                "notifying WebRTC provider of preferences update for",
+                entity_id,
+            )
+        connection.send_result(msg["id"], entity_prefs)

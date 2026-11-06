@@ -1,88 +1,158 @@
-"""
-Support for Actions on Google Assistant Smart Home Control.
+"""Support for Actions on Google Assistant Smart Home Control."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/google_assistant/
-"""
-import asyncio
-import logging
-from typing import Dict, Any
+import probatio
 
-import aiohttp
-import async_timeout
-
-import voluptuous as vol
-
-# Typing imports
-from homeassistant.core import HomeAssistant, ServiceCall
-
-from homeassistant.const import CONF_NAME
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
+from homeassistant.const import CONF_API_KEY, CONF_NAME, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers.typing import ConfigType
 
 from .const import (
-    DOMAIN, CONF_PROJECT_ID, CONF_EXPOSE_BY_DEFAULT, DEFAULT_EXPOSE_BY_DEFAULT,
-    CONF_EXPOSED_DOMAINS, DEFAULT_EXPOSED_DOMAINS, CONF_API_KEY,
-    SERVICE_REQUEST_SYNC, REQUEST_SYNC_BASE_URL, CONF_ENTITY_CONFIG,
-    CONF_EXPOSE, CONF_ALIASES, CONF_ROOM_HINT
+    CONF_ALIASES,
+    CONF_CLIENT_EMAIL,
+    CONF_ENTITY_CONFIG,
+    CONF_EXPOSE,
+    CONF_EXPOSE_BY_DEFAULT,
+    CONF_EXPOSED_DOMAINS,
+    CONF_PRIVATE_KEY,
+    CONF_PROJECT_ID,
+    CONF_REPORT_STATE,
+    CONF_ROOM_HINT,
+    CONF_SECURE_DEVICES_PIN,
+    CONF_SERVICE_ACCOUNT,
+    DATA_CONFIG,
+    DEFAULT_EXPOSE_BY_DEFAULT,
+    DEFAULT_EXPOSED_DOMAINS,
+    DOMAIN,
+    SOURCE_CLOUD,
 )
-from .http import async_register_http
+from .http import GoogleAssistantView, GoogleConfig
+from .services import async_setup_services
 
-_LOGGER = logging.getLogger(__name__)
+CONF_ALLOW_UNLOCK = "allow_unlock"
 
-DEPENDENCIES = ['http']
+PLATFORMS = [Platform.BUTTON]
 
-DEFAULT_AGENT_USER_ID = 'home-assistant'
+ENTITY_SCHEMA = probatio.Schema(
+    {
+        probatio.Optional(CONF_NAME): cv.string,
+        probatio.Optional(CONF_EXPOSE, default=True): cv.boolean,
+        probatio.Optional(CONF_ALIASES): probatio.All(
+            probatio.EnsureList(), [cv.string]
+        ),
+        probatio.Optional(CONF_ROOM_HINT): cv.string,
+    }
+)
 
-ENTITY_SCHEMA = vol.Schema({
-    vol.Optional(CONF_NAME): cv.string,
-    vol.Optional(CONF_EXPOSE): cv.boolean,
-    vol.Optional(CONF_ALIASES): vol.All(cv.ensure_list, [cv.string]),
-    vol.Optional(CONF_ROOM_HINT): cv.string
-})
+GOOGLE_SERVICE_ACCOUNT = probatio.Schema(
+    {
+        probatio.Required(probatio.Secret(CONF_PRIVATE_KEY)): cv.string,
+        probatio.Required(CONF_CLIENT_EMAIL): cv.string,
+    },
+    extra=probatio.ALLOW_EXTRA,
+)
 
-GOOGLE_ASSISTANT_SCHEMA = vol.Schema({
-    vol.Required(CONF_PROJECT_ID): cv.string,
-    vol.Optional(CONF_EXPOSE_BY_DEFAULT,
-                 default=DEFAULT_EXPOSE_BY_DEFAULT): cv.boolean,
-    vol.Optional(CONF_EXPOSED_DOMAINS,
-                 default=DEFAULT_EXPOSED_DOMAINS): cv.ensure_list,
-    vol.Optional(CONF_API_KEY): cv.string,
-    vol.Optional(CONF_ENTITY_CONFIG): {cv.entity_id: ENTITY_SCHEMA}
-}, extra=vol.PREVENT_EXTRA)
-
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: GOOGLE_ASSISTANT_SCHEMA
-}, extra=vol.ALLOW_EXTRA)
+__all__ = [
+    "CONF_ROOM_HINT",
+    "DOMAIN",
+    "SOURCE_CLOUD",
+]
 
 
-async def async_setup(hass: HomeAssistant, yaml_config: Dict[str, Any]):
+def _check_report_state(data):
+    if data[CONF_REPORT_STATE] and CONF_SERVICE_ACCOUNT not in data:
+        raise probatio.Invalid(
+            "If report state is enabled, a service account must exist"
+        )
+    return data
+
+
+GOOGLE_ASSISTANT_SCHEMA = probatio.All(
+    probatio.Schema(
+        {
+            probatio.Required(CONF_PROJECT_ID): cv.string,
+            probatio.Optional(
+                CONF_EXPOSE_BY_DEFAULT, default=DEFAULT_EXPOSE_BY_DEFAULT
+            ): cv.boolean,
+            probatio.Optional(
+                CONF_EXPOSED_DOMAINS, default=DEFAULT_EXPOSED_DOMAINS
+            ): probatio.EnsureList(),
+            probatio.Optional(CONF_ENTITY_CONFIG): {cv.entity_id: ENTITY_SCHEMA},
+            # str on purpose, makes sure it is configured correctly.
+            probatio.Optional(probatio.Secret(CONF_SECURE_DEVICES_PIN)): str,
+            probatio.Optional(CONF_REPORT_STATE, default=False): cv.boolean,
+            probatio.Optional(CONF_SERVICE_ACCOUNT): GOOGLE_SERVICE_ACCOUNT,
+            # deprecated configuration options
+            probatio.Remove(CONF_ALLOW_UNLOCK): cv.boolean,
+            probatio.Remove(CONF_API_KEY): cv.string,
+        },
+        extra=probatio.PREVENT_EXTRA,
+    ),
+    _check_report_state,
+)
+
+CONFIG_SCHEMA = probatio.Schema(
+    {probatio.Optional(DOMAIN): GOOGLE_ASSISTANT_SCHEMA}, extra=probatio.ALLOW_EXTRA
+)
+
+type GoogleConfigEntry = ConfigEntry[GoogleConfig]
+
+
+async def async_setup(hass: HomeAssistant, yaml_config: ConfigType) -> bool:
     """Activate Google Actions component."""
-    config = yaml_config.get(DOMAIN, {})
-    api_key = config.get(CONF_API_KEY)
-    async_register_http(hass, config)
+    if DOMAIN not in yaml_config:
+        return True
 
-    async def request_sync_service_handler(call: ServiceCall):
-        """Handle request sync service calls."""
-        websession = async_get_clientsession(hass)
-        try:
-            with async_timeout.timeout(5, loop=hass.loop):
-                res = await websession.post(
-                    REQUEST_SYNC_BASE_URL,
-                    params={'key': api_key},
-                    json={'agent_user_id': call.context.user_id})
-                _LOGGER.info("Submitted request_sync request to Google")
-                res.raise_for_status()
-        except aiohttp.ClientResponseError:
-            body = await res.read()
-            _LOGGER.error(
-                'request_sync request failed: %d %s', res.status, body)
-        except (asyncio.TimeoutError, aiohttp.ClientError):
-            _LOGGER.error("Could not contact Google for request_sync")
+    hass.data[DATA_CONFIG] = yaml_config[DOMAIN]
 
-    # Register service only if api key is provided
-    if api_key is not None:
-        hass.services.async_register(
-            DOMAIN, SERVICE_REQUEST_SYNC, request_sync_service_handler)
+    async_setup_services(hass)
+
+    hass.async_create_task(
+        hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_IMPORT},
+            data={CONF_PROJECT_ID: yaml_config[DOMAIN][CONF_PROJECT_ID]},
+        )
+    )
 
     return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: GoogleConfigEntry) -> None:
+    """Set up from a config entry."""
+
+    config: ConfigType = hass.data[DATA_CONFIG].copy()
+
+    if entry.source == SOURCE_IMPORT:
+        # if project was changed, remove entry a new will be setup
+        if config[CONF_PROJECT_ID] != entry.data[CONF_PROJECT_ID]:
+            hass.async_create_task(hass.config_entries.async_remove(entry.entry_id))
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="project_id_changed",
+            )
+
+    config.update(entry.data)
+
+    device_registry = dr.async_get(hass)
+    device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, config[CONF_PROJECT_ID])},
+        manufacturer="Google",
+        model="Google Home",
+        name=config[CONF_PROJECT_ID],
+        entry_type=dr.DeviceEntryType.SERVICE,
+    )
+
+    google_config = GoogleConfig(hass, config)
+    await google_config.async_initialize()
+
+    entry.runtime_data = google_config
+
+    hass.http.register_view(GoogleAssistantView(google_config))
+
+    google_config.async_update_report_state()
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

@@ -1,17 +1,18 @@
-"""
-Module with location helpers.
+"""Module with location helpers.
 
 detect_location_info and elevation are mocked by default during tests.
 """
-import collections
+
+from functools import lru_cache
 import math
-from typing import Any, Optional, Tuple, Dict
+from typing import Any, NamedTuple
 
-import requests
+import aiohttp
 
-ELEVATION_URL = 'http://maps.googleapis.com/maps/api/elevation/json'
-FREEGEO_API = 'https://freegeoip.net/json/'
-IP_API = 'http://ip-api.com/json'
+from homeassistant.const import __version__ as HA_VERSION
+
+WHOAMI_URL = "https://services.home-assistant.io/whoami/v1"
+WHOAMI_URL_DEV = "https://services-dev.home-assistant.workers.dev/whoami/v1"
 
 # Constants from https://github.com/maurycyp/vincenty
 # Earth ellipsoid according to WGS 84
@@ -26,31 +27,39 @@ MILES_PER_KILOMETER = 0.621371
 MAX_ITERATIONS = 200
 CONVERGENCE_THRESHOLD = 1e-12
 
-LocationInfo = collections.namedtuple(
-    "LocationInfo",
-    ['ip', 'country_code', 'country_name', 'region_code', 'region_name',
-     'city', 'zip_code', 'time_zone', 'latitude', 'longitude',
-     'use_metric'])
+
+class LocationInfo(NamedTuple):
+    """Tuple with location information."""
+
+    ip: str
+    country_code: str
+    currency: str
+    region_code: str
+    region_name: str
+    city: str
+    zip_code: str
+    time_zone: str
+    latitude: float
+    longitude: float
+    use_metric: bool
 
 
-def detect_location_info() -> Optional[LocationInfo]:
+async def async_detect_location_info(
+    session: aiohttp.ClientSession,
+) -> LocationInfo | None:
     """Detect location information."""
-    data = _get_freegeoip()
-
-    if data is None:
-        data = _get_ip_api()
-
-    if data is None:
+    if (data := await _get_whoami(session)) is None:
         return None
 
-    data['use_metric'] = data['country_code'] not in (
-        'US', 'MM', 'LR')
+    data["use_metric"] = data["country_code"] not in ("US", "MM", "LR")
 
     return LocationInfo(**data)
 
 
-def distance(lat1: Optional[float], lon1: Optional[float],
-             lat2: float, lon2: float) -> Optional[float]:
+@lru_cache
+def distance(
+    lat1: float | None, lon1: float | None, lat2: float, lon2: float
+) -> float | None:
     """Calculate the distance in meters between two points.
 
     Async friendly.
@@ -63,36 +72,13 @@ def distance(lat1: Optional[float], lon1: Optional[float],
     return result * 1000
 
 
-def elevation(latitude: float, longitude: float) -> int:
-    """Return elevation for given latitude and longitude."""
-    try:
-        req = requests.get(
-            ELEVATION_URL,
-            params={
-                'locations': '{},{}'.format(latitude, longitude),
-                'sensor': 'false',
-            },
-            timeout=10)
-    except requests.RequestException:
-        return 0
-
-    if req.status_code != 200:
-        return 0
-
-    try:
-        return int(float(req.json()['results'][0]['elevation']))
-    except (ValueError, KeyError, IndexError):
-        return 0
-
-
 # Author: https://github.com/maurycyp
 # Source: https://github.com/maurycyp/vincenty
 # License: https://github.com/maurycyp/vincenty/blob/master/LICENSE
-# pylint: disable=invalid-name
-def vincenty(point1: Tuple[float, float], point2: Tuple[float, float],
-             miles: bool = False) -> Optional[float]:
-    """
-    Vincenty formula (inverse method) to calculate the distance.
+def vincenty(
+    point1: tuple[float, float], point2: tuple[float, float], miles: bool = False
+) -> float | None:
+    """Vincenty formula (inverse method) to calculate the distance.
 
     Result in kilometers or miles between two points on the surface of a
     spheroid.
@@ -116,40 +102,52 @@ def vincenty(point1: Tuple[float, float], point2: Tuple[float, float],
     for _ in range(MAX_ITERATIONS):
         sinLambda = math.sin(Lambda)
         cosLambda = math.cos(Lambda)
-        sinSigma = math.sqrt((cosU2 * sinLambda) ** 2 +
-                             (cosU1 * sinU2 - sinU1 * cosU2 * cosLambda) ** 2)
-        if sinSigma == 0:
+        sinSigma = math.sqrt(
+            (cosU2 * sinLambda) ** 2 + (cosU1 * sinU2 - sinU1 * cosU2 * cosLambda) ** 2
+        )
+        if sinSigma == 0.0:
             return 0.0  # coincident points
         cosSigma = sinU1 * sinU2 + cosU1 * cosU2 * cosLambda
         sigma = math.atan2(sinSigma, cosSigma)
         sinAlpha = cosU1 * cosU2 * sinLambda / sinSigma
-        cosSqAlpha = 1 - sinAlpha ** 2
+        cosSqAlpha = 1 - sinAlpha**2
         try:
             cos2SigmaM = cosSigma - 2 * sinU1 * sinU2 / cosSqAlpha
         except ZeroDivisionError:
             cos2SigmaM = 0
-        C = FLATTENING / 16 * cosSqAlpha * (4 + FLATTENING * (4 - 3 *
-                                                              cosSqAlpha))
+        C = FLATTENING / 16 * cosSqAlpha * (4 + FLATTENING * (4 - 3 * cosSqAlpha))
         LambdaPrev = Lambda
-        Lambda = L + (1 - C) * FLATTENING * sinAlpha * (sigma + C * sinSigma *
-                                                        (cos2SigmaM + C *
-                                                         cosSigma *
-                                                         (-1 + 2 *
-                                                          cos2SigmaM ** 2)))
+        Lambda = L + (1 - C) * FLATTENING * sinAlpha * (
+            sigma
+            + C * sinSigma * (cos2SigmaM + C * cosSigma * (-1 + 2 * cos2SigmaM**2))
+        )
         if abs(Lambda - LambdaPrev) < CONVERGENCE_THRESHOLD:
             break  # successful convergence
     else:
         return None  # failure to converge
 
-    uSq = cosSqAlpha * (AXIS_A ** 2 - AXIS_B ** 2) / (AXIS_B ** 2)
+    uSq = cosSqAlpha * (AXIS_A**2 - AXIS_B**2) / (AXIS_B**2)
     A = 1 + uSq / 16384 * (4096 + uSq * (-768 + uSq * (320 - 175 * uSq)))
     B = uSq / 1024 * (256 + uSq * (-128 + uSq * (74 - 47 * uSq)))
-    deltaSigma = B * sinSigma * (cos2SigmaM +
-                                 B / 4 * (cosSigma * (-1 + 2 *
-                                                      cos2SigmaM ** 2) -
-                                          B / 6 * cos2SigmaM *
-                                          (-3 + 4 * sinSigma ** 2) *
-                                          (-3 + 4 * cos2SigmaM ** 2)))
+    # fmt: off
+    deltaSigma = (
+        B
+        * sinSigma
+        * (
+            cos2SigmaM
+            + B
+            / 4
+            * (
+                cosSigma * (-1 + 2 * cos2SigmaM**2)
+                - B
+                / 6
+                * cos2SigmaM
+                * (-3 + 4 * sinSigma ** 2)
+                * (-3 + 4 * cos2SigmaM ** 2)
+            )
+        )
+    )
+    # fmt: on
     s = AXIS_B * A * (sigma - deltaSigma)
 
     s /= 1000  # Conversion of meters to kilometers
@@ -159,43 +157,30 @@ def vincenty(point1: Tuple[float, float], point2: Tuple[float, float],
     return round(s, 6)
 
 
-def _get_freegeoip() -> Optional[Dict[str, Any]]:
-    """Query freegeoip.io for location data."""
+async def _get_whoami(session: aiohttp.ClientSession) -> dict[str, Any] | None:
+    """Query whoami.home-assistant.io for location data."""
     try:
-        raw_info = requests.get(FREEGEO_API, timeout=5).json()
-    except (requests.RequestException, ValueError):
+        resp = await session.get(
+            WHOAMI_URL_DEV if HA_VERSION.endswith("0.dev0") else WHOAMI_URL,
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
+    except aiohttp.ClientError, TimeoutError:
+        return None
+
+    try:
+        raw_info = await resp.json()
+    except aiohttp.ClientError, ValueError:
         return None
 
     return {
-        'ip': raw_info.get('ip'),
-        'country_code': raw_info.get('country_code'),
-        'country_name': raw_info.get('country_name'),
-        'region_code': raw_info.get('region_code'),
-        'region_name': raw_info.get('region_name'),
-        'city': raw_info.get('city'),
-        'zip_code': raw_info.get('zip_code'),
-        'time_zone': raw_info.get('time_zone'),
-        'latitude': raw_info.get('latitude'),
-        'longitude': raw_info.get('longitude'),
-    }
-
-
-def _get_ip_api() -> Optional[Dict[str, Any]]:
-    """Query ip-api.com for location data."""
-    try:
-        raw_info = requests.get(IP_API, timeout=5).json()
-    except (requests.RequestException, ValueError):
-        return None
-
-    return {
-        'ip': raw_info.get('query'),
-        'country_code': raw_info.get('countryCode'),
-        'country_name': raw_info.get('country'),
-        'region_code': raw_info.get('region'),
-        'region_name': raw_info.get('regionName'),
-        'city': raw_info.get('city'),
-        'zip_code': raw_info.get('zip'),
-        'time_zone': raw_info.get('timezone'),
-        'latitude': raw_info.get('lat'),
-        'longitude': raw_info.get('lon'),
+        "ip": raw_info.get("ip"),
+        "country_code": raw_info.get("country"),
+        "currency": raw_info.get("currency"),
+        "region_code": raw_info.get("region_code"),
+        "region_name": raw_info.get("region"),
+        "city": raw_info.get("city"),
+        "zip_code": raw_info.get("postal_code"),
+        "time_zone": raw_info.get("timezone"),
+        "latitude": float(raw_info.get("latitude")),
+        "longitude": float(raw_info.get("longitude")),
     }

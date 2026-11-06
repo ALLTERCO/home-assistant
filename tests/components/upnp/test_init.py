@@ -1,188 +1,265 @@
 """Test UPnP/IGD setup process."""
 
-from ipaddress import ip_address
-from unittest.mock import patch, MagicMock
+from collections.abc import Callable, Coroutine
+import copy
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from homeassistant.setup import async_setup_component
-from homeassistant.components import upnp
-from homeassistant.components.upnp.device import Device
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from async_upnp_client.aiohttp import AiohttpNotifyServer
+from async_upnp_client.exceptions import UpnpCommunicationError
+from async_upnp_client.profiles.igd import IgdDevice
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
-from tests.common import MockConfigEntry
-from tests.common import mock_coro
+from homeassistant.components import ssdp
+from homeassistant.components.upnp.const import (
+    CONFIG_ENTRY_FORCE_POLL,
+    CONFIG_ENTRY_LOCATION,
+    CONFIG_ENTRY_MAC_ADDRESS,
+    CONFIG_ENTRY_ORIGINAL_UDN,
+    CONFIG_ENTRY_ST,
+    CONFIG_ENTRY_UDN,
+    DOMAIN,
+)
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.service_info.ssdp import ATTR_UPNP_UDN, SsdpServiceInfo
 
-
-class MockDevice(Device):
-    """Mock device for Device."""
-
-    def __init__(self, udn):
-        """Initializer."""
-        super().__init__(None)
-        self._udn = udn
-        self.added_port_mappings = []
-        self.removed_port_mappings = []
-
-    @classmethod
-    async def async_create_device(cls, hass, ssdp_description):
-        """Return self."""
-        return cls()
-
-    @property
-    def udn(self):
-        """Get the UDN."""
-        return self._udn
-
-    async def _async_add_port_mapping(self,
-                                      external_port,
-                                      local_ip,
-                                      internal_port):
-        """Add a port mapping."""
-        entry = [external_port, local_ip, internal_port]
-        self.added_port_mappings.append(entry)
-
-    async def _async_delete_port_mapping(self, external_port):
-        """Remove a port mapping."""
-        entry = external_port
-        self.removed_port_mappings.append(entry)
+from .conftest import (
+    TEST_DISCOVERY,
+    TEST_LOCATION,
+    TEST_MAC_ADDRESS,
+    TEST_ST,
+    TEST_UDN,
+    TEST_USN,
+)
 
 
-async def test_async_setup_no_auto_config(hass):
-    """Test async_setup."""
-    # setup component, enable auto_config
-    await async_setup_component(hass, 'upnp')
-
-    assert hass.data[upnp.DOMAIN]['auto_config'] == {
-        'active': False,
-        'enable_sensors': False,
-        'enable_port_mapping': False,
-        'ports': {'hass': 'hass'},
-    }
-
-
-async def test_async_setup_auto_config(hass):
-    """Test async_setup."""
-    # setup component, enable auto_config
-    await async_setup_component(hass, 'upnp', {'upnp': {}, 'discovery': {}})
-
-    assert hass.data[upnp.DOMAIN]['auto_config'] == {
-        'active': True,
-        'enable_sensors': True,
-        'enable_port_mapping': False,
-        'ports': {'hass': 'hass'},
-    }
-
-
-async def test_async_setup_auto_config_port_mapping(hass):
-    """Test async_setup."""
-    # setup component, enable auto_config
-    await async_setup_component(hass, 'upnp', {
-        'upnp': {
-            'port_mapping': True,
-            'ports': {'hass': 'hass'},
-        },
-        'discovery': {}})
-
-    assert hass.data[upnp.DOMAIN]['auto_config'] == {
-        'active': True,
-        'enable_sensors': True,
-        'enable_port_mapping': True,
-        'ports': {'hass': 'hass'},
-    }
-
-
-async def test_async_setup_auto_config_no_sensors(hass):
-    """Test async_setup."""
-    # setup component, enable auto_config
-    await async_setup_component(hass, 'upnp', {
-        'upnp': {'sensors': False},
-        'discovery': {}})
-
-    assert hass.data[upnp.DOMAIN]['auto_config'] == {
-        'active': True,
-        'enable_sensors': False,
-        'enable_port_mapping': False,
-        'ports': {'hass': 'hass'},
-    }
-
-
-async def test_async_setup_entry_default(hass):
+@pytest.mark.usefixtures("ssdp_instant_discovery", "mock_mac_address_from_host")
+async def test_async_setup_entry_default(
+    hass: HomeAssistant, mock_igd_device: IgdDevice
+) -> None:
     """Test async_setup_entry."""
-    udn = 'uuid:device_1'
-    entry = MockConfigEntry(domain=upnp.DOMAIN, data={
-        'ssdp_description': 'http://192.168.1.1/desc.xml',
-        'udn': udn,
-        'sensors': True,
-        'port_mapping': False,
-    })
-
-    # ensure hass.http is available
-    await async_setup_component(hass, 'upnp')
-
-    # mock homeassistant.components.upnp.device.Device
-    mock_device = MagicMock()
-    mock_device.udn = udn
-    mock_device.async_add_port_mappings.return_value = mock_coro()
-    mock_device.async_delete_port_mappings.return_value = mock_coro()
-    with patch.object(Device, 'async_create_device') as mock_create_device:
-        mock_create_device.return_value = mock_coro(
-            return_value=mock_device)
-        with patch('homeassistant.components.upnp.device.get_local_ip',
-                   return_value='192.168.1.10'):
-            assert await upnp.async_setup_entry(hass, entry) is True
-
-            # ensure device is stored/used
-            assert hass.data[upnp.DOMAIN]['devices'][udn] == mock_device
-
-            hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
-            await hass.async_block_till_done()
-
-    # ensure cleaned up
-    assert udn not in hass.data[upnp.DOMAIN]['devices']
-
-    # ensure no port-mapping-methods called
-    assert len(mock_device.async_add_port_mappings.mock_calls) == 0
-    assert len(mock_device.async_delete_port_mappings.mock_calls) == 0
-
-
-async def test_async_setup_entry_port_mapping(hass):
-    """Test async_setup_entry."""
-    udn = 'uuid:device_1'
-    entry = MockConfigEntry(domain=upnp.DOMAIN, data={
-        'ssdp_description': 'http://192.168.1.1/desc.xml',
-        'udn': udn,
-        'sensors': False,
-        'port_mapping': True,
-    })
-
-    # ensure hass.http is available
-    await async_setup_component(hass, 'upnp', {
-        'upnp': {
-            'port_mapping': True,
-            'ports': {'hass': 'hass'},
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=TEST_USN,
+        data={
+            CONFIG_ENTRY_ST: TEST_ST,
+            CONFIG_ENTRY_UDN: TEST_UDN,
+            CONFIG_ENTRY_ORIGINAL_UDN: TEST_UDN,
+            CONFIG_ENTRY_LOCATION: TEST_LOCATION,
+            CONFIG_ENTRY_MAC_ADDRESS: TEST_MAC_ADDRESS,
         },
-        'discovery': {},
-    })
+        options={
+            CONFIG_ENTRY_FORCE_POLL: False,
+        },
+    )
 
-    mock_device = MockDevice(udn)
-    with patch.object(Device, 'async_create_device') as mock_create_device:
-        mock_create_device.return_value = mock_coro(return_value=mock_device)
-        with patch('homeassistant.components.upnp.device.get_local_ip',
-                   return_value='192.168.1.10'):
-            assert await upnp.async_setup_entry(hass, entry) is True
+    # Load config_entry.
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id) is True
 
-            # ensure device is stored/used
-            assert hass.data[upnp.DOMAIN]['devices'][udn] == mock_device
+    mock_igd_device.async_subscribe_services.assert_called()
+    assert entry.update_listeners == []
 
-            # ensure add-port-mapping-methods called
-            assert mock_device.added_port_mappings == [
-                [8123, ip_address('192.168.1.10'), 8123]
-            ]
 
-            hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
-            await hass.async_block_till_done()
+async def test_unload_stops_notify_server(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_igd_device: IgdDevice,
+    mock_notify_server: AiohttpNotifyServer,
+) -> None:
+    """Test unloading stops the notify server started during setup."""
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+    mock_notify_server.async_start_server.assert_awaited_once()
 
-    # ensure cleaned up
-    assert udn not in hass.data[upnp.DOMAIN]['devices']
+    assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
 
-    # ensure delete-port-mapping-methods called
-    assert mock_device.removed_port_mappings == [8123]
+    mock_igd_device.async_unsubscribe_services.assert_awaited_once()
+    mock_notify_server.async_stop_server.assert_awaited_once()
+
+
+@pytest.mark.usefixtures("ssdp_instant_discovery", "mock_no_mac_address_from_host")
+async def test_async_setup_entry_default_no_mac_address(hass: HomeAssistant) -> None:
+    """Test async_setup_entry."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=TEST_USN,
+        data={
+            CONFIG_ENTRY_ST: TEST_ST,
+            CONFIG_ENTRY_UDN: TEST_UDN,
+            CONFIG_ENTRY_ORIGINAL_UDN: TEST_UDN,
+            CONFIG_ENTRY_LOCATION: TEST_LOCATION,
+            CONFIG_ENTRY_MAC_ADDRESS: None,
+        },
+        options={
+            CONFIG_ENTRY_FORCE_POLL: False,
+        },
+    )
+
+    # Load config_entry.
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id) is True
+
+
+@pytest.mark.usefixtures(
+    "ssdp_instant_discovery_multi_location",
+    "mock_mac_address_from_host",
+)
+async def test_async_setup_entry_multi_location(
+    hass: HomeAssistant, mock_async_create_device: AsyncMock
+) -> None:
+    """Test async_setup_entry for a device both seen via IPv4 and IPv6.
+
+    The resulting IPv4 location is preferred/stored.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=TEST_USN,
+        data={
+            CONFIG_ENTRY_ST: TEST_ST,
+            CONFIG_ENTRY_UDN: TEST_UDN,
+            CONFIG_ENTRY_ORIGINAL_UDN: TEST_UDN,
+            CONFIG_ENTRY_LOCATION: TEST_LOCATION,
+            CONFIG_ENTRY_MAC_ADDRESS: TEST_MAC_ADDRESS,
+        },
+        options={
+            CONFIG_ENTRY_FORCE_POLL: False,
+        },
+    )
+
+    # Load config_entry.
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id) is True
+
+    # Ensure that the IPv4 location is used.
+    mock_async_create_device.assert_called_once_with(TEST_LOCATION)
+
+
+@pytest.mark.usefixtures("mock_mac_address_from_host")
+async def test_async_setup_udn_mismatch(
+    hass: HomeAssistant, mock_async_create_device: AsyncMock
+) -> None:
+    """Test async_setup_entry for a device with different UDN from SSDP."""
+    test_discovery = copy.deepcopy(TEST_DISCOVERY)
+    test_discovery.upnp[ATTR_UPNP_UDN] = "uuid:another_udn"
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=TEST_USN,
+        data={
+            CONFIG_ENTRY_ST: TEST_ST,
+            CONFIG_ENTRY_UDN: TEST_UDN,
+            CONFIG_ENTRY_ORIGINAL_UDN: TEST_UDN,
+            CONFIG_ENTRY_LOCATION: TEST_LOCATION,
+            CONFIG_ENTRY_MAC_ADDRESS: TEST_MAC_ADDRESS,
+        },
+        options={
+            CONFIG_ENTRY_FORCE_POLL: False,
+        },
+    )
+
+    # Set up device discovery callback.
+    async def register_callback(
+        hass: HomeAssistant,
+        callback: Callable[
+            [SsdpServiceInfo, ssdp.SsdpChange], Coroutine[Any, Any, None] | None
+        ],
+        match_dict: dict[str, str] | None = None,
+    ) -> MagicMock:
+        """Immediately do callback."""
+        await callback(test_discovery, ssdp.SsdpChange.ALIVE)
+        return MagicMock()
+
+    with (
+        patch(
+            "homeassistant.components.ssdp.async_register_callback",
+            side_effect=register_callback,
+        ),
+        patch(
+            "homeassistant.components.ssdp.async_get_discovery_info_by_st",
+            return_value=[test_discovery],
+        ),
+    ):
+        # Load config_entry.
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id) is True
+
+    # Ensure that the IPv4 location is used.
+    mock_async_create_device.assert_called_once_with(TEST_LOCATION)
+
+
+@pytest.mark.usefixtures(
+    "ssdp_instant_discovery",
+    "mock_get_source_ip",
+    "mock_mac_address_from_host",
+)
+async def test_async_setup_entry_force_poll(
+    hass: HomeAssistant, mock_igd_device: IgdDevice
+) -> None:
+    """Test async_setup_entry with forced polling."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=TEST_USN,
+        data={
+            CONFIG_ENTRY_ST: TEST_ST,
+            CONFIG_ENTRY_UDN: TEST_UDN,
+            CONFIG_ENTRY_ORIGINAL_UDN: TEST_UDN,
+            CONFIG_ENTRY_LOCATION: TEST_LOCATION,
+            CONFIG_ENTRY_MAC_ADDRESS: TEST_MAC_ADDRESS,
+        },
+        options={
+            CONFIG_ENTRY_FORCE_POLL: True,
+        },
+    )
+
+    # Load config_entry.
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id) is True
+
+    mock_igd_device.async_subscribe_services.assert_not_called()
+
+    # Ensure that the device is forced to poll.
+    mock_igd_device.async_get_traffic_and_status_data.assert_called_with(
+        None, force_poll=True
+    )
+
+
+@pytest.mark.usefixtures(
+    "ssdp_instant_discovery",
+    "mock_get_source_ip",
+    "mock_mac_address_from_host",
+)
+async def test_async_setup_entry_force_poll_subscribe_error(
+    hass: HomeAssistant, mock_igd_device: IgdDevice
+) -> None:
+    """Test async_setup_entry where subscribing fails."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=TEST_USN,
+        data={
+            CONFIG_ENTRY_ST: TEST_ST,
+            CONFIG_ENTRY_UDN: TEST_UDN,
+            CONFIG_ENTRY_ORIGINAL_UDN: TEST_UDN,
+            CONFIG_ENTRY_LOCATION: TEST_LOCATION,
+            CONFIG_ENTRY_MAC_ADDRESS: TEST_MAC_ADDRESS,
+        },
+        options={
+            CONFIG_ENTRY_FORCE_POLL: False,
+        },
+    )
+
+    # Subscribing partially succeeds, but not completely.
+    # Unsubscribing will fail for the subscribed services afterwards.
+    mock_igd_device.async_subscribe_services.side_effect = UpnpCommunicationError
+    mock_igd_device.async_unsubscribe_services.side_effect = UpnpCommunicationError
+
+    # Load config_entry, should still be able to load,
+    # falling back to polling/the old functionality.
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id) is True
+
+    # Ensure that the device is forced to poll.
+    mock_igd_device.async_get_traffic_and_status_data.assert_called_with(
+        None, force_poll=True
+    )

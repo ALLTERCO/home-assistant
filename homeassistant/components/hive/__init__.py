@@ -1,0 +1,105 @@
+"""Support for the Hive devices and services."""
+
+from collections.abc import Awaitable, Callable, Coroutine
+from functools import wraps
+from typing import Any, Concatenate
+
+from aiohttp.web_exceptions import HTTPException
+from apyhiveapi import Auth, Hive
+from apyhiveapi.helper.hive_exceptions import HiveReauthRequired
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import (
+    aiohttp_client,
+    config_validation as cv,
+    device_registry as dr,
+)
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.typing import ConfigType
+
+from .const import DOMAIN, PLATFORMS
+from .entity import HiveEntity
+from .services import async_setup_services
+
+type HiveConfigEntry = ConfigEntry[Hive]
+
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Hive integration."""
+    async_setup_services(hass)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: HiveConfigEntry) -> None:
+    """Set up Hive from a config entry."""
+    web_session = aiohttp_client.async_get_clientsession(hass)
+    hive_config = dict(entry.data)
+    hive = Hive(web_session)
+
+    entry.runtime_data = hive
+
+    try:
+        devices = await hive.session.startSession(hive_config)
+    except HTTPException as error:
+        raise ConfigEntryNotReady(
+            f"Could not connect to the internet: {error}"
+        ) from error
+    except HiveReauthRequired as err:
+        raise ConfigEntryAuthFailed from err
+
+    hub_data = devices["parent"][0]
+    connections: set[tuple[str, str]] = set()
+    if mac := hub_data.get("macAddress"):
+        connections.add((dr.CONNECTION_NETWORK_MAC, mac))
+
+    device_registry = dr.async_get(hass)
+    device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, hub_data["device_id"])},
+        connections=connections,
+        name=hub_data["hiveName"],
+        model=hub_data["deviceData"]["model"],
+        sw_version=hub_data["deviceData"]["version"],
+        manufacturer=hub_data["deviceData"]["manufacturer"],
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: HiveConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: HiveConfigEntry) -> None:
+    """Remove a config entry."""
+    hive = Auth(entry.data["username"], entry.data["password"])
+    await hive.forget_device(
+        entry.data["tokens"]["AuthenticationResult"]["AccessToken"],
+        entry.data["device_data"][1],
+    )
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: HiveConfigEntry, device_entry: dr.AnyDeviceEntry
+) -> bool:
+    """Remove a config entry from a device."""
+    return True
+
+
+def refresh_system[_HiveEntityT: HiveEntity, **_P](
+    func: Callable[Concatenate[_HiveEntityT, _P], Awaitable[Any]],
+) -> Callable[Concatenate[_HiveEntityT, _P], Coroutine[Any, Any, None]]:
+    """Force update all entities after state change."""
+
+    @wraps(func)
+    async def wrapper(self: _HiveEntityT, *args: _P.args, **kwargs: _P.kwargs) -> None:
+        await func(self, *args, **kwargs)
+        async_dispatcher_send(self.hass, DOMAIN)
+
+    return wrapper

@@ -1,39 +1,126 @@
 """Component to embed Google Cast."""
-from homeassistant import config_entries
-from homeassistant.helpers import config_entry_flow
+
+from dataclasses import dataclass, field
+from typing import Protocol
+from uuid import UUID
+
+from pychromecast import Chromecast
+from pychromecast.controllers.multizone import MultizoneManager
+from pychromecast.discovery import CastBrowser
+
+from homeassistant.components.media_player import BrowseMedia, MediaType
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers.integration_platform import LazyIntegrationPlatforms
+from homeassistant.helpers.typing import ConfigType
+
+from . import home_assistant_cast
+from .const import DOMAIN
+from .services import async_setup_services
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+PLATFORMS = [Platform.MEDIA_PLAYER]
+
+type CastConfigEntry = ConfigEntry[CastRuntimeData]
+
+__all__ = [
+    "DOMAIN",
+]
 
 
-DOMAIN = 'cast'
-REQUIREMENTS = ['pychromecast==2.1.0']
+@dataclass
+class CastRuntimeData:
+    """Runtime data for the Cast integration."""
+
+    cast_platforms: LazyIntegrationPlatforms[CastProtocol]
+    refresh_token: str
+    unknown_models: dict[str | None, tuple[str | None, str | None]] = field(
+        default_factory=dict
+    )
+    added_cast_devices: set[UUID] = field(default_factory=set)
+    browser: CastBrowser | None = None
+    multizone_manager: MultizoneManager | None = None
 
 
-async def async_setup(hass, config):
+@callback
+def _process_cast_platform(
+    hass: HomeAssistant, integration_domain: str, platform: CastProtocol
+) -> CastProtocol:
+    """Process a cast platform."""
+    if (
+        not hasattr(platform, "async_get_media_browser_root_object")
+        or not hasattr(platform, "async_browse_media")
+        or not hasattr(platform, "async_play_media")
+    ):
+        raise HomeAssistantError(f"Invalid cast platform {platform}")
+    return platform
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Cast component."""
-    conf = config.get(DOMAIN)
-
-    hass.data[DOMAIN] = conf or {}
-
-    if conf is not None:
-        hass.async_create_task(hass.config_entries.flow.async_init(
-            DOMAIN, context={'source': config_entries.SOURCE_IMPORT}))
-
+    async_setup_services(hass)
     return True
 
 
-async def async_setup_entry(hass, entry):
+async def async_setup_entry(hass: HomeAssistant, entry: CastConfigEntry) -> None:
     """Set up Cast from a config entry."""
-    hass.async_create_task(hass.config_entries.async_forward_entry_setup(
-        entry, 'media_player'))
+    refresh_token = await home_assistant_cast.async_setup_ha_cast(hass, entry)
+    entry.runtime_data = CastRuntimeData(
+        cast_platforms=LazyIntegrationPlatforms(hass, DOMAIN, _process_cast_platform),
+        refresh_token=refresh_token,
+    )
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+class CastProtocol(Protocol):
+    """Define the format of cast platforms."""
+
+    async def async_get_media_browser_root_object(
+        self, hass: HomeAssistant, cast_type: str
+    ) -> list[BrowseMedia]:
+        """Create a list of root objects for media browsing."""
+
+    async def async_browse_media(
+        self,
+        hass: HomeAssistant,
+        media_content_type: MediaType | str,
+        media_content_id: str,
+        cast_type: str,
+    ) -> BrowseMedia | None:
+        """Browse media.
+
+        Return a BrowseMedia object or None if the media does not belong to
+        this platform.
+        """
+
+    async def async_play_media(
+        self,
+        hass: HomeAssistant,
+        cast_entity_id: str,
+        chromecast: Chromecast,
+        media_type: MediaType | str,
+        media_id: str,
+    ) -> bool:
+        """Play media.
+
+        Return True if the media is played by the platform, False if not.
+        """
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: CastConfigEntry) -> None:
+    """Remove Home Assistant Cast user."""
+    await home_assistant_cast.async_remove_user(hass, entry)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: CastConfigEntry, device_entry: dr.AnyDeviceEntry
+) -> bool:
+    """Remove cast config entry from a device.
+
+    The actual cleanup is done in CastMediaPlayerEntity.async_will_remove_from_hass.
+    """
     return True
-
-
-async def _async_has_devices(hass):
-    """Return if there are devices that can be discovered."""
-    from pychromecast.discovery import discover_chromecasts
-
-    return await hass.async_add_executor_job(discover_chromecasts)
-
-
-config_entry_flow.register_discovery_flow(
-    DOMAIN, 'Google Cast', _async_has_devices,
-    config_entries.CONN_CLASS_LOCAL_PUSH)

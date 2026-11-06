@@ -1,256 +1,726 @@
 """Tests for deCONZ config flow."""
-from unittest.mock import patch
-import pytest
 
-import voluptuous as vol
-from homeassistant.components.deconz import config_flow
-from tests.common import MockConfigEntry
+import logging
+from unittest.mock import patch
 
 import pydeconz
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+
+from homeassistant.components.deconz.config_flow import (
+    CONF_MANUAL_INPUT,
+    CONF_SERIAL,
+    DECONZ_MANUFACTURERURL,
+)
+from homeassistant.components.deconz.const import (
+    CONF_ALLOW_CLIP_SENSOR,
+    CONF_ALLOW_DECONZ_GROUPS,
+    CONF_ALLOW_NEW_DEVICES,
+    CONF_MASTER_GATEWAY,
+    DOMAIN,
+    HASSIO_CONFIGURATION_URL,
+)
+from homeassistant.config_entries import SOURCE_HASSIO, SOURCE_SSDP, SOURCE_USER
+from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_PORT, CONTENT_TYPE_JSON
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers.service_info.hassio import HassioServiceInfo
+from homeassistant.helpers.service_info.ssdp import (
+    ATTR_UPNP_MANUFACTURER_URL,
+    ATTR_UPNP_SERIAL,
+    SsdpServiceInfo,
+)
+
+from .conftest import API_KEY, BRIDGE_ID
+
+BAD_BRIDGEID = "0000000000000000"
 
 
-async def test_flow_works(hass, aioclient_mock):
-    """Test that config flow works."""
-    aioclient_mock.get(pydeconz.utils.URL_DISCOVER, json=[
-        {'id': 'id', 'internalipaddress': '1.2.3.4', 'internalport': 80}
-    ])
-    aioclient_mock.post('http://1.2.3.4:80/api', json=[
-        {"success": {"username": "1234567890ABCDEF"}}
-    ])
+async def test_flow_discovered_bridges(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test that config flow works for discovered bridges."""
+    logging.getLogger("homeassistant.components.deconz").setLevel(logging.DEBUG)
+    aioclient_mock.get(
+        pydeconz.utils.URL_DISCOVER,
+        json=[
+            {"id": BRIDGE_ID, "internalipaddress": "1.2.3.4", "internalport": 80},
+            {"id": "1234E567890A", "internalipaddress": "5.6.7.8", "internalport": 80},
+        ],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
 
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
-    await flow.async_step_init()
-    await flow.async_step_link(user_input={})
-    result = await flow.async_step_options(
-        user_input={'allow_clip_sensor': True, 'allow_deconz_groups': True})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
 
-    assert result['type'] == 'create_entry'
-    assert result['title'] == 'deCONZ-id'
-    assert result['data'] == {
-        'bridgeid': 'id',
-        'host': '1.2.3.4',
-        'port': 80,
-        'api_key': '1234567890ABCDEF',
-        'allow_clip_sensor': True,
-        'allow_deconz_groups': True
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "1.2.3.4"}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
+
+    aioclient_mock.post(
+        "http://1.2.3.4:80/api",
+        json=[{"success": {"username": API_KEY}}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == BRIDGE_ID
+    assert result["data"] == {
+        CONF_HOST: "1.2.3.4",
+        CONF_PORT: 80,
+        CONF_API_KEY: API_KEY,
     }
+    assert result["result"].unique_id == BRIDGE_ID
 
 
-async def test_flow_already_registered_bridge(hass):
-    """Test config flow don't allow more than one bridge to be registered."""
-    MockConfigEntry(domain='deconz', data={
-        'host': '1.2.3.4'
-    }).add_to_hass(hass)
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
+async def test_flow_discovered_bridge_already_configured(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    config_entry_setup: MockConfigEntry,
+) -> None:
+    """Test that a discovered bridge updates an existing config entry."""
+    aioclient_mock.get(
+        pydeconz.utils.URL_DISCOVER,
+        json=[{"id": BRIDGE_ID, "internalipaddress": "2.3.4.5", "internalport": 80}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
 
-    result = await flow.async_step_init()
-    assert result['type'] == 'abort'
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
 
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
 
-async def test_flow_no_discovered_bridges(hass, aioclient_mock):
-    """Test config flow discovers no bridges."""
-    aioclient_mock.get(pydeconz.utils.URL_DISCOVER, json=[])
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "2.3.4.5"}
+    )
 
-    result = await flow.async_step_init()
-    assert result['type'] == 'abort'
-
-
-async def test_flow_one_bridge_discovered(hass, aioclient_mock):
-    """Test config flow discovers one bridge."""
-    aioclient_mock.get(pydeconz.utils.URL_DISCOVER, json=[
-        {'id': 'id', 'internalipaddress': '1.2.3.4', 'internalport': 80}
-    ])
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
-
-    result = await flow.async_step_init()
-    assert result['type'] == 'form'
-    assert result['step_id'] == 'link'
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert config_entry_setup.data[CONF_HOST] == "2.3.4.5"
 
 
-async def test_flow_two_bridges_discovered(hass, aioclient_mock):
-    """Test config flow discovers two bridges."""
-    aioclient_mock.get(pydeconz.utils.URL_DISCOVER, json=[
-        {'id': 'id1', 'internalipaddress': '1.2.3.4', 'internalport': 80},
-        {'id': 'id2', 'internalipaddress': '5.6.7.8', 'internalport': 80}
-    ])
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
+async def test_flow_manual_configuration_decision(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test that config flow for one discovered bridge works."""
+    aioclient_mock.get(
+        pydeconz.utils.URL_DISCOVER,
+        json=[{"id": BRIDGE_ID, "internalipaddress": "1.2.3.4", "internalport": 80}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
 
-    result = await flow.async_step_init()
-    assert result['type'] == 'form'
-    assert result['step_id'] == 'init'
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
 
-    with pytest.raises(vol.Invalid):
-        assert result['data_schema']({'host': '0.0.0.0'})
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: CONF_MANUAL_INPUT}
+    )
 
-    result['data_schema']({'host': '1.2.3.4'})
-    result['data_schema']({'host': '5.6.7.8'})
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "manual_input"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "1.2.3.4", CONF_PORT: 80},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
+
+    aioclient_mock.post(
+        "http://1.2.3.4:80/api",
+        json=[{"success": {"username": API_KEY}}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    aioclient_mock.get(
+        f"http://1.2.3.4:80/api/{API_KEY}/config",
+        json={"bridgeid": BRIDGE_ID},
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == BRIDGE_ID
+    assert result["data"] == {
+        CONF_HOST: "1.2.3.4",
+        CONF_PORT: 80,
+        CONF_API_KEY: API_KEY,
+    }
+    assert result["result"].unique_id == BRIDGE_ID
 
 
-async def test_link_no_api_key(hass, aioclient_mock):
+async def test_flow_manual_configuration(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test config flow works with manual config after no discovered bridges."""
+    logging.getLogger("homeassistant.components.deconz").setLevel(logging.DEBUG)
+    aioclient_mock.get(
+        pydeconz.utils.URL_DISCOVER,
+        json=[],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "manual_input"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "1.2.3.4", CONF_PORT: 80},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
+
+    aioclient_mock.post(
+        "http://1.2.3.4:80/api",
+        json=[{"success": {"username": API_KEY}}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    aioclient_mock.get(
+        f"http://1.2.3.4:80/api/{API_KEY}/config",
+        json={"bridgeid": BRIDGE_ID},
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == BRIDGE_ID
+    assert result["data"] == {
+        CONF_HOST: "1.2.3.4",
+        CONF_PORT: 80,
+        CONF_API_KEY: API_KEY,
+    }
+    assert result["result"].unique_id == BRIDGE_ID
+
+
+async def test_manual_configuration_after_discovery_timeout(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test failed discovery fallbacks to manual configuration."""
+    aioclient_mock.get(pydeconz.utils.URL_DISCOVER, exc=TimeoutError)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "manual_input"
+    assert not hass.config_entries.flow._progress[result["flow_id"]].bridges
+
+
+async def test_manual_configuration_after_discovery_ResponseError(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test failed discovery fallbacks to manual configuration."""
+    aioclient_mock.get(pydeconz.utils.URL_DISCOVER, exc=pydeconz.errors.ResponseError)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "manual_input"
+    assert not hass.config_entries.flow._progress[result["flow_id"]].bridges
+
+
+async def test_manual_configuration_update_configuration(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    config_entry_setup: MockConfigEntry,
+) -> None:
+    """Test that manual configuration can update existing config entry."""
+    aioclient_mock.get(
+        pydeconz.utils.URL_DISCOVER,
+        json=[],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "manual_input"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "2.3.4.5", CONF_PORT: 80},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
+
+    aioclient_mock.post(
+        "http://2.3.4.5:80/api",
+        json=[{"success": {"username": API_KEY}}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    aioclient_mock.get(
+        f"http://2.3.4.5:80/api/{API_KEY}/config",
+        json={"bridgeid": BRIDGE_ID},
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert config_entry_setup.data[CONF_HOST] == "2.3.4.5"
+
+
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_manual_configuration_dont_update_configuration(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test that _create_entry work and that bridgeid can be requested."""
+    aioclient_mock.get(
+        pydeconz.utils.URL_DISCOVER,
+        json=[],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "manual_input"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "1.2.3.4", CONF_PORT: 80},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
+
+    aioclient_mock.post(
+        "http://1.2.3.4:80/api",
+        json=[{"success": {"username": API_KEY}}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    aioclient_mock.get(
+        f"http://1.2.3.4:80/api/{API_KEY}/config",
+        json={"bridgeid": BRIDGE_ID},
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+
+
+async def test_manual_configuration_timeout_get_bridge(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test that _create_entry handles a timeout."""
+    aioclient_mock.get(
+        pydeconz.utils.URL_DISCOVER,
+        json=[],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "manual_input"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_HOST: "1.2.3.4", CONF_PORT: 80},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
+
+    aioclient_mock.post(
+        "http://1.2.3.4:80/api",
+        json=[{"success": {"username": API_KEY}}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    aioclient_mock.get(f"http://1.2.3.4:80/api/{API_KEY}/config", exc=TimeoutError)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "no_bridges"
+
+
+@pytest.mark.parametrize(
+    ("raised_error", "error_string"),
+    [
+        (pydeconz.errors.LinkButtonNotPressed, "linking_not_possible"),
+        (TimeoutError, "no_key"),
+        (pydeconz.errors.ResponseError, "no_key"),
+        (pydeconz.errors.RequestError, "no_key"),
+    ],
+)
+async def test_link_step_fails(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    raised_error: Exception,
+    error_string: str,
+) -> None:
     """Test config flow should abort if no API key was possible to retrieve."""
-    aioclient_mock.post('http://1.2.3.4:80/api', json=[])
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
-    flow.deconz_config = {'host': '1.2.3.4', 'port': 80}
+    aioclient_mock.get(
+        pydeconz.utils.URL_DISCOVER,
+        json=[{"id": BRIDGE_ID, "internalipaddress": "1.2.3.4", "internalport": 80}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
 
-    result = await flow.async_step_link(user_input={})
-    assert result['type'] == 'form'
-    assert result['step_id'] == 'link'
-    assert result['errors'] == {'base': 'no_key'}
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
 
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_HOST: "1.2.3.4"}
+    )
 
-async def test_link_already_registered_bridge(hass):
-    """Test that link verifies to only allow one config entry to complete.
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
 
-    This is possible with discovery which will allow the user to complete
-    a second config entry and then complete the discovered config entry.
-    """
-    MockConfigEntry(domain='deconz', data={
-        'host': '1.2.3.4'
-    }).add_to_hass(hass)
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
-    flow.deconz_config = {'host': '1.2.3.4', 'port': 80}
+    aioclient_mock.post("http://1.2.3.4:80/api", exc=raised_error)
 
-    result = await flow.async_step_link(user_input={})
-    assert result['type'] == 'abort'
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
 
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
+    assert result["errors"] == {"base": error_string}
 
-async def test_bridge_discovery(hass):
-    """Test a bridge being discovered with no additional config file."""
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
-    with patch.object(config_flow, 'load_json', return_value={}):
-        result = await flow.async_step_discovery({
-            'host': '1.2.3.4',
-            'port': 80,
-            'serial': 'id'
-        })
+    aioclient_mock.clear_requests()
+    aioclient_mock.post(
+        "http://1.2.3.4:80/api",
+        json=[{"success": {"username": API_KEY}}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
 
-    assert result['type'] == 'form'
-    assert result['step_id'] == 'link'
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
 
 
-async def test_bridge_discovery_config_file(hass):
-    """Test a bridge being discovered with a corresponding config file."""
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
-    with patch.object(config_flow, 'load_json',
-                      return_value={'host': '1.2.3.4',
-                                    'port': 8080,
-                                    'api_key': '1234567890ABCDEF'}):
-        result = await flow.async_step_discovery({
-            'host': '1.2.3.4',
-            'port': 80,
-            'serial': 'id'
-        })
+async def test_reauth_flow_update_configuration(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    config_entry_setup: MockConfigEntry,
+) -> None:
+    """Verify reauth flow can update gateway API key."""
+    result = await config_entry_setup.start_reauth_flow(hass)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
 
-    assert result['type'] == 'create_entry'
-    assert result['title'] == 'deCONZ-id'
-    assert result['data'] == {
-        'bridgeid': 'id',
-        'host': '1.2.3.4',
-        'port': 80,
-        'api_key': '1234567890ABCDEF',
-        'allow_clip_sensor': True,
-        'allow_deconz_groups': True
+    new_api_key = "new_key"
+
+    aioclient_mock.post(
+        "http://1.2.3.4:80/api",
+        json=[{"success": {"username": new_api_key}}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    aioclient_mock.get(
+        f"http://1.2.3.4:80/api/{new_api_key}/config",
+        json={"bridgeid": BRIDGE_ID},
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert config_entry_setup.data[CONF_API_KEY] == new_api_key
+
+
+async def test_flow_ssdp_discovery(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test that config flow for one discovered bridge works."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        data=SsdpServiceInfo(
+            ssdp_usn="mock_usn",
+            ssdp_st="mock_st",
+            ssdp_location="http://1.2.3.4:80/",
+            upnp={
+                ATTR_UPNP_MANUFACTURER_URL: DECONZ_MANUFACTURERURL,
+                ATTR_UPNP_SERIAL: BRIDGE_ID,
+            },
+        ),
+        context={"source": SOURCE_SSDP},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
+
+    flows = hass.config_entries.flow.async_progress()
+    assert len(flows) == 1
+    assert flows[0].get("context", {}).get("configuration_url") == "http://1.2.3.4:80"
+
+    aioclient_mock.post(
+        "http://1.2.3.4:80/api",
+        json=[{"success": {"username": API_KEY}}],
+        headers={"content-type": CONTENT_TYPE_JSON},
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == BRIDGE_ID
+    assert result["data"] == {
+        CONF_HOST: "1.2.3.4",
+        CONF_PORT: 80,
+        CONF_API_KEY: API_KEY,
     }
+    assert result["result"].unique_id == BRIDGE_ID
 
 
-async def test_bridge_discovery_other_config_file(hass):
-    """Test a bridge being discovered with another bridges config file."""
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
-    with patch.object(config_flow, 'load_json',
-                      return_value={'host': '5.6.7.8', 'api_key': '5678'}):
-        result = await flow.async_step_discovery({
-            'host': '1.2.3.4',
-            'port': 80,
-            'serial': 'id'
-        })
+async def test_ssdp_discovery_update_configuration(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Test if a discovered bridge is configured but updates with new attributes."""
+    with patch(
+        "homeassistant.components.deconz.async_setup_entry",
+        return_value=None,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            data=SsdpServiceInfo(
+                ssdp_usn="mock_usn",
+                ssdp_st="mock_st",
+                ssdp_location="http://2.3.4.5:80/",
+                upnp={
+                    ATTR_UPNP_MANUFACTURER_URL: DECONZ_MANUFACTURERURL,
+                    ATTR_UPNP_SERIAL: BRIDGE_ID,
+                },
+            ),
+            context={"source": SOURCE_SSDP},
+        )
+        await hass.async_block_till_done()
 
-    assert result['type'] == 'form'
-    assert result['step_id'] == 'link'
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert config_entry_setup.data[CONF_HOST] == "2.3.4.5"
 
 
-async def test_bridge_discovery_already_configured(hass):
+async def test_ssdp_discovery_dont_update_configuration(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
     """Test if a discovered bridge has already been configured."""
-    MockConfigEntry(domain='deconz', data={
-        'host': '1.2.3.4'
-    }).add_to_hass(hass)
 
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        data=SsdpServiceInfo(
+            ssdp_usn="mock_usn",
+            ssdp_st="mock_st",
+            ssdp_location="http://1.2.3.4:80/",
+            upnp={
+                ATTR_UPNP_MANUFACTURER_URL: DECONZ_MANUFACTURERURL,
+                ATTR_UPNP_SERIAL: BRIDGE_ID,
+            },
+        ),
+        context={"source": SOURCE_SSDP},
+    )
 
-    result = await flow.async_step_discovery({
-        'host': '1.2.3.4',
-        'serial': 'id'
-    })
-
-    assert result['type'] == 'abort'
-
-
-async def test_import_without_api_key(hass):
-    """Test importing a host without an API key."""
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
-
-    result = await flow.async_step_import({
-        'host': '1.2.3.4',
-    })
-
-    assert result['type'] == 'form'
-    assert result['step_id'] == 'link'
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert config_entry_setup.data[CONF_HOST] == "1.2.3.4"
 
 
-async def test_import_with_api_key(hass):
-    """Test importing a host with an API key."""
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
+@pytest.mark.parametrize("config_entry_source", [SOURCE_HASSIO])
+async def test_ssdp_discovery_dont_update_existing_hassio_configuration(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Test to ensure the SSDP discovery does not update an Hass.io entry."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        data=SsdpServiceInfo(
+            ssdp_usn="mock_usn",
+            ssdp_st="mock_st",
+            ssdp_location="http://1.2.3.4:80/",
+            upnp={
+                ATTR_UPNP_MANUFACTURER_URL: DECONZ_MANUFACTURERURL,
+                ATTR_UPNP_SERIAL: BRIDGE_ID,
+            },
+        ),
+        context={"source": SOURCE_SSDP},
+    )
 
-    result = await flow.async_step_import({
-        'bridgeid': 'id',
-        'host': '1.2.3.4',
-        'port': 80,
-        'api_key': '1234567890ABCDEF'
-    })
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert config_entry_setup.data[CONF_HOST] == "1.2.3.4"
 
-    assert result['type'] == 'create_entry'
-    assert result['title'] == 'deCONZ-id'
-    assert result['data'] == {
-        'bridgeid': 'id',
-        'host': '1.2.3.4',
-        'port': 80,
-        'api_key': '1234567890ABCDEF',
-        'allow_clip_sensor': True,
-        'allow_deconz_groups': True
+
+async def test_flow_hassio_discovery(hass: HomeAssistant) -> None:
+    """Test hassio discovery flow works."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        data=HassioServiceInfo(
+            config={
+                "addon": "Mock Addon",
+                CONF_HOST: "mock-deconz",
+                CONF_PORT: 80,
+                CONF_SERIAL: BRIDGE_ID,
+                CONF_API_KEY: API_KEY,
+            },
+            name="Mock Addon",
+            slug="deconz",
+            uuid="1234",
+        ),
+        context={"source": SOURCE_HASSIO},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "hassio_confirm"
+    assert result["description_placeholders"] == {"addon": "Mock Addon"}
+
+    flows = hass.config_entries.flow.async_progress()
+    assert len(flows) == 1
+    assert (
+        flows[0].get("context", {}).get("configuration_url") == HASSIO_CONFIGURATION_URL
+    )
+
+    with patch(
+        "homeassistant.components.deconz.async_setup_entry",
+        return_value=None,
+    ) as mock_setup_entry:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input={}
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["result"].data == {
+        CONF_HOST: "mock-deconz",
+        CONF_PORT: 80,
+        CONF_API_KEY: API_KEY,
     }
+    assert result["result"].unique_id == BRIDGE_ID
+    assert len(mock_setup_entry.mock_calls) == 1
 
 
-async def test_options(hass, aioclient_mock):
-    """Test that options work and that bridgeid can be requested."""
-    aioclient_mock.get('http://1.2.3.4:80/api/1234567890ABCDEF/config',
-                       json={"bridgeid": "id"})
-    flow = config_flow.DeconzFlowHandler()
-    flow.hass = hass
-    flow.deconz_config = {'host': '1.2.3.4',
-                          'port': 80,
-                          'api_key': '1234567890ABCDEF'}
-    result = await flow.async_step_options(
-        user_input={'allow_clip_sensor': False, 'allow_deconz_groups': False})
-    assert result['type'] == 'create_entry'
-    assert result['title'] == 'deCONZ-id'
-    assert result['data'] == {
-        'bridgeid': 'id',
-        'host': '1.2.3.4',
-        'port': 80,
-        'api_key': '1234567890ABCDEF',
-        'allow_clip_sensor': False,
-        'allow_deconz_groups': False
+async def test_hassio_discovery_update_configuration(
+    hass: HomeAssistant,
+    config_entry_setup: MockConfigEntry,
+) -> None:
+    """Test we can update an existing config entry."""
+    with patch(
+        "homeassistant.components.deconz.async_setup_entry",
+        return_value=None,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            data=HassioServiceInfo(
+                config={
+                    CONF_HOST: "2.3.4.5",
+                    CONF_PORT: 8080,
+                    CONF_API_KEY: "updated",
+                    CONF_SERIAL: BRIDGE_ID,
+                },
+                name="Mock Addon",
+                slug="deconz",
+                uuid="1234",
+            ),
+            context={"source": SOURCE_HASSIO},
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert config_entry_setup.data[CONF_HOST] == "2.3.4.5"
+    assert config_entry_setup.data[CONF_PORT] == 8080
+    assert config_entry_setup.data[CONF_API_KEY] == "updated"
+
+
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_hassio_discovery_dont_update_configuration(hass: HomeAssistant) -> None:
+    """Test we can update an existing config entry."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        data=HassioServiceInfo(
+            config={
+                CONF_HOST: "1.2.3.4",
+                CONF_PORT: 80,
+                CONF_API_KEY: API_KEY,
+                CONF_SERIAL: BRIDGE_ID,
+            },
+            name="Mock Addon",
+            slug="deconz",
+            uuid="1234",
+        ),
+        context={"source": SOURCE_HASSIO},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+
+
+async def test_option_flow(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Test config flow options."""
+    result = await hass.config_entries.options.async_init(config_entry_setup.entry_id)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "deconz_devices"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_ALLOW_CLIP_SENSOR: False,
+            CONF_ALLOW_DECONZ_GROUPS: False,
+            CONF_ALLOW_NEW_DEVICES: False,
+        },
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        CONF_ALLOW_CLIP_SENSOR: False,
+        CONF_ALLOW_DECONZ_GROUPS: False,
+        CONF_ALLOW_NEW_DEVICES: False,
+        CONF_MASTER_GATEWAY: True,
     }

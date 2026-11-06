@@ -1,0 +1,13 @@
+{
+  "domain": "huisbaasje",
+  "name": "EnergyFlip",
+  "categories": ["energy.meters_monitoring"],
+  "codeowners": ["@dennisschroer", "@DieEneSchrodinger"],
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/huisbaasje",
+  "integration_type": "device",
+  "iot_class": "cloud_polling",
+  "loggers": ["energyflip"],
+  "requirements": ["energyflip-api-client==0.3.0"]
+}

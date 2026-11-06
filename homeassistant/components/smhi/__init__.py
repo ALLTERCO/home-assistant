@@ -1,0 +1,62 @@
+"""Support for the Swedish weather institute weather service."""
+
+from homeassistant.const import (
+    CONF_LATITUDE,
+    CONF_LOCATION,
+    CONF_LONGITUDE,
+    CONF_NAME,
+    Platform,
+)
+from homeassistant.core import HomeAssistant
+
+from .coordinator import (
+    SMHIConfigEntry,
+    SMHIDataUpdateCoordinator,
+    SMHIFireDataUpdateCoordinator,
+)
+
+PLATFORMS = [Platform.SENSOR, Platform.WEATHER]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: SMHIConfigEntry) -> None:
+    """Set up SMHI forecast as config entry."""
+
+    # Setting unique id where missing
+    if entry.unique_id is None:
+        unique_id = (
+            f"{entry.data[CONF_LOCATION][CONF_LATITUDE]}"
+            f"-{entry.data[CONF_LOCATION][CONF_LONGITUDE]}"
+        )
+        hass.config_entries.async_update_entry(entry, unique_id=unique_id)
+
+    coordinator = SMHIDataUpdateCoordinator(hass, entry)
+    await coordinator.async_config_entry_first_refresh()
+    fire_coordinator = SMHIFireDataUpdateCoordinator(hass, entry)
+    await fire_coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = (coordinator, fire_coordinator)
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: SMHIConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: SMHIConfigEntry) -> None:
+    """Migrate old entry."""
+
+    if entry.version == 1:
+        new_data = {
+            CONF_NAME: entry.data[CONF_NAME],
+            CONF_LOCATION: {
+                CONF_LATITUDE: entry.data[CONF_LATITUDE],
+                CONF_LONGITUDE: entry.data[CONF_LONGITUDE],
+            },
+        }
+        hass.config_entries.async_update_entry(entry, data=new_data, version=2)
+
+    if entry.version == 2:
+        new_data = entry.data.copy()
+        new_data.pop(CONF_NAME)
+        hass.config_entries.async_update_entry(entry, data=new_data, version=3)

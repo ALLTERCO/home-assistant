@@ -1,101 +1,142 @@
 """The tests for the Remote component, adapted from Light Test."""
-# pylint: disable=protected-access
 
-import unittest
+from pytest_homeassistant.common import async_mock_service
 
-from homeassistant.setup import setup_component
+from homeassistant.components import remote
+from homeassistant.components.remote import (
+    ATTR_ALTERNATIVE,
+    ATTR_COMMAND,
+    ATTR_COMMAND_TYPE,
+    ATTR_DELAY_SECS,
+    ATTR_DEVICE,
+    ATTR_NUM_REPEATS,
+    ATTR_TIMEOUT,
+    DOMAIN,
+)
 from homeassistant.const import (
-    ATTR_ENTITY_ID, STATE_ON, STATE_OFF, CONF_PLATFORM,
-    SERVICE_TURN_ON, SERVICE_TURN_OFF)
-import homeassistant.components.remote as remote
+    ATTR_ENTITY_ID,
+    CONF_PLATFORM,
+    SERVICE_TURN_OFF,
+    SERVICE_TURN_ON,
+    STATE_OFF,
+    STATE_ON,
+)
+from homeassistant.core import HomeAssistant
 
-from tests.common import mock_service, get_test_home_assistant
-from tests.components.remote import common
+TEST_PLATFORM = {DOMAIN: {CONF_PLATFORM: "test"}}
+SERVICE_SEND_COMMAND = "send_command"
+SERVICE_LEARN_COMMAND = "learn_command"
+SERVICE_DELETE_COMMAND = "delete_command"
+ENTITY_ID = "entity_id_val"
 
-TEST_PLATFORM = {remote.DOMAIN: {CONF_PLATFORM: 'test'}}
-SERVICE_SEND_COMMAND = 'send_command'
+
+async def test_is_on(hass: HomeAssistant) -> None:
+    """Test is_on."""
+    hass.states.async_set("remote.test", STATE_ON)
+    assert remote.is_on(hass, "remote.test")
+
+    hass.states.async_set("remote.test", STATE_OFF)
+    assert not remote.is_on(hass, "remote.test")
 
 
-class TestRemote(unittest.TestCase):
-    """Test the remote module."""
+async def test_turn_on(hass: HomeAssistant) -> None:
+    """Test turn_on."""
+    turn_on_calls = async_mock_service(hass, DOMAIN, SERVICE_TURN_ON)
+    await hass.services.async_call(DOMAIN, SERVICE_TURN_ON, {ATTR_ENTITY_ID: ENTITY_ID})
 
-    # pylint: disable=invalid-name
-    def setUp(self):
-        """Set up things to be run when tests are started."""
-        self.hass = get_test_home_assistant()
+    await hass.async_block_till_done()
 
-    # pylint: disable=invalid-name
-    def tearDown(self):
-        """Stop everything that was started."""
-        self.hass.stop()
+    assert len(turn_on_calls) == 1
+    call = turn_on_calls[-1]
 
-    def test_is_on(self):
-        """Test is_on."""
-        self.hass.states.set('remote.test', STATE_ON)
-        self.assertTrue(remote.is_on(self.hass, 'remote.test'))
+    assert call.domain == DOMAIN
 
-        self.hass.states.set('remote.test', STATE_OFF)
-        self.assertFalse(remote.is_on(self.hass, 'remote.test'))
 
-        self.hass.states.set(remote.ENTITY_ID_ALL_REMOTES, STATE_ON)
-        self.assertTrue(remote.is_on(self.hass))
+async def test_turn_off(hass: HomeAssistant) -> None:
+    """Test turn_off."""
+    turn_off_calls = async_mock_service(hass, DOMAIN, SERVICE_TURN_OFF)
 
-        self.hass.states.set(remote.ENTITY_ID_ALL_REMOTES, STATE_OFF)
-        self.assertFalse(remote.is_on(self.hass))
+    await hass.services.async_call(
+        DOMAIN, SERVICE_TURN_OFF, {ATTR_ENTITY_ID: ENTITY_ID}
+    )
 
-    def test_turn_on(self):
-        """Test turn_on."""
-        turn_on_calls = mock_service(
-            self.hass, remote.DOMAIN, SERVICE_TURN_ON)
+    await hass.async_block_till_done()
 
-        common.turn_on(
-            self.hass,
-            entity_id='entity_id_val')
+    assert len(turn_off_calls) == 1
+    call = turn_off_calls[-1]
 
-        self.hass.block_till_done()
+    assert call.domain == DOMAIN
+    assert call.service == SERVICE_TURN_OFF
+    assert call.data[ATTR_ENTITY_ID] == ENTITY_ID
 
-        self.assertEqual(1, len(turn_on_calls))
-        call = turn_on_calls[-1]
 
-        self.assertEqual(remote.DOMAIN, call.domain)
+async def test_send_command(hass: HomeAssistant) -> None:
+    """Test send_command."""
+    send_command_calls = async_mock_service(hass, DOMAIN, SERVICE_SEND_COMMAND)
 
-    def test_turn_off(self):
-        """Test turn_off."""
-        turn_off_calls = mock_service(
-            self.hass, remote.DOMAIN, SERVICE_TURN_OFF)
+    data = {
+        ATTR_ENTITY_ID: ENTITY_ID,
+        ATTR_DEVICE: "test_device",
+        ATTR_COMMAND: ["test_command"],
+        ATTR_NUM_REPEATS: "4",
+        ATTR_DELAY_SECS: "0.6",
+    }
 
-        common.turn_off(
-            self.hass, entity_id='entity_id_val')
+    await hass.services.async_call(DOMAIN, SERVICE_SEND_COMMAND, data)
 
-        self.hass.block_till_done()
+    await hass.async_block_till_done()
 
-        self.assertEqual(1, len(turn_off_calls))
-        call = turn_off_calls[-1]
+    assert len(send_command_calls) == 1
+    call = send_command_calls[-1]
 
-        self.assertEqual(remote.DOMAIN, call.domain)
-        self.assertEqual(SERVICE_TURN_OFF, call.service)
-        self.assertEqual('entity_id_val', call.data[ATTR_ENTITY_ID])
+    assert call.domain == DOMAIN
+    assert call.service == SERVICE_SEND_COMMAND
+    assert call.data[ATTR_ENTITY_ID] == ENTITY_ID
 
-    def test_send_command(self):
-        """Test send_command."""
-        send_command_calls = mock_service(
-            self.hass, remote.DOMAIN, SERVICE_SEND_COMMAND)
 
-        common.send_command(
-            self.hass, entity_id='entity_id_val',
-            device='test_device', command=['test_command'],
-            num_repeats='4', delay_secs='0.6')
+async def test_learn_command(hass: HomeAssistant) -> None:
+    """Test learn_command."""
+    learn_command_calls = async_mock_service(hass, DOMAIN, SERVICE_LEARN_COMMAND)
 
-        self.hass.block_till_done()
+    data = {
+        ATTR_ENTITY_ID: ENTITY_ID,
+        ATTR_DEVICE: "test_device",
+        ATTR_COMMAND: ["test_command"],
+        ATTR_COMMAND_TYPE: "rf",
+        ATTR_ALTERNATIVE: True,
+        ATTR_TIMEOUT: 20,
+    }
+    await hass.services.async_call(DOMAIN, SERVICE_LEARN_COMMAND, data)
 
-        self.assertEqual(1, len(send_command_calls))
-        call = send_command_calls[-1]
+    await hass.async_block_till_done()
 
-        self.assertEqual(remote.DOMAIN, call.domain)
-        self.assertEqual(SERVICE_SEND_COMMAND, call.service)
-        self.assertEqual('entity_id_val', call.data[ATTR_ENTITY_ID])
+    assert len(learn_command_calls) == 1
+    call = learn_command_calls[-1]
 
-    def test_services(self):
-        """Test the provided services."""
-        self.assertTrue(setup_component(self.hass, remote.DOMAIN,
-                                        TEST_PLATFORM))
+    assert call.domain == DOMAIN
+    assert call.service == SERVICE_LEARN_COMMAND
+    assert call.data[ATTR_ENTITY_ID] == ENTITY_ID
+
+
+async def test_delete_command(hass: HomeAssistant) -> None:
+    """Test delete_command."""
+    delete_command_calls = async_mock_service(
+        hass, remote.DOMAIN, SERVICE_DELETE_COMMAND
+    )
+
+    data = {
+        ATTR_ENTITY_ID: ENTITY_ID,
+        ATTR_DEVICE: "test_device",
+        ATTR_COMMAND: ["test_command"],
+    }
+
+    await hass.services.async_call(DOMAIN, SERVICE_DELETE_COMMAND, data)
+
+    await hass.async_block_till_done()
+
+    assert len(delete_command_calls) == 1
+    call = delete_command_calls[-1]
+
+    assert call.domain == remote.DOMAIN
+    assert call.service == SERVICE_DELETE_COMMAND
+    assert call.data[ATTR_ENTITY_ID] == ENTITY_ID

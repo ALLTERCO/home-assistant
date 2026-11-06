@@ -1,0 +1,619 @@
+"""Config flow for RFXCOM RFXtrx integration."""
+
+from collections.abc import Mapping
+import itertools
+from types import MappingProxyType
+from typing import Any, override
+
+import probatio
+import RFXtrx as rfxtrxmod
+
+from homeassistant.components import usb
+from homeassistant.config_entries import (
+    SOURCE_RECONFIGURE,
+    ConfigFlow,
+    ConfigFlowResult,
+    ConfigSubentryFlow,
+    OptionsFlow,
+    SubentryFlowResult,
+)
+from homeassistant.const import (
+    CONF_COMMAND_OFF,
+    CONF_COMMAND_ON,
+    CONF_DEVICE,
+    CONF_HOST,
+    CONF_PORT,
+    CONF_TYPE,
+)
+from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import VolDictType
+
+from . import (
+    DeviceTuple,
+    RfxtrxConfigEntry,
+    get_device_tuple_from_device,
+    get_rfx_object,
+)
+from .binary_sensor import supported as binary_supported
+from .const import (
+    CONF_AUTOMATIC_ADD,
+    CONF_DATA_BITS,
+    CONF_EVENT_CODE,
+    CONF_OFF_DELAY,
+    CONF_PROTOCOLS,
+    CONF_REPLACE_DEVICE,
+    CONF_VENETIAN_BLIND_MODE,
+    CONST_VENETIAN_BLIND_MODE_DEFAULT,
+    CONST_VENETIAN_BLIND_MODE_EU,
+    CONST_VENETIAN_BLIND_MODE_US,
+    DEVICE_PACKET_TYPE_LIGHTING4,
+    DOMAIN,
+    SUBENTRY_TYPE_DEVICE,
+)
+
+CONF_MANUAL_PATH = "Enter Manually"
+
+RECV_MODES = sorted(itertools.chain(*rfxtrxmod.lowlevel.Status.RECMODES))
+
+
+def none_or_int(value: str | None, base: int) -> int | None:
+    """Check if string is one otherwise convert to int."""
+    if value is None:
+        return None
+    return int(value, base)
+
+
+def _same_protocol(a: rfxtrxmod.RFXtrxDevice, b: rfxtrxmod.RFXtrxDevice) -> bool:
+    """Return whether two devices use the same packet type and subtype."""
+    return bool(a.packettype == b.packettype and a.subtype == b.subtype)
+
+
+class RfxtrxOptionsFlow(OptionsFlow):
+    """Handle Rfxtrx options."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            data = {
+                **self.config_entry.data,
+                CONF_AUTOMATIC_ADD: user_input[CONF_AUTOMATIC_ADD],
+                CONF_PROTOCOLS: user_input[CONF_PROTOCOLS] or None,
+            }
+            self.hass.config_entries.async_update_entry(self.config_entry, data=data)
+            return self.async_create_entry(title="", data={})
+
+        options = {
+            probatio.Optional(
+                CONF_AUTOMATIC_ADD,
+                default=self.config_entry.data[CONF_AUTOMATIC_ADD],
+            ): bool,
+            probatio.Optional(
+                CONF_PROTOCOLS,
+                default=self.config_entry.data.get(CONF_PROTOCOLS) or [],
+            ): cv.multi_select(RECV_MODES),
+        }
+
+        return self.async_show_form(
+            step_id="init", data_schema=probatio.Schema(options)
+        )
+
+
+class RfxtrxSubentryFlowHandler(ConfigSubentryFlow):
+    """Handle a subentry flow for a single RFXtrx device."""
+
+    def __init__(self) -> None:
+        """Initialize rfxtrx device subentry flow."""
+        self._event_code: str | None = None
+        self._device_object: rfxtrxmod.RFXtrxEvent | None = None
+        self._options_subentry_id: str | None = None
+        self._replace_subentry_id: str | None = None
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Add a new device."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            event_code = user_input[CONF_EVENT_CODE]
+            device_object = get_rfx_object(event_code)
+            if device_object is None:
+                errors[CONF_EVENT_CODE] = "invalid_event_code"
+            elif not self._can_add_device(device_object):
+                errors[CONF_EVENT_CODE] = "already_configured_device"
+            else:
+                self._event_code = event_code
+                self._device_object = device_object
+                return await self.async_step_device_options()
+
+        schema = probatio.Schema({probatio.Required(CONF_EVENT_CODE): str})
+        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Choose between configuring the device options and replacing it."""
+        return self.async_show_menu(
+            step_id="reconfigure",
+            menu_options=["reconfigure_options", "replace_device"],
+        )
+
+    async def async_step_reconfigure_options(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Configure the options of an existing device."""
+        subentry = self._get_reconfigure_subentry()
+        self._event_code = subentry.data[CONF_EVENT_CODE][0]
+        self._device_object = get_rfx_object(self._event_code)
+        self._options_subentry_id = subentry.subentry_id
+        return await self.async_step_device_options()
+
+    async def async_step_replace_device(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Point an existing device at different hardware.
+
+        Either by entering a new event code directly, or by picking another
+        already-configured device of the same protocol to take over (which
+        is then removed) - the device, its entities, and their history are
+        kept as-is since their identity is the subentry, not the radio
+        address.
+        """
+        subentry = self._get_reconfigure_subentry()
+        errors: dict[str, str] = {}
+
+        current_device_object = get_rfx_object(subentry.data[CONF_EVENT_CODE][0])
+        assert current_device_object
+        replace_devices = self._get_replace_devices(
+            current_device_object, subentry.subentry_id
+        )
+
+        if user_input is not None:
+            replace_subentry_id = user_input.get(CONF_REPLACE_DEVICE)
+            if replace_subentry_id:
+                event_code = (
+                    self._get_entry()
+                    .subentries[replace_subentry_id]
+                    .data[CONF_EVENT_CODE][0]
+                )
+            else:
+                event_code = user_input.get(CONF_EVENT_CODE, "")
+
+            device_object = get_rfx_object(event_code) if event_code else None
+            exclude_subentry_ids = self._reconfigure_exclude_ids(replace_subentry_id)
+
+            if device_object is None:
+                errors[CONF_EVENT_CODE] = "invalid_event_code"
+            elif not _same_protocol(device_object.device, current_device_object.device):
+                errors[CONF_EVENT_CODE] = "incompatible_device"
+            elif not self._can_add_device(
+                device_object, exclude_subentry_ids=exclude_subentry_ids
+            ):
+                errors[CONF_EVENT_CODE] = "already_configured_device"
+            else:
+                self._event_code = event_code
+                self._device_object = device_object
+                self._options_subentry_id = replace_subentry_id
+                self._replace_subentry_id = replace_subentry_id
+                return await self.async_step_device_options()
+
+        schema: VolDictType = {
+            probatio.Optional(
+                CONF_EVENT_CODE,
+                description={"suggested_value": subentry.data[CONF_EVENT_CODE][0]},
+            ): str
+        }
+        if replace_devices:
+            schema[probatio.Optional(CONF_REPLACE_DEVICE)] = probatio.In(
+                replace_devices
+            )
+
+        return self.async_show_form(
+            step_id="replace_device",
+            data_schema=probatio.Schema(schema),
+            errors=errors,
+        )
+
+    async def async_step_device_options(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Manage device options."""
+        errors: dict[str, str] = {}
+        assert self._device_object
+        assert self._event_code
+        current_data: Mapping[str, Any] = {}
+        if self._options_subentry_id:
+            current_data = self._get_entry().subentries[self._options_subentry_id].data
+
+        if user_input is not None:
+            try:
+                command_on = none_or_int(user_input.get(CONF_COMMAND_ON), 16)
+            except ValueError:
+                errors[CONF_COMMAND_ON] = "invalid_input_2262_on"
+
+            try:
+                command_off = none_or_int(user_input.get(CONF_COMMAND_OFF), 16)
+            except ValueError:
+                errors[CONF_COMMAND_OFF] = "invalid_input_2262_off"
+
+            if not errors:
+                device_id = get_device_tuple_from_device(
+                    self._device_object.device,
+                    data_bits=user_input.get(CONF_DATA_BITS),
+                )
+
+                exclude_subentry_ids: set[str] = set()
+                if self.source == SOURCE_RECONFIGURE:
+                    exclude_subentry_ids = self._reconfigure_exclude_ids(
+                        self._replace_subentry_id
+                    )
+                if self._find_conflicting_subentry(device_id, exclude_subentry_ids):
+                    if self._device_object.device.packettype == (
+                        DEVICE_PACKET_TYPE_LIGHTING4
+                    ):
+                        errors[CONF_DATA_BITS] = "already_configured_device"
+                    elif self.source == SOURCE_RECONFIGURE:
+                        return await self.async_step_replace_device(
+                            {CONF_EVENT_CODE: self._event_code}
+                        )
+                    else:
+                        return await self.async_step_user(
+                            {CONF_EVENT_CODE: self._event_code}
+                        )
+
+            if not errors:
+                event_codes = self._retained_event_codes(
+                    current_data, device_id, user_input.get(CONF_DATA_BITS)
+                )
+                data: dict[str, Any] = {CONF_EVENT_CODE: event_codes}
+                if user_input.get(CONF_OFF_DELAY):
+                    data[CONF_OFF_DELAY] = user_input[CONF_OFF_DELAY]
+                if user_input.get(CONF_DATA_BITS):
+                    data[CONF_DATA_BITS] = user_input[CONF_DATA_BITS]
+                if command_on:
+                    data[CONF_COMMAND_ON] = command_on
+                if command_off:
+                    data[CONF_COMMAND_OFF] = command_off
+                if user_input.get(CONF_VENETIAN_BLIND_MODE):
+                    data[CONF_VENETIAN_BLIND_MODE] = user_input[
+                        CONF_VENETIAN_BLIND_MODE
+                    ]
+
+                title = (
+                    f"{self._device_object.device.type_string} {device_id.id_string}"
+                )
+
+                if self.source == SOURCE_RECONFIGURE:
+                    if self._replace_subentry_id:
+                        self.hass.config_entries.async_remove_subentry(
+                            self._get_entry(), self._replace_subentry_id
+                        )
+                    return self.async_update_and_abort(
+                        self._get_entry(),
+                        self._get_reconfigure_subentry(),
+                        title=title,
+                        data=MappingProxyType(data),
+                        unique_id=device_id.unique_id,
+                    )
+                return self.async_create_entry(
+                    title=title,
+                    data=MappingProxyType(data),
+                    unique_id=device_id.unique_id,
+                )
+
+        data_schema: VolDictType = {}
+
+        if binary_supported(self._device_object):
+            off_delay_schema: VolDictType
+            if current_data.get(CONF_OFF_DELAY):
+                off_delay_schema = {
+                    probatio.Optional(
+                        CONF_OFF_DELAY,
+                        description={"suggested_value": current_data[CONF_OFF_DELAY]},
+                    ): int,
+                }
+            else:
+                off_delay_schema = {
+                    probatio.Optional(CONF_OFF_DELAY): int,
+                }
+            data_schema.update(off_delay_schema)
+
+        if self._device_object.device.packettype == DEVICE_PACKET_TYPE_LIGHTING4:
+            data_schema.update(
+                {
+                    probatio.Optional(
+                        CONF_DATA_BITS, default=current_data.get(CONF_DATA_BITS, 0)
+                    ): int,
+                    probatio.Optional(
+                        CONF_COMMAND_ON,
+                        default=hex(current_data.get(CONF_COMMAND_ON, 0)),
+                    ): str,
+                    probatio.Optional(
+                        CONF_COMMAND_OFF,
+                        default=hex(current_data.get(CONF_COMMAND_OFF, 0)),
+                    ): str,
+                }
+            )
+
+        if isinstance(self._device_object.device, rfxtrxmod.RfyDevice):
+            data_schema.update(
+                {
+                    probatio.Optional(
+                        CONF_VENETIAN_BLIND_MODE,
+                        default=current_data.get(
+                            CONF_VENETIAN_BLIND_MODE, CONST_VENETIAN_BLIND_MODE_DEFAULT
+                        ),
+                    ): probatio.In(
+                        [
+                            CONST_VENETIAN_BLIND_MODE_DEFAULT,
+                            CONST_VENETIAN_BLIND_MODE_US,
+                            CONST_VENETIAN_BLIND_MODE_EU,
+                        ]
+                    ),
+                }
+            )
+
+        return self.async_show_form(
+            step_id="device_options",
+            data_schema=probatio.Schema(data_schema),
+            errors=errors,
+        )
+
+    def _retained_event_codes(
+        self,
+        current_data: Mapping[str, Any],
+        device_id: DeviceTuple,
+        data_bits: int | None,
+    ) -> list[str]:
+        """Return self._event_code plus current codes still matching the device."""
+        assert self._event_code
+        event_codes = [self._event_code]
+        for code in current_data.get(CONF_EVENT_CODE, []):
+            if code == self._event_code:
+                continue
+            old_event = get_rfx_object(code)
+            if old_event is None:
+                continue
+            old_device_id = get_device_tuple_from_device(
+                old_event.device, data_bits=data_bits
+            )
+            if old_device_id == device_id:
+                event_codes.append(code)
+        return event_codes
+
+    def _reconfigure_exclude_ids(self, replace_subentry_id: str | None) -> set[str]:
+        """Subentry ids that must not collide with the device being configured."""
+        exclude_subentry_ids = {self._get_reconfigure_subentry().subentry_id}
+        if replace_subentry_id:
+            exclude_subentry_ids.add(replace_subentry_id)
+        return exclude_subentry_ids
+
+    def _find_conflicting_subentry(
+        self,
+        device_id: DeviceTuple,
+        exclude_subentry_ids: set[str] | None = None,
+    ) -> str | None:
+        """Return the id of the subentry already using this device tuple, if any."""
+        exclude_subentry_ids = exclude_subentry_ids or set()
+        for subentry in self._get_entry().get_subentries_of_type(SUBENTRY_TYPE_DEVICE):
+            if subentry.subentry_id in exclude_subentry_ids:
+                continue
+            rfx_obj = get_rfx_object(subentry.data[CONF_EVENT_CODE][0])
+            if rfx_obj is None:
+                continue
+
+            existing_device_id = get_device_tuple_from_device(
+                rfx_obj.device, subentry.data.get(CONF_DATA_BITS)
+            )
+            existing_device_id_unmasked = get_device_tuple_from_device(rfx_obj.device)
+            if device_id in (existing_device_id, existing_device_id_unmasked):
+                return subentry.subentry_id
+
+        return None
+
+    def _can_add_device(
+        self,
+        new_rfx_obj: rfxtrxmod.RFXtrxEvent,
+        exclude_subentry_ids: set[str] | None = None,
+    ) -> bool:
+        """Check if device does not already exist."""
+        new_device_id = get_device_tuple_from_device(new_rfx_obj.device)
+        return (
+            self._find_conflicting_subentry(new_device_id, exclude_subentry_ids) is None
+        )
+
+    def _get_replace_devices(
+        self, current_device_object: rfxtrxmod.RFXtrxEvent, exclude_subentry_id: str
+    ) -> dict[str, str]:
+        """Get other configured devices of the same protocol, to replace with."""
+        replace_devices: dict[str, str] = {}
+        for subentry in self._get_entry().get_subentries_of_type(SUBENTRY_TYPE_DEVICE):
+            if subentry.subentry_id == exclude_subentry_id:
+                continue
+            rfx_obj = get_rfx_object(subentry.data[CONF_EVENT_CODE][0])
+            if rfx_obj is None:
+                continue
+            if _same_protocol(rfx_obj.device, current_device_object.device):
+                replace_devices[subentry.subentry_id] = subentry.title
+
+        return replace_devices
+
+
+class RfxtrxConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for RFXCOM RFXtrx."""
+
+    VERSION = 3
+
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Step when user initializes a integration."""
+        await self.async_set_unique_id(DOMAIN)
+        self._abort_if_unique_id_configured()
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            if user_input[CONF_TYPE] == "Serial":
+                return await self.async_step_setup_serial()
+
+            return await self.async_step_setup_network()
+
+        list_of_types = ["Serial", "Network"]
+
+        schema = probatio.Schema(
+            {probatio.Required(CONF_TYPE): probatio.In(list_of_types)}
+        )
+        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+
+    async def async_step_setup_network(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Step when setting up network configuration."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            host = user_input[CONF_HOST]
+            port = user_input[CONF_PORT]
+
+            try:
+                data = await self.async_validate_rfx(host=host, port=port)
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+
+            if not errors:
+                return self.async_create_entry(title="RFXTRX", data=data)
+
+        schema = probatio.Schema(
+            {probatio.Required(CONF_HOST): str, probatio.Required(CONF_PORT): int}
+        )
+        return self.async_show_form(
+            step_id="setup_network",
+            data_schema=schema,
+            errors=errors,
+        )
+
+    async def async_step_setup_serial(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Step when setting up serial configuration."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            user_selection = user_input[CONF_DEVICE]
+            if user_selection == CONF_MANUAL_PATH:
+                return await self.async_step_setup_serial_manual_path()
+
+            dev_path = user_selection
+
+            try:
+                data = await self.async_validate_rfx(device=dev_path)
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+
+            if not errors:
+                return self.async_create_entry(title="RFXTRX", data=data)
+
+        ports = await usb.async_scan_serial_ports(self.hass)
+        list_of_ports = {}
+        for port in ports:
+            list_of_ports[port.device] = (
+                f"{port.device} - {port.description or 'n/a'}"
+                f", s/n: {port.serial_number or 'n/a'}"
+                + (f" - {port.manufacturer}" if port.manufacturer else "")
+            )
+        list_of_ports[CONF_MANUAL_PATH] = CONF_MANUAL_PATH
+
+        schema = probatio.Schema(
+            {probatio.Required(CONF_DEVICE): probatio.In(list_of_ports)}
+        )
+        return self.async_show_form(
+            step_id="setup_serial",
+            data_schema=schema,
+            errors=errors,
+        )
+
+    async def async_step_setup_serial_manual_path(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Select path manually."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            device = user_input[CONF_DEVICE]
+            try:
+                data = await self.async_validate_rfx(device=device)
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+
+            if not errors:
+                return self.async_create_entry(title="RFXTRX", data=data)
+
+        schema = probatio.Schema({probatio.Required(CONF_DEVICE): str})
+        return self.async_show_form(
+            step_id="setup_serial_manual_path",
+            data_schema=schema,
+            errors=errors,
+        )
+
+    async def async_validate_rfx(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        device: str | None = None,
+    ) -> dict[str, Any]:
+        """Create data for rfxtrx entry."""
+        success = await self.hass.async_add_executor_job(
+            _test_transport, host, port, device
+        )
+        if not success:
+            raise CannotConnect
+
+        data: dict[str, Any] = {
+            CONF_HOST: host,
+            CONF_PORT: port,
+            CONF_DEVICE: device,
+            CONF_AUTOMATIC_ADD: False,
+        }
+        return data
+
+    @classmethod
+    @callback
+    @override
+    def async_get_supported_subentry_types(
+        cls, config_entry: RfxtrxConfigEntry
+    ) -> dict[str, type[ConfigSubentryFlow]]:
+        """Return subentries supported by this handler."""
+        return {SUBENTRY_TYPE_DEVICE: RfxtrxSubentryFlowHandler}
+
+    @staticmethod
+    @callback
+    @override
+    def async_get_options_flow(
+        config_entry: RfxtrxConfigEntry,
+    ) -> RfxtrxOptionsFlow:
+        """Get the options flow for this handler."""
+        return RfxtrxOptionsFlow()
+
+
+def _test_transport(host: str | None, port: int | None, device: str | None) -> bool:
+    """Construct a rfx object based on config."""
+    if port is not None:
+        conn = rfxtrxmod.PyNetworkTransport((host, port))
+    else:
+        conn = rfxtrxmod.PySerialTransport(device)
+
+    try:
+        conn.connect()
+    except rfxtrxmod.RFXtrxTransportError, TimeoutError:
+        return False
+
+    return True
+
+
+class CannotConnect(HomeAssistantError):
+    """Error to indicate we cannot connect."""

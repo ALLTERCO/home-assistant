@@ -1,0 +1,197 @@
+"""Support for consuming values for the Volkszaehler API."""
+
+from typing import override
+
+import probatio
+
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+)
+from homeassistant.config_entries import SOURCE_IMPORT
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_MONITORED_CONDITIONS,
+    CONF_NAME,
+    CONF_PORT,
+    CONF_UUID,
+    UnitOfEnergy,
+    UnitOfPower,
+)
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    AddEntitiesCallback,
+)
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+
+from . import VolkszaehlerConfigEntry, VolkszaehlerData
+from .const import (
+    DEFAULT_HOST,
+    DEFAULT_NAME,
+    DEFAULT_PORT,
+    DOMAIN,
+    SUBENTRY_TYPE_CHANNEL,
+)
+
+SENSOR_TYPES: tuple[SensorEntityDescription, ...] = (
+    SensorEntityDescription(
+        key="average",
+        name="Average",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        icon="mdi:power-off",
+    ),
+    SensorEntityDescription(
+        key="consumption",
+        name="Consumption",
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        icon="mdi:power-plug",
+    ),
+    SensorEntityDescription(
+        key="max",
+        name="Max",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        icon="mdi:arrow-up",
+    ),
+    SensorEntityDescription(
+        key="min",
+        name="Min",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        icon="mdi:arrow-down",
+    ),
+)
+
+SENSOR_KEYS: list[str] = [desc.key for desc in SENSOR_TYPES]
+
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
+    {
+        probatio.Required(CONF_UUID): cv.string,
+        probatio.Optional(CONF_HOST, default=DEFAULT_HOST): cv.string,
+        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        probatio.Optional(CONF_PORT, default=DEFAULT_PORT): probatio.Port(),
+        probatio.Optional(CONF_MONITORED_CONDITIONS, default=["average"]): probatio.All(
+            probatio.EnsureList(), [probatio.In(SENSOR_KEYS)]
+        ),
+    }
+)
+
+
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
+    """Import Volkszaehler sensor YAML config into config flow."""
+    validated = PLATFORM_SCHEMA(config)
+    data = {
+        CONF_HOST: validated[CONF_HOST],
+        CONF_NAME: validated[CONF_NAME],
+        CONF_PORT: validated[CONF_PORT],
+        CONF_UUID: validated[CONF_UUID],
+    }
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_IMPORT},
+        data=data,
+    )
+    if result["type"] is FlowResultType.ABORT and result["reason"] not in (
+        "already_configured",
+        "subentry_added",
+    ):
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            f"deprecated_yaml_import_issue_{result['reason']}",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=f"deprecated_yaml_import_issue_{result['reason']}",
+            translation_placeholders={
+                "domain": DOMAIN,
+                "integration_title": DEFAULT_NAME,
+            },
+            breaks_in_ha_version="2027.3.0",
+        )
+        return
+
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": DEFAULT_NAME,
+        },
+        breaks_in_ha_version="2027.3.0",
+    )
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: VolkszaehlerConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Volkszaehler sensors from a config entry."""
+    conditions = SENSOR_KEYS
+
+    for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_CHANNEL):
+        vz_api = entry.runtime_data[subentry.subentry_id]
+
+        entities = [
+            VolkszaehlerSensor(
+                vz_api,
+                subentry.title,
+                subentry.data[CONF_UUID],
+                description,
+            )
+            for description in SENSOR_TYPES
+            if description.key in conditions
+        ]
+
+        async_add_entities(entities, False, config_subentry_id=subentry.subentry_id)
+
+
+class VolkszaehlerSensor(SensorEntity):
+    """Implementation of a Volkszaehler sensor."""
+
+    def __init__(
+        self,
+        vz_api: VolkszaehlerData,
+        name: str,
+        uuid: str,
+        description: SensorEntityDescription,
+    ) -> None:
+        """Initialize the Volkszaehler sensor."""
+        self.entity_description = description
+        self.vz_api = vz_api
+
+        self._attr_name = f"{name} {description.name}"
+        self._attr_unique_id = f"{uuid}_{description.key}"
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Could the device be accessed during the last update call."""
+        return self.vz_api.available
+
+    async def async_update(self) -> None:
+        """Get the latest data from REST API."""
+        await self.vz_api.async_update()
+
+        if self.vz_api.api.data is not None:
+            self._attr_native_value = round(
+                getattr(self.vz_api.api, self.entity_description.key), 2
+            )

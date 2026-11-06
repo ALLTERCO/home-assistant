@@ -1,0 +1,267 @@
+"""Support for SleepIQ from SleepNumber."""
+
+import logging
+from typing import Any
+
+from asyncsleepiq import (
+    AsyncSleepIQ,
+    SleepIQAPIException,
+    SleepIQConnectionException,
+    SleepIQLoginException,
+    SleepIQSleeper,
+    SleepIQTimeoutException,
+)
+import probatio
+
+from homeassistant.config_entries import SOURCE_IMPORT
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, PRESSURE, Platform
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import (
+    config_validation as cv,
+    entity_registry as er,
+    issue_registry as ir,
+)
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
+from homeassistant.helpers.typing import ConfigType
+
+from .const import DOMAIN, IS_IN_BED, SLEEP_NUMBER
+from .coordinator import (
+    SleepIQConfigEntry,
+    SleepIQData,
+    SleepIQDataUpdateCoordinator,
+    SleepIQPauseUpdateCoordinator,
+    SleepIQSleepDataCoordinator,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+INTEGRATION_TITLE = "SleepIQ"
+
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.LIGHT,
+    Platform.NUMBER,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
+
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        DOMAIN: {
+            probatio.Required(CONF_USERNAME): cv.string,
+            probatio.Required(probatio.Secret(CONF_PASSWORD)): cv.string,
+        }
+    },
+    extra=probatio.ALLOW_EXTRA,
+)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up sleepiq component."""
+    if DOMAIN in config:
+        hass.async_create_task(_async_import_yaml(hass, config[DOMAIN]))
+
+    return True
+
+
+async def _async_import_yaml(hass: HomeAssistant, import_data: dict[str, Any]) -> None:
+    """Import the YAML account into a config entry and raise a repair issue."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
+
+    if (
+        result["type"] is FlowResultType.ABORT
+        and result["reason"] != "already_configured"
+    ):
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            f"deprecated_yaml_import_issue_{result['reason']}",
+            breaks_in_ha_version="2027.6.0",
+            is_fixable=False,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=f"deprecated_yaml_import_issue_{result['reason']}",
+            translation_placeholders={
+                "domain": DOMAIN,
+                "integration_title": INTEGRATION_TITLE,
+            },
+        )
+        return
+
+    ir.async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        breaks_in_ha_version="2027.6.0",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": INTEGRATION_TITLE,
+        },
+    )
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: SleepIQConfigEntry) -> None:
+    """Set up the SleepIQ config entry."""
+    conf = entry.data
+    email = conf[CONF_USERNAME]
+    password = conf[CONF_PASSWORD]
+
+    client_session = async_create_clientsession(hass)
+
+    gateway = AsyncSleepIQ(client_session=client_session)
+
+    try:
+        await gateway.login(email, password)
+    except SleepIQConnectionException as err:
+        raise ConfigEntryNotReady(
+            str(err) or "Transient connection failure during authentication"
+        ) from err
+    except SleepIQLoginException as err:
+        raise ConfigEntryAuthFailed(err) from err
+    except SleepIQTimeoutException as err:
+        raise ConfigEntryNotReady(
+            str(err) or "Timed out during authentication"
+        ) from err
+
+    try:
+        await gateway.init_beds()
+    except SleepIQTimeoutException as err:
+        raise ConfigEntryNotReady(
+            str(err) or "Timed out during initialization"
+        ) from err
+    except SleepIQAPIException as err:
+        raise ConfigEntryNotReady(str(err) or "Error reading from SleepIQ API") from err
+
+    _filter_duplicate_beds(gateway)
+    _deduplicate_sleepers(gateway)
+    await _async_migrate_unique_ids(hass, entry, gateway)
+
+    coordinator = SleepIQDataUpdateCoordinator(hass, entry, gateway)
+    pause_coordinator = SleepIQPauseUpdateCoordinator(hass, entry, gateway)
+    sleep_data_coordinator = SleepIQSleepDataCoordinator(hass, entry, gateway)
+
+    # Call the SleepIQ API to refresh data
+    await coordinator.async_config_entry_first_refresh()
+    await pause_coordinator.async_config_entry_first_refresh()
+    await sleep_data_coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = SleepIQData(
+        data_coordinator=coordinator,
+        pause_coordinator=pause_coordinator,
+        sleep_data_coordinator=sleep_data_coordinator,
+        client=gateway,
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: SleepIQConfigEntry) -> None:
+    """Unload the config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+_FIRMNESS_CONTROL = "firmness control"
+
+
+def _filter_duplicate_beds(gateway: AsyncSleepIQ) -> None:
+    """Remove "Firmness Control" controller objects that duplicate a real bed.
+
+    The SleepIQ API can return a controller object alongside the real bed,
+    both carrying the same sleeper IDs. The controller is identified by
+    "Firmness Control" in its model string.
+    """
+    to_remove: list[str] = []
+    for bed_id, bed in gateway.beds.items():
+        if _FIRMNESS_CONTROL in (bed.model or "").lower():
+            to_remove.append(bed_id)
+    for bed_id in to_remove:
+        _LOGGER.debug(
+            "Removing controller duplicate '%s' (id=%s, model=%s)",
+            gateway.beds[bed_id].name,
+            bed_id,
+            gateway.beds[bed_id].model,
+        )
+        del gateway.beds[bed_id]
+
+
+def _deduplicate_sleepers(gateway: AsyncSleepIQ) -> None:
+    """Remove duplicate sleepers within each bed.
+
+    The API can return the same sleeper_id more than once per bed, which
+    causes entity platforms to create entities with colliding unique IDs.
+    Keep only the first occurrence of each effective identity, keyed by
+    str(sleeper_id) so that falsy values (None, "") are also deduplicated
+    rather than skipped.
+    """
+    for bed in gateway.beds.values():
+        seen: set[str] = set()
+        filtered: list[SleepIQSleeper] = []
+        for sleeper in bed.sleepers:
+            key = str(sleeper.sleeper_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(sleeper)
+        if len(filtered) != len(bed.sleepers):
+            _LOGGER.debug(
+                "Removed %d duplicate sleeper(s) from bed '%s' (id=%s)",
+                len(bed.sleepers) - len(filtered),
+                bed.name,
+                bed.id,
+            )
+            bed.sleepers[:] = filtered
+
+
+async def _async_migrate_unique_ids(
+    hass: HomeAssistant, entry: SleepIQConfigEntry, gateway: AsyncSleepIQ
+) -> None:
+    """Migrate old unique ids."""
+    names_to_ids = {
+        sleeper.name: sleeper.sleeper_id
+        for bed in gateway.beds.values()
+        for sleeper in bed.sleepers
+    }
+
+    bed_ids = {bed.id for bed in gateway.beds.values()}
+
+    @callback
+    def _async_migrator(entity_entry: er.RegistryEntry) -> dict[str, Any] | None:
+        # Old format for sleeper entities was {bed_id}_{sleeper.name}_{sensor_type}.....
+        # New format is {sleeper.sleeper_id}_{sensor_type}....
+        sensor_types = [IS_IN_BED, PRESSURE, SLEEP_NUMBER]
+
+        old_unique_id = entity_entry.unique_id
+        parts = old_unique_id.split("_")
+
+        # If it doesn't begin with a bed id or end with one of the sensor types,
+        # it doesn't need to be migrated
+        if parts[0] not in bed_ids or not old_unique_id.endswith(tuple(sensor_types)):
+            return None
+
+        sensor_type = next(filter(old_unique_id.endswith, sensor_types))
+        sleeper_name = "_".join(parts[1:]).removesuffix(f"_{sensor_type}")
+        sleeper_id = names_to_ids.get(sleeper_name)
+
+        if not sleeper_id:
+            return None
+
+        new_unique_id = f"{sleeper_id}_{sensor_type}"
+
+        _LOGGER.debug(
+            "Migrating unique_id from [%s] to [%s]",
+            old_unique_id,
+            new_unique_id,
+        )
+        return {"new_unique_id": new_unique_id}
+
+    await er.async_migrate_entries(hass, entry.entry_id, _async_migrator)

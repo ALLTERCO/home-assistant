@@ -1,0 +1,13 @@
+{
+  "domain": "sonarr",
+  "name": "Sonarr",
+  "categories": ["media_entertainment.tv_streaming"],
+  "codeowners": ["@ctalkington"],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/sonarr",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "loggers": ["aiopyarr"],
+  "requirements": ["aiopyarr==23.4.0"]
+}

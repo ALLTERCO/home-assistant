@@ -1,220 +1,142 @@
 """Test deCONZ component setup process."""
-from unittest.mock import Mock, patch
 
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.setup import async_setup_component
-from homeassistant.components import deconz
+import asyncio
+from unittest.mock import patch
 
-from tests.common import mock_coro
+import pydeconz
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
-CONFIG = {
-    "config": {
-        "bridgeid": "0123456789ABCDEF",
-        "mac": "12:34:56:78:90:ab",
-        "modelid": "deCONZ",
-        "name": "Phoscon",
-        "swversion": "2.05.35"
-    }
-}
+from homeassistant.components.deconz.const import CONF_MASTER_GATEWAY, DOMAIN
+from homeassistant.components.deconz.errors import AuthenticationRequired
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant
+
+from .conftest import ConfigEntryFactoryType
 
 
-async def test_config_with_host_passed_to_config_entry(hass):
-    """Test that configured options for a host are loaded via config entry."""
-    with patch.object(hass, 'config_entries') as mock_config_entries, \
-            patch.object(deconz, 'configured_hosts', return_value=[]), \
-            patch.object(deconz, 'load_json', return_value={}):
-        assert await async_setup_component(hass, deconz.DOMAIN, {
-            deconz.DOMAIN: {
-                deconz.CONF_HOST: '1.2.3.4',
-                deconz.CONF_PORT: 80
-            }
-        }) is True
-    # Import flow started
-    assert len(mock_config_entries.flow.mock_calls) == 2
+async def test_setup_entry(config_entry_setup: MockConfigEntry) -> None:
+    """Test successful setup of entry."""
+    assert config_entry_setup.state is ConfigEntryState.LOADED
+    assert config_entry_setup.options[CONF_MASTER_GATEWAY] is True
 
 
-async def test_config_file_passed_to_config_entry(hass):
-    """Test that configuration file for a host are loaded via config entry."""
-    with patch.object(hass, 'config_entries') as mock_config_entries, \
-            patch.object(deconz, 'configured_hosts', return_value=[]), \
-            patch.object(deconz, 'load_json',
-                         return_value={'host': '1.2.3.4'}):
-        assert await async_setup_component(hass, deconz.DOMAIN, {
-            deconz.DOMAIN: {}
-        }) is True
-    # Import flow started
-    assert len(mock_config_entries.flow.mock_calls) == 2
-
-
-async def test_config_without_host_not_passed_to_config_entry(hass):
-    """Test that a configuration without a host does not initiate an import."""
-    with patch.object(hass, 'config_entries') as mock_config_entries, \
-            patch.object(deconz, 'configured_hosts', return_value=[]), \
-            patch.object(deconz, 'load_json', return_value={}):
-        assert await async_setup_component(hass, deconz.DOMAIN, {
-            deconz.DOMAIN: {}
-        }) is True
-    # No flow started
-    assert len(mock_config_entries.flow.mock_calls) == 0
-
-
-async def test_config_already_registered_not_passed_to_config_entry(hass):
-    """Test that an already registered host does not initiate an import."""
-    with patch.object(hass, 'config_entries') as mock_config_entries, \
-            patch.object(deconz, 'configured_hosts',
-                         return_value=['1.2.3.4']), \
-            patch.object(deconz, 'load_json', return_value={}):
-        assert await async_setup_component(hass, deconz.DOMAIN, {
-            deconz.DOMAIN: {
-                deconz.CONF_HOST: '1.2.3.4',
-                deconz.CONF_PORT: 80
-            }
-        }) is True
-    # No flow started
-    assert len(mock_config_entries.flow.mock_calls) == 0
-
-
-async def test_config_discovery(hass):
-    """Test that a discovered bridge does not initiate an import."""
-    with patch.object(hass, 'config_entries') as mock_config_entries:
-        assert await async_setup_component(hass, deconz.DOMAIN, {}) is True
-    # No flow started
-    assert len(mock_config_entries.flow.mock_calls) == 0
-
-
-async def test_setup_entry_already_registered_bridge(hass):
-    """Test setup entry doesn't allow more than one instance of deCONZ."""
-    hass.data[deconz.DOMAIN] = True
-    assert await deconz.async_setup_entry(hass, {}) is False
-
-
-async def test_setup_entry_no_available_bridge(hass):
-    """Test setup entry fails if deCONZ is not available."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
-    with patch('pydeconz.DeconzSession.async_load_parameters',
-               return_value=mock_coro(False)):
-        assert await deconz.async_setup_entry(hass, entry) is False
-
-
-async def test_setup_entry_successful(hass):
-    """Test setup entry is successful."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
-    with patch.object(hass, 'async_create_task') as mock_add_job, \
-        patch.object(hass, 'config_entries') as mock_config_entries, \
-        patch('pydeconz.DeconzSession.async_get_state',
-              return_value=mock_coro(CONFIG)), \
-        patch('pydeconz.DeconzSession.start', return_value=True), \
-        patch('homeassistant.helpers.device_registry.async_get_registry',
-              return_value=mock_coro(Mock())):
-        assert await deconz.async_setup_entry(hass, entry) is True
-    assert hass.data[deconz.DOMAIN]
-    assert hass.data[deconz.DATA_DECONZ_ID] == {}
-    assert len(hass.data[deconz.DATA_DECONZ_UNSUB]) == 1
-    assert len(mock_add_job.mock_calls) ==  \
-        len(deconz.SUPPORTED_PLATFORMS)
-    assert len(mock_config_entries.async_forward_entry_setup.mock_calls) == \
-        len(deconz.SUPPORTED_PLATFORMS)
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[0][1] == \
-        (entry, 'binary_sensor')
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[1][1] == \
-        (entry, 'cover')
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[2][1] == \
-        (entry, 'light')
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[3][1] == \
-        (entry, 'scene')
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[4][1] == \
-        (entry, 'sensor')
-    assert mock_config_entries.async_forward_entry_setup.mock_calls[5][1] == \
-        (entry, 'switch')
-
-
-async def test_unload_entry(hass):
-    """Test being able to unload an entry."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80, 'api_key': '1234567890ABCDEF'}
-    entry.async_unload.return_value = mock_coro(True)
-    deconzmock = Mock()
-    deconzmock.async_load_parameters.return_value = mock_coro(True)
-    deconzmock.sensors = {}
-    with patch('pydeconz.DeconzSession', return_value=deconzmock):
-        assert await deconz.async_setup_entry(hass, entry) is True
-
-    assert deconz.DATA_DECONZ_EVENT in hass.data
-
-    hass.data[deconz.DATA_DECONZ_EVENT].append(Mock())
-    hass.data[deconz.DATA_DECONZ_ID] = {'id': 'deconzid'}
-    assert await deconz.async_unload_entry(hass, entry)
-    assert deconz.DOMAIN not in hass.data
-    assert len(hass.data[deconz.DATA_DECONZ_UNSUB]) == 0
-    assert len(hass.data[deconz.DATA_DECONZ_EVENT]) == 0
-    assert len(hass.data[deconz.DATA_DECONZ_ID]) == 0
-
-
-async def test_add_new_device(hass):
-    """Test adding a new device generates a signal for platforms."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80,
-                  'api_key': '1234567890ABCDEF', 'allow_clip_sensor': False}
-    new_event = {
-        "t": "event",
-        "e": "added",
-        "r": "sensors",
-        "id": "1",
-        "sensor": {
-            "config": {
-                "on": "True",
-                "reachable": "True"
-            },
-            "name": "event",
-            "state": {},
-            "type": "ZHASwitch"
-        }
-    }
-    with patch.object(deconz, 'async_dispatcher_send') as mock_dispatch_send, \
-            patch('pydeconz.DeconzSession.async_get_state',
-                  return_value=mock_coro(CONFIG)), \
-            patch('pydeconz.DeconzSession.start', return_value=True):
-        assert await deconz.async_setup_entry(hass, entry) is True
-        hass.data[deconz.DOMAIN].async_event_handler(new_event)
+@pytest.mark.parametrize(
+    ("side_effect", "state"),
+    [
+        # Failed authentication trigger a reauthentication flow
+        (pydeconz.Unauthorized, ConfigEntryState.SETUP_ERROR),
+        # Connection fails
+        (TimeoutError, ConfigEntryState.SETUP_RETRY),
+        (pydeconz.RequestError, ConfigEntryState.SETUP_RETRY),
+        (pydeconz.ResponseError, ConfigEntryState.SETUP_RETRY),
+    ],
+)
+async def test_get_deconz_api_fails(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    side_effect: Exception,
+    state: ConfigEntryState,
+) -> None:
+    """Failed setup."""
+    config_entry.add_to_hass(hass)
+    with patch(
+        "homeassistant.components.deconz.hub.api.DeconzSession.refresh_state",
+        side_effect=side_effect,
+    ):
+        await hass.config_entries.async_setup(config_entry.entry_id)
         await hass.async_block_till_done()
-        assert len(mock_dispatch_send.mock_calls) == 1
-        assert len(mock_dispatch_send.mock_calls[0]) == 3
+    assert config_entry.state is state
 
 
-async def test_add_new_remote(hass):
-    """Test new added device creates a new remote."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80,
-                  'api_key': '1234567890ABCDEF', 'allow_clip_sensor': False}
-    remote = Mock()
-    remote.name = 'name'
-    remote.type = 'ZHASwitch'
-    remote.register_async_callback = Mock()
-    with patch('pydeconz.DeconzSession.async_get_state',
-               return_value=mock_coro(CONFIG)), \
-            patch('pydeconz.DeconzSession.start', return_value=True):
-        assert await deconz.async_setup_entry(hass, entry) is True
-    async_dispatcher_send(hass, 'deconz_new_sensor', [remote])
-    await hass.async_block_till_done()
-    assert len(hass.data[deconz.DATA_DECONZ_EVENT]) == 1
+async def test_setup_entry_fails_trigger_reauth_flow(
+    hass: HomeAssistant, config_entry_factory: ConfigEntryFactoryType
+) -> None:
+    """Failed authentication trigger a reauthentication flow."""
+    with (
+        patch(
+            "homeassistant.components.deconz.get_deconz_api",
+            side_effect=AuthenticationRequired,
+        ),
+        patch.object(hass.config_entries.flow, "async_init") as mock_flow_init,
+    ):
+        config_entry = await config_entry_factory()
+        mock_flow_init.assert_called_once()
+    assert config_entry.state is ConfigEntryState.SETUP_ERROR
 
 
-async def test_do_not_allow_clip_sensor(hass):
-    """Test that clip sensors can be ignored."""
-    entry = Mock()
-    entry.data = {'host': '1.2.3.4', 'port': 80,
-                  'api_key': '1234567890ABCDEF', 'allow_clip_sensor': False}
-    remote = Mock()
-    remote.name = 'name'
-    remote.type = 'CLIPSwitch'
-    remote.register_async_callback = Mock()
-    with patch('pydeconz.DeconzSession.async_get_state',
-               return_value=mock_coro(CONFIG)), \
-            patch('pydeconz.DeconzSession.start', return_value=True):
-        assert await deconz.async_setup_entry(hass, entry) is True
+async def test_setup_entry_multiple_gateways(
+    hass: HomeAssistant, config_entry_factory: ConfigEntryFactoryType
+) -> None:
+    """Test setup entry is successful with multiple gateways."""
+    config_entry = await config_entry_factory()
 
-    async_dispatcher_send(hass, 'deconz_new_sensor', [remote])
-    await hass.async_block_till_done()
-    assert len(hass.data[deconz.DATA_DECONZ_EVENT]) == 0
+    entry2 = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="2",
+        unique_id="01234E56789B",
+        data=config_entry.data | {"host": "2.3.4.5"},
+    )
+    config_entry2 = await config_entry_factory(entry2)
+
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert config_entry2.state is ConfigEntryState.LOADED
+    assert config_entry.options[CONF_MASTER_GATEWAY] is True
+    assert config_entry2.options[CONF_MASTER_GATEWAY] is False
+
+
+async def test_unload_entry(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Test being able to unload an entry."""
+    assert config_entry_setup.state is ConfigEntryState.LOADED
+    assert await hass.config_entries.async_unload(config_entry_setup.entry_id)
+    assert config_entry_setup.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_unload_entry_multiple_gateways(
+    hass: HomeAssistant, config_entry_factory: ConfigEntryFactoryType
+) -> None:
+    """Test being able to unload an entry and master gateway gets moved."""
+    config_entry = await config_entry_factory()
+
+    entry2 = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="2",
+        unique_id="01234E56789B",
+        data=config_entry.data | {"host": "2.3.4.5"},
+    )
+    config_entry2 = await config_entry_factory(entry2)
+
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert config_entry2.state is ConfigEntryState.LOADED
+
+    assert await hass.config_entries.async_unload(config_entry.entry_id)
+    assert config_entry.state is ConfigEntryState.NOT_LOADED
+    assert config_entry2.options[CONF_MASTER_GATEWAY] is True
+
+
+async def test_unload_entry_multiple_gateways_parallel(
+    hass: HomeAssistant, config_entry_factory: ConfigEntryFactoryType
+) -> None:
+    """Test race condition when unloading multiple config entries in parallel."""
+    config_entry = await config_entry_factory()
+
+    entry2 = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="2",
+        unique_id="01234E56789B",
+        data=config_entry.data | {"host": "2.3.4.5"},
+    )
+    config_entry2 = await config_entry_factory(entry2)
+
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert config_entry2.state is ConfigEntryState.LOADED
+
+    await asyncio.gather(
+        hass.config_entries.async_unload(config_entry.entry_id),
+        hass.config_entries.async_unload(config_entry2.entry_id),
+    )
+
+    assert config_entry.state is ConfigEntryState.NOT_LOADED
+    assert config_entry2.state is ConfigEntryState.NOT_LOADED

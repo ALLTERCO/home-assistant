@@ -1,0 +1,417 @@
+"""Test the Logitech Harmony Hub config flow."""
+
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import aiohttp
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+
+from homeassistant import config_entries
+from homeassistant.components.harmony.const import DOMAIN, PREVIOUS_ACTIVE_ACTIVITY
+from homeassistant.const import CONF_HOST, CONF_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
+
+from .const import HUB_NAME
+
+
+def _get_mock_harmonyapi(connect=None, close=None):
+    harmonyapi_mock = MagicMock()
+    type(harmonyapi_mock).connect = AsyncMock(return_value=connect)
+    type(harmonyapi_mock).close = AsyncMock(return_value=close)
+
+    return harmonyapi_mock
+
+
+@pytest.mark.parametrize(
+    ("user_input", "expected_data"),
+    [
+        pytest.param(
+            {"host": "1.2.3.4"},
+            {"host": "1.2.3.4", "name": "friend"},
+            id="host_only",
+        ),
+        pytest.param(
+            {"host": "1.2.3.4", "activity": "Watch TV", "delay_secs": 0.2},
+            {
+                "host": "1.2.3.4",
+                "name": "friend",
+                "activity": "Watch TV",
+                "delay_secs": 0.2,
+            },
+            id="with_extra_options",
+        ),
+    ],
+)
+async def test_user_form(
+    hass: HomeAssistant,
+    user_input: dict[str, Any],
+    expected_data: dict[str, Any],
+) -> None:
+    """Test we get the user form."""
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {}
+
+    harmonyapi = _get_mock_harmonyapi(connect=True)
+    harmonyapi.name = "friend"
+    with (
+        patch(
+            "homeassistant.components.harmony.util.HarmonyAPI",
+            return_value=harmonyapi,
+        ),
+        patch(
+            "homeassistant.components.harmony.async_setup_entry",
+            return_value=None,
+        ) as mock_setup_entry,
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input,
+        )
+        await hass.async_block_till_done()
+
+    # pylint: disable-next=home-assistant-tests-config-flow-unique-id
+    assert result2["type"] is FlowResultType.CREATE_ENTRY
+    assert result2["title"] == "friend"
+    assert result2["data"] == expected_data
+    assert len(mock_setup_entry.mock_calls) == 1
+
+
+async def test_form_ssdp(hass: HomeAssistant) -> None:
+    """Test we get the form with ssdp source."""
+
+    with patch(
+        "homeassistant.components.harmony.config_flow.HubConnector.get_remote_id",
+        return_value=1234,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_SSDP},
+            data=SsdpServiceInfo(
+                ssdp_usn="mock_usn",
+                ssdp_st="mock_st",
+                ssdp_location="http://192.168.1.12:8088/description",
+                upnp={
+                    "friendlyName": "Harmony Hub",
+                },
+            ),
+        )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "link"
+    assert result["errors"] == {}
+    assert result["description_placeholders"] == {
+        "host": "Harmony Hub",
+        "name": "192.168.1.12",
+    }
+    progress = hass.config_entries.flow.async_progress()
+    assert len(progress) == 1
+    assert progress[0]["flow_id"] == result["flow_id"]
+
+    harmonyapi = _get_mock_harmonyapi(connect=True)
+
+    with (
+        patch(
+            "homeassistant.components.harmony.util.HarmonyAPI",
+            return_value=harmonyapi,
+        ),
+        patch(
+            "homeassistant.components.harmony.async_setup_entry",
+            return_value=None,
+        ) as mock_setup_entry,
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {},
+        )
+        await hass.async_block_till_done()
+
+    assert result2["type"] is FlowResultType.CREATE_ENTRY
+    assert result2["title"] == "Harmony Hub"
+    assert result2["data"] == {"host": "192.168.1.12", "name": "Harmony Hub"}
+    assert result2["result"].unique_id == "1234"
+    assert len(mock_setup_entry.mock_calls) == 1
+
+
+async def test_form_ssdp_fails_to_get_remote_id(hass: HomeAssistant) -> None:
+    """Test we abort if we cannot get the remote id."""
+
+    with patch(
+        "homeassistant.components.harmony.config_flow.HubConnector.get_remote_id",
+        side_effect=aiohttp.ClientError,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_SSDP},
+            data=SsdpServiceInfo(
+                ssdp_usn="mock_usn",
+                ssdp_st="mock_st",
+                ssdp_location="http://192.168.1.12:8088/description",
+                upnp={
+                    "friendlyName": "Harmony Hub",
+                },
+            ),
+        )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "cannot_connect"
+
+
+async def test_form_ssdp_aborts_before_checking_remoteid_if_host_known(
+    hass: HomeAssistant,
+) -> None:
+    """Test we abort without connecting if the host is already known."""
+
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={"host": "2.2.2.2", "name": "any"},
+    )
+    config_entry.add_to_hass(hass)
+
+    config_entry_without_host = MockConfigEntry(
+        domain=DOMAIN,
+        data={"name": "other"},
+    )
+    config_entry_without_host.add_to_hass(hass)
+
+    harmonyapi = _get_mock_harmonyapi(connect=True)
+
+    with patch(
+        "homeassistant.components.harmony.util.HarmonyAPI",
+        return_value=harmonyapi,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_SSDP},
+            data=SsdpServiceInfo(
+                ssdp_usn="mock_usn",
+                ssdp_st="mock_st",
+                ssdp_location="http://2.2.2.2:8088/description",
+                upnp={
+                    "friendlyName": "Harmony Hub",
+                },
+            ),
+        )
+    assert result["type"] is FlowResultType.ABORT
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "error"),
+    [
+        pytest.param(None, "cannot_connect", id="cannot_connect"),
+        pytest.param(ValueError, "unknown", id="unknown"),
+    ],
+)
+async def test_form_errors(
+    hass: HomeAssistant,
+    side_effect: type[Exception] | None,
+    error: str,
+) -> None:
+    """Test we handle cannot connect and unknown errors."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    harmonyapi = _get_mock_harmonyapi(connect=False)
+    with patch(
+        "homeassistant.components.harmony.util.HarmonyAPI",
+        return_value=harmonyapi,
+        side_effect=side_effect,
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "host": "1.2.3.4",
+                "activity": "Watch TV",
+                "delay_secs": 0.2,
+            },
+        )
+
+    assert result2["type"] is FlowResultType.FORM
+    assert result2["errors"] == {"base": error}
+
+    harmonyapi = _get_mock_harmonyapi(connect=True)
+    harmonyapi.name = "friend"
+    with (
+        patch(
+            "homeassistant.components.harmony.util.HarmonyAPI",
+            return_value=harmonyapi,
+        ),
+        patch(
+            "homeassistant.components.harmony.async_setup_entry",
+            return_value=None,
+        ),
+    ):
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                "host": "1.2.3.4",
+                "activity": "Watch TV",
+                "delay_secs": 0.2,
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_options_flow_entry_not_loaded(hass: HomeAssistant) -> None:
+    """Test the options flow aborts while the entry is not set up."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="abcde12345",
+        data={CONF_HOST: "1.2.3.4", CONF_NAME: "Guest Room"},
+    )
+    config_entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "entry_not_loaded"
+
+
+async def test_options_flow(hass: HomeAssistant, mock_hc, mock_write_config) -> None:
+    """Test config flow options."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="abcde12345",
+        data={CONF_HOST: "1.2.3.4", CONF_NAME: "Guest Room"},
+        options={"activity": "Watch TV", "delay_secs": 0.5},
+    )
+
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    result = await hass.config_entries.options.async_init(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_unload(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={"activity": PREVIOUS_ACTIVE_ACTIVITY, "delay_secs": 0.4},
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert config_entry.options == {
+        "activity": PREVIOUS_ACTIVE_ACTIVITY,
+        "delay_secs": 0.4,
+    }
+
+
+async def test_reconfigure(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Test reconfiguring the host of the hub."""
+    mock_config_entry.add_to_hass(hass)
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == {}
+
+    harmonyapi = _get_mock_harmonyapi(connect=True)
+    harmonyapi.name = "friend"
+    harmonyapi.hub_id = 123
+    with (
+        patch(
+            "homeassistant.components.harmony.util.HarmonyAPI",
+            return_value=harmonyapi,
+        ),
+        patch(
+            "homeassistant.components.harmony.async_setup_entry",
+            return_value=None,
+        ) as mock_setup_entry,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_HOST: "5.6.7.8"}
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert mock_config_entry.data == {CONF_HOST: "5.6.7.8", CONF_NAME: HUB_NAME}
+    mock_setup_entry.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "error"),
+    [
+        pytest.param(None, "cannot_connect", id="cannot_connect"),
+        pytest.param(ValueError, "unknown", id="unknown"),
+    ],
+)
+async def test_reconfigure_errors(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    side_effect: type[Exception] | None,
+    error: str,
+) -> None:
+    """Test reconfiguring shows errors and recovers from them."""
+    mock_config_entry.add_to_hass(hass)
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+
+    harmonyapi = _get_mock_harmonyapi(connect=False)
+    with patch(
+        "homeassistant.components.harmony.util.HarmonyAPI",
+        return_value=harmonyapi,
+        side_effect=side_effect,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_HOST: "5.6.7.8"}
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == {"base": error}
+
+    harmonyapi = _get_mock_harmonyapi(connect=True)
+    harmonyapi.hub_id = 123
+    with (
+        patch(
+            "homeassistant.components.harmony.util.HarmonyAPI",
+            return_value=harmonyapi,
+        ),
+        patch(
+            "homeassistant.components.harmony.async_setup_entry",
+            return_value=None,
+        ) as mock_setup_entry,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_HOST: "5.6.7.8"}
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert mock_config_entry.data[CONF_HOST] == "5.6.7.8"
+    mock_setup_entry.assert_awaited_once()
+
+
+async def test_reconfigure_unique_id_mismatch(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Test reconfiguring to a different hub aborts."""
+    mock_config_entry.add_to_hass(hass)
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+
+    harmonyapi = _get_mock_harmonyapi(connect=True)
+    harmonyapi.hub_id = 456
+    with patch(
+        "homeassistant.components.harmony.util.HarmonyAPI",
+        return_value=harmonyapi,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_HOST: "5.6.7.8"}
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unique_id_mismatch"
+    assert mock_config_entry.data[CONF_HOST] == "192.0.2.0"

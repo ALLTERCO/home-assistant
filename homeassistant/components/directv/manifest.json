@@ -1,0 +1,19 @@
+{
+  "domain": "directv",
+  "name": "DirecTV",
+  "categories": ["media_entertainment.tv_streaming"],
+  "codeowners": [],
+  "config_flow": true,
+  "connectivity": ["network"],
+  "documentation": "https://www.home-assistant.io/integrations/directv",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "loggers": ["directv"],
+  "requirements": ["directv==0.4.0"],
+  "ssdp": [
+    {
+      "deviceType": "urn:schemas-upnp-org:device:MediaServer:1",
+      "manufacturer": "DIRECTV"
+    }
+  ]
+}

@@ -1,142 +1,90 @@
-"""
-Support to trigger Maker IFTTT recipes.
+"""Support to trigger Maker IFTTT recipes."""
 
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/ifttt/
-"""
-from ipaddress import ip_address
 import json
 import logging
-from urllib.parse import urlparse
 
-import requests
-import voluptuous as vol
+from aiohttp import web
+import probatio
 
-import homeassistant.helpers.config_validation as cv
-from homeassistant import config_entries
-from homeassistant.util.network import is_local
+from homeassistant.components import webhook
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_WEBHOOK_ID
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_entry_flow, config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
-REQUIREMENTS = ['pyfttt==0.3']
-DEPENDENCIES = ['webhook']
+from .const import DATA_API_KEYS, DOMAIN
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
-EVENT_RECEIVED = 'ifttt_webhook_received'
+EVENT_RECEIVED = "ifttt_webhook_received"
 
-ATTR_EVENT = 'event'
-ATTR_VALUE1 = 'value1'
-ATTR_VALUE2 = 'value2'
-ATTR_VALUE3 = 'value3'
+CONF_KEY = "key"
 
-CONF_KEY = 'key'
-CONF_WEBHOOK_ID = 'webhook_id'
-
-DOMAIN = 'ifttt'
-
-SERVICE_TRIGGER = 'trigger'
-
-SERVICE_TRIGGER_SCHEMA = vol.Schema({
-    vol.Required(ATTR_EVENT): cv.string,
-    vol.Optional(ATTR_VALUE1): cv.string,
-    vol.Optional(ATTR_VALUE2): cv.string,
-    vol.Optional(ATTR_VALUE3): cv.string,
-})
-
-CONFIG_SCHEMA = vol.Schema({
-    vol.Optional(DOMAIN): vol.Schema({
-        vol.Required(CONF_KEY): cv.string,
-    }),
-}, extra=vol.ALLOW_EXTRA)
+CONFIG_SCHEMA = probatio.Schema(
+    {
+        probatio.Optional(DOMAIN): probatio.Schema(
+            {
+                probatio.Required(probatio.Secret(CONF_KEY)): probatio.Any(
+                    {cv.string: cv.string}, cv.string
+                )
+            }
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
+)
 
 
-async def async_setup(hass, config):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the IFTTT service component."""
+    async_setup_services(hass)
+
     if DOMAIN not in config:
         return True
 
-    key = config[DOMAIN][CONF_KEY]
-
-    def trigger_service(call):
-        """Handle IFTTT trigger service calls."""
-        event = call.data[ATTR_EVENT]
-        value1 = call.data.get(ATTR_VALUE1)
-        value2 = call.data.get(ATTR_VALUE2)
-        value3 = call.data.get(ATTR_VALUE3)
-
-        try:
-            import pyfttt
-            pyfttt.send_event(key, event, value1, value2, value3)
-        except requests.exceptions.RequestException:
-            _LOGGER.exception("Error communicating with IFTTT")
-
-    hass.services.async_register(DOMAIN, SERVICE_TRIGGER, trigger_service,
-                                 schema=SERVICE_TRIGGER_SCHEMA)
+    api_keys = config[DOMAIN][CONF_KEY]
+    if isinstance(api_keys, str):
+        api_keys = {"default": api_keys}
+    hass.data[DATA_API_KEYS] = api_keys
 
     return True
 
 
-async def handle_webhook(hass, webhook_id, request):
+async def handle_webhook(
+    hass: HomeAssistant, webhook_id: str, request: web.Request
+) -> None:
     """Handle webhook callback."""
     body = await request.text()
     try:
         data = json.loads(body) if body else {}
     except ValueError:
-        return None
+        _LOGGER.error(
+            "Received invalid data from IFTTT. Data needs to be formatted as JSON: %s",
+            body,
+        )
+        return
 
-    if isinstance(data, dict):
-        data['webhook_id'] = webhook_id
+    if not isinstance(data, dict):
+        _LOGGER.error(
+            "Received invalid data from IFTTT. Data needs to be a dictionary: %s", data
+        )
+        return
+
+    data["webhook_id"] = webhook_id
     hass.bus.async_fire(EVENT_RECEIVED, data)
 
 
-async def async_setup_entry(hass, entry):
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Configure based on config entry."""
-    hass.components.webhook.async_register(
-        entry.data['webhook_id'], handle_webhook)
-    return True
+    webhook.async_register(
+        hass, DOMAIN, "IFTTT", entry.data[CONF_WEBHOOK_ID], handle_webhook
+    )
 
 
-async def async_unload_entry(hass, entry):
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload a config entry."""
-    hass.components.webhook.async_unregister(entry.data['webhook_id'])
-    return True
+    webhook.async_unregister(hass, entry.data[CONF_WEBHOOK_ID])
 
 
-@config_entries.HANDLERS.register(DOMAIN)
-class ConfigFlow(config_entries.ConfigFlow):
-    """Handle an IFTTT config flow."""
-
-    async def async_step_user(self, user_input=None):
-        """Handle a user initiated set up flow."""
-        if self._async_current_entries():
-            return self.async_abort(reason='one_instance_allowed')
-
-        try:
-            url_parts = urlparse(self.hass.config.api.base_url)
-
-            if is_local(ip_address(url_parts.hostname)):
-                return self.async_abort(reason='not_internet_accessible')
-        except ValueError:
-            # If it's not an IP address, it's very likely publicly accessible
-            pass
-
-        if user_input is None:
-            return self.async_show_form(
-                step_id='user',
-            )
-
-        webhook_id = self.hass.components.webhook.async_generate_id()
-        webhook_url = \
-            self.hass.components.webhook.async_generate_url(webhook_id)
-
-        return self.async_create_entry(
-            title='IFTTT Webhook',
-            data={
-                CONF_WEBHOOK_ID: webhook_id
-            },
-            description_placeholders={
-                'applet_url': 'https://ifttt.com/maker_webhooks',
-                'webhook_url': webhook_url,
-                'docs_url':
-                'https://www.home-assistant.io/components/ifttt/'
-            }
-        )
+async_remove_entry = config_entry_flow.webhook_async_remove_entry

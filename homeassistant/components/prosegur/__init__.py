@@ -1,0 +1,58 @@
+"""The Prosegur Alarm integration."""
+
+from pyprosegur.auth import Auth
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_COUNTRY, CONF_PASSWORD, CONF_USERNAME, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import aiohttp_client, config_validation as cv
+from homeassistant.helpers.typing import ConfigType
+
+from .const import DOMAIN
+from .services import async_setup_services
+
+PLATFORMS = [Platform.ALARM_CONTROL_PANEL, Platform.CAMERA]
+
+type ProsegurConfigEntry = ConfigEntry[Auth]
+
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Prosegur Alarm integration."""
+    async_setup_services(hass)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ProsegurConfigEntry) -> None:
+    """Set up Prosegur Alarm from a config entry."""
+    try:
+        session = aiohttp_client.async_get_clientsession(hass)
+        auth = Auth(
+            session,
+            entry.data[CONF_USERNAME],
+            entry.data[CONF_PASSWORD],
+            entry.data[CONF_COUNTRY],
+        )
+        await auth.login()
+
+    except ConnectionRefusedError as error:
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN, translation_key="invalid_auth"
+        ) from error
+
+    except ConnectionError as error:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN, translation_key="cannot_connect"
+        ) from error
+
+    entry.runtime_data = auth
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ProsegurConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

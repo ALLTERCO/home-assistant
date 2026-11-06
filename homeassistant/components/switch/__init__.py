@@ -1,120 +1,94 @@
-"""
-Component to interface with various switches that can be controlled remotely.
+"""Component to interface with switches that can be controlled remotely."""
 
-For more details about this component, please refer to the documentation
-at https://home-assistant.io/components/switch/
-"""
 from datetime import timedelta
 import logging
 
-import voluptuous as vol
-
-from homeassistant.loader import bind_hass
-from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.helpers.entity import ToggleEntity
-from homeassistant.helpers.config_validation import PLATFORM_SCHEMA  # noqa
-import homeassistant.helpers.config_validation as cv
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    STATE_ON, SERVICE_TURN_ON, SERVICE_TURN_OFF, SERVICE_TOGGLE,
-    ATTR_ENTITY_ID)
-from homeassistant.components import group
+    SERVICE_TOGGLE,
+    SERVICE_TURN_OFF,
+    SERVICE_TURN_ON,
+    STATE_OFF,
+    STATE_ON,
+)
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_component import EntityComponent
+from homeassistant.helpers.typing import ConfigType
 
-DOMAIN = 'switch'
-DEPENDENCIES = ['group']
-SCAN_INTERVAL = timedelta(seconds=30)
-
-GROUP_NAME_ALL_SWITCHES = 'all switches'
-ENTITY_ID_ALL_SWITCHES = group.ENTITY_ID_FORMAT.format('all_switches')
-
-ENTITY_ID_FORMAT = DOMAIN + '.{}'
-
-ATTR_TODAY_ENERGY_KWH = "today_energy_kwh"
-ATTR_CURRENT_POWER_W = "current_power_w"
-
-MIN_TIME_BETWEEN_SCANS = timedelta(seconds=10)
-
-PROP_TO_ATTR = {
-    'current_power_w': ATTR_CURRENT_POWER_W,
-    'today_energy_kwh': ATTR_TODAY_ENERGY_KWH,
-}
-
-SWITCH_SERVICE_SCHEMA = vol.Schema({
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-})
+from .const import (
+    DATA_COMPONENT,
+    DEVICE_CLASSES_SCHEMA,
+    DOMAIN,
+    SwitchDeviceClass,
+    SwitchService,
+)
+from .entity import SwitchEntity, SwitchEntityDescription
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
+ENTITY_ID_FORMAT = DOMAIN + ".{}"
+PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA
+PLATFORM_SCHEMA_BASE = cv.PLATFORM_SCHEMA_BASE
+SCAN_INTERVAL = timedelta(seconds=30)
 
-@bind_hass
-def is_on(hass, entity_id=None):
+MIN_TIME_BETWEEN_SCANS = timedelta(seconds=10)
+
+
+DEVICE_CLASSES = [cls.value for cls in SwitchDeviceClass]
+
+__all__ = [
+    "DEVICE_CLASSES_SCHEMA",
+    "DOMAIN",
+    "ENTITY_ID_FORMAT",
+    "PLATFORM_SCHEMA",
+    "PLATFORM_SCHEMA_BASE",
+    "SERVICE_TOGGLE",
+    "SERVICE_TURN_OFF",
+    "SERVICE_TURN_ON",
+    "STATE_OFF",
+    "STATE_ON",
+    "SwitchDeviceClass",
+    "SwitchEntity",
+    "SwitchEntityDescription",
+    "SwitchService",
+]
+
+# mypy: disallow-any-generics
+
+
+def is_on(hass: HomeAssistant, entity_id: str) -> bool:
     """Return if the switch is on based on the statemachine.
 
     Async friendly.
     """
-    entity_id = entity_id or ENTITY_ID_ALL_SWITCHES
     return hass.states.is_state(entity_id, STATE_ON)
 
 
-async def async_setup(hass, config):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Track states and offer events for switches."""
-    component = hass.data[DOMAIN] = EntityComponent(
-        _LOGGER, DOMAIN, hass, SCAN_INTERVAL, GROUP_NAME_ALL_SWITCHES)
+    component = hass.data[DATA_COMPONENT] = EntityComponent[SwitchEntity](
+        _LOGGER, DOMAIN, hass, SCAN_INTERVAL
+    )
     await component.async_setup(config)
 
-    component.async_register_entity_service(
-        SERVICE_TURN_OFF, SWITCH_SERVICE_SCHEMA,
-        'async_turn_off'
-    )
-
-    component.async_register_entity_service(
-        SERVICE_TURN_ON, SWITCH_SERVICE_SCHEMA,
-        'async_turn_on'
-    )
-
-    component.async_register_entity_service(
-        SERVICE_TOGGLE, SWITCH_SERVICE_SCHEMA,
-        'async_toggle'
-    )
+    async_setup_services(hass)
 
     return True
 
 
-async def async_setup_entry(hass, entry):
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Set up a config entry."""
-    return await hass.data[DOMAIN].async_setup_entry(entry)
+    if not await hass.data[DATA_COMPONENT].async_setup_entry(entry):
+        raise ConfigEntryError(
+            translation_domain=HOMEASSISTANT_DOMAIN,
+            translation_key="platform_setup_failed",
+            translation_placeholders={"platform": entry.domain, "domain": DOMAIN},
+        )
 
 
-async def async_unload_entry(hass, entry):
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Unload a config entry."""
-    return await hass.data[DOMAIN].async_unload_entry(entry)
-
-
-class SwitchDevice(ToggleEntity):
-    """Representation of a switch."""
-
-    @property
-    def current_power_w(self):
-        """Return the current power usage in W."""
-        return None
-
-    @property
-    def today_energy_kwh(self):
-        """Return the today total energy usage in kWh."""
-        return None
-
-    @property
-    def is_standby(self):
-        """Return true if device is in standby."""
-        return None
-
-    @property
-    def state_attributes(self):
-        """Return the optional state attributes."""
-        data = {}
-
-        for prop, attr in PROP_TO_ATTR.items():
-            value = getattr(self, prop)
-            if value:
-                data[attr] = value
-
-        return data
+    await hass.data[DATA_COMPONENT].async_unload_entry(entry)

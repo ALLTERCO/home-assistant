@@ -1,0 +1,90 @@
+add_doorbell_text:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: unifiprotect
+    message:
+      example: Come In
+      required: true
+      selector:
+        text:
+remove_doorbell_text:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: unifiprotect
+    message:
+      example: Go Away!
+      required: true
+      selector:
+        text:
+set_chime_paired_doorbells:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: unifiprotect
+    doorbells:
+      example: "event.front_doorbell_doorbell"
+      required: false
+      selector:
+        target:
+          entity:
+            - integration: unifiprotect
+              domain: event
+              device_class: doorbell
+            - integration: unifiprotect
+              domain: binary_sensor
+              device_class: occupancy
+remove_privacy_zone:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: unifiprotect
+          entity:
+            domain: camera
+    name:
+      required: true
+      selector:
+        text:
+get_user_keyring_info:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: unifiprotect
+
+ptz_goto_preset:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: unifiprotect
+          entity:
+            domain: camera
+    preset:
+      required: true
+      selector:
+        text:
+
+trigger_alarm_webhook:
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: unifiprotect
+    trigger_id:
+      example: 0b6c5a2e-9d3f-4c1a-8e7b-2f4d6a8c1e3b
+      required: true
+      selector:
+        text:

@@ -1,133 +1,253 @@
 """Authentication for HTTP component."""
 
-import base64
-import hmac
+from collections.abc import Awaitable, Callable
+from datetime import timedelta
 import logging
+import secrets
+import time
+from typing import Any, Final
 
 from aiohttp import hdrs
-from aiohttp.web import middleware
+from aiohttp.web import (
+    Application,
+    HTTPInternalServerError,
+    Request,
+    StreamResponse,
+    middleware,
+)
+import jwt
+from jwt import api_jws
+from yarl import URL
 
-from homeassistant.core import callback
-from homeassistant.const import HTTP_HEADER_HA_AUTH
-from .const import KEY_AUTHENTICATED, KEY_REAL_IP
+from homeassistant.auth import jwt_wrapper
+from homeassistant.auth.const import GROUP_ID_READ_ONLY
+from homeassistant.components import websocket_api
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.http import KEY_AUTHENTICATED, current_request
+from homeassistant.helpers.json import json_bytes
+from homeassistant.helpers.storage import Store
 
-DATA_API_PASSWORD = 'api_password'
+from .auth_util import async_user_not_allowed_do_auth
+from .const import (
+    DATA_SUPERVISOR_USER,
+    KEY_HASS_REFRESH_TOKEN_ID,
+    KEY_HASS_USER,
+    is_supervisor_unix_socket_request,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
+DATA_API_PASSWORD: Final = "api_password"
+DATA_SIGN_SECRET: Final = "http.auth.sign_secret"
+SIGN_QUERY_PARAM: Final = "authSig"
+SAFE_QUERY_PARAMS: Final = frozenset(("height", "width"))
+
+STORAGE_VERSION = 1
+STORAGE_KEY = "http.auth"
+CONTENT_USER_NAME = "Home Assistant Content"
+
 
 @callback
-def setup_auth(app, trusted_networks, use_auth,
-               support_legacy=False, api_password=None):
+def async_sign_path(
+    hass: HomeAssistant,
+    path: str,
+    expiration: timedelta,
+    *,
+    refresh_token_id: str | None = None,
+    use_content_user: bool = False,
+) -> str:
+    """Sign a path for temporary access without auth header."""
+    if (secret := hass.data.get(DATA_SIGN_SECRET)) is None:
+        secret = hass.data[DATA_SIGN_SECRET] = secrets.token_hex()
+
+    if refresh_token_id is None:
+        if use_content_user:
+            refresh_token_id = hass.data[STORAGE_KEY]
+        elif (
+            connection := websocket_api.current_connection.get()
+        ) and connection.refresh_token_id:
+            refresh_token_id = connection.refresh_token_id
+        elif (
+            request := current_request.get()
+        ) and KEY_HASS_REFRESH_TOKEN_ID in request:
+            refresh_token_id = request[KEY_HASS_REFRESH_TOKEN_ID]
+        else:
+            refresh_token_id = hass.data[STORAGE_KEY]
+
+    url = URL(path)
+    now_timestamp = int(time.time())
+    expiration_timestamp = now_timestamp + int(expiration.total_seconds())
+    params = [itm for itm in url.query.items() if itm[0] not in SAFE_QUERY_PARAMS]
+    json_payload = json_bytes(
+        {
+            "iss": refresh_token_id,
+            "path": url.path,
+            "params": params,
+            "iat": now_timestamp,
+            "exp": expiration_timestamp,
+        }
+    )
+    encoded = api_jws.encode(json_payload, secret, "HS256")
+    params.append((SIGN_QUERY_PARAM, encoded))
+    url = url.with_query(params)
+    return f"{url.path}?{url.query_string}"
+
+
+async def async_setup_auth(
+    hass: HomeAssistant,
+    app: Application,
+) -> None:
     """Create auth middleware for the app."""
-    old_auth_warning = set()
+    store = Store[dict[str, Any]](hass, STORAGE_VERSION, STORAGE_KEY)
+    if (data := await store.async_load()) is None:
+        data = {}
+
+    refresh_token = None
+    if "content_user" in data:
+        user = await hass.auth.async_get_user(data["content_user"])
+        if user and user.refresh_tokens:
+            refresh_token = list(user.refresh_tokens.values())[0]
+
+    if refresh_token is None:
+        user = await hass.auth.async_create_system_user(
+            CONTENT_USER_NAME, group_ids=[GROUP_ID_READ_ONLY]
+        )
+        refresh_token = await hass.auth.async_create_refresh_token(user)
+        data["content_user"] = user.id
+        await store.async_save(data)
+
+    hass.data[STORAGE_KEY] = refresh_token.id
+
+    @callback
+    def async_validate_auth_header(request: Request) -> bool:
+        """Test authorization header against access token.
+
+        Basic auth_type is legacy code, should be removed with api_password.
+        """
+        try:
+            auth_type, auth_val = request.headers.get(hdrs.AUTHORIZATION, "").split(
+                " ", 1
+            )
+        except ValueError:
+            # If no space in authorization header
+            return False
+
+        if auth_type != "Bearer":
+            return False
+
+        refresh_token = hass.auth.async_validate_access_token(auth_val)
+
+        if refresh_token is None:
+            return False
+
+        if async_user_not_allowed_do_auth(hass, refresh_token.user, request):
+            return False
+
+        hass.auth.async_log_access_token_usage(refresh_token, request.remote)
+        request[KEY_HASS_USER] = refresh_token.user
+        request[KEY_HASS_REFRESH_TOKEN_ID] = refresh_token.id
+        return True
+
+    @callback
+    def async_validate_signed_request(request: Request) -> bool:
+        """Validate a signed request."""
+        if (secret := hass.data.get(DATA_SIGN_SECRET)) is None:
+            return False
+
+        if (signature := request.query.get(SIGN_QUERY_PARAM)) is None:
+            return False
+
+        try:
+            claims = jwt_wrapper.verify_and_decode(
+                signature, secret, algorithms=["HS256"], options={"verify_iss": False}
+            )
+        except jwt.InvalidTokenError:
+            return False
+
+        if claims["path"] != request.path:
+            return False
+
+        params = [
+            list(itm)  # claims stores tuples as lists
+            for itm in request.query.items()
+            if itm[0] not in SAFE_QUERY_PARAMS and itm[0] != SIGN_QUERY_PARAM
+        ]
+        if claims["params"] != params:
+            return False
+
+        refresh_token = hass.auth.async_get_refresh_token(claims["iss"])
+
+        if refresh_token is None:
+            return False
+
+        if async_user_not_allowed_do_auth(hass, refresh_token.user, request):
+            return False
+
+        request[KEY_HASS_USER] = refresh_token.user
+        request[KEY_HASS_REFRESH_TOKEN_ID] = refresh_token.id
+        return True
+
+    async def async_authenticate_supervisor_unix_socket(request: Request) -> bool:
+        """Authenticate a request from a Unix socket as the Supervisor user.
+
+        The Unix Socket is dedicated and only available to Supervisor. To
+        avoid the extra overhead and round trips for the authentication and
+        refresh tokens, we directly authenticate requests from the socket as
+        the Supervisor user provided by the hassio integration. The user is
+        looked up in the auth store so a user removed at runtime is not
+        authenticated any longer.
+        """
+        if (supervisor_user := hass.data.get(DATA_SUPERVISOR_USER)) is None or (
+            user := await hass.auth.async_get_user(supervisor_user.id)
+        ) is None:
+            # The Unix socket should not be serving before the hassio integration
+            # has provided the Supervisor user. If we get here, something is wrong.
+            _LOGGER.error(
+                "Supervisor user not found; cannot authenticate Unix socket request"
+            )
+            raise HTTPInternalServerError
+
+        # Not setting KEY_HASS_REFRESH_TOKEN_ID since Supervisor user
+        # doesn't use refresh tokens.
+        request[KEY_HASS_USER] = user
+        return True
 
     @middleware
-    async def auth_middleware(request, handler):
+    async def auth_middleware(
+        request: Request, handler: Callable[[Request], Awaitable[StreamResponse]]
+    ) -> StreamResponse:
         """Authenticate as middleware."""
         authenticated = False
 
-        if use_auth and (HTTP_HEADER_HA_AUTH in request.headers or
-                         DATA_API_PASSWORD in request.query):
-            if request.path not in old_auth_warning:
-                _LOGGER.log(
-                    logging.INFO if support_legacy else logging.WARNING,
-                    'You need to use a bearer token to access %s from %s',
-                    request.path, request[KEY_REAL_IP])
-                old_auth_warning.add(request.path)
+        if is_supervisor_unix_socket_request(request):
+            authenticated = await async_authenticate_supervisor_unix_socket(request)
+            auth_type = "supervisor unix socket"
 
-        legacy_auth = (not use_auth or support_legacy) and api_password
-        if (hdrs.AUTHORIZATION in request.headers and
-                await async_validate_auth_header(
-                    request, api_password if legacy_auth else None)):
-            # it included both use_auth and api_password Basic auth
+        elif hdrs.AUTHORIZATION in request.headers and async_validate_auth_header(
+            request
+        ):
             authenticated = True
+            auth_type = "bearer token"
 
-        elif (legacy_auth and HTTP_HEADER_HA_AUTH in request.headers and
-              hmac.compare_digest(
-                  api_password.encode('utf-8'),
-                  request.headers[HTTP_HEADER_HA_AUTH].encode('utf-8'))):
-            # A valid auth header has been set
+        # We first start with a string check to avoid parsing query params
+        # for every request.
+        elif (
+            request.method in ["GET", "HEAD"]
+            and SIGN_QUERY_PARAM in request.query_string
+            and async_validate_signed_request(request)
+        ):
             authenticated = True
+            auth_type = "signed request"
 
-        elif (legacy_auth and DATA_API_PASSWORD in request.query and
-              hmac.compare_digest(
-                  api_password.encode('utf-8'),
-                  request.query[DATA_API_PASSWORD].encode('utf-8'))):
-            authenticated = True
-
-        elif _is_trusted_ip(request, trusted_networks):
-            authenticated = True
-
-        elif not use_auth and api_password is None:
-            # If neither password nor auth_providers set,
-            #  just always set authenticated=True
-            authenticated = True
+        if authenticated and _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "Authenticated %s for %s using %s",
+                request.remote or "unknown remote",
+                request.path,
+                auth_type,
+            )
 
         request[KEY_AUTHENTICATED] = authenticated
         return await handler(request)
 
-    async def auth_startup(app):
-        """Initialize auth middleware when app starts up."""
-        app.middlewares.append(auth_middleware)
-
-    app.on_startup.append(auth_startup)
-
-
-def _is_trusted_ip(request, trusted_networks):
-    """Test if request is from a trusted ip."""
-    ip_addr = request[KEY_REAL_IP]
-
-    return any(
-        ip_addr in trusted_network for trusted_network
-        in trusted_networks)
-
-
-def validate_password(request, api_password):
-    """Test if password is valid."""
-    return hmac.compare_digest(
-        api_password.encode('utf-8'),
-        request.app['hass'].http.api_password.encode('utf-8'))
-
-
-async def async_validate_auth_header(request, api_password=None):
-    """
-    Test authorization header against access token.
-
-    Basic auth_type is legacy code, should be removed with api_password.
-    """
-    if hdrs.AUTHORIZATION not in request.headers:
-        return False
-
-    try:
-        auth_type, auth_val = \
-            request.headers.get(hdrs.AUTHORIZATION).split(' ', 1)
-    except ValueError:
-        # If no space in authorization header
-        return False
-
-    if auth_type == 'Bearer':
-        hass = request.app['hass']
-        refresh_token = await hass.auth.async_validate_access_token(auth_val)
-        if refresh_token is None:
-            return False
-
-        request['hass_refresh_token'] = refresh_token
-        request['hass_user'] = refresh_token.user
-        return True
-
-    if auth_type == 'Basic' and api_password is not None:
-        decoded = base64.b64decode(auth_val).decode('utf-8')
-        try:
-            username, password = decoded.split(':', 1)
-        except ValueError:
-            # If no ':' in decoded
-            return False
-
-        if username != 'homeassistant':
-            return False
-
-        return hmac.compare_digest(api_password.encode('utf-8'),
-                                   password.encode('utf-8'))
-
-    return False
+    app.middlewares.append(auth_middleware)

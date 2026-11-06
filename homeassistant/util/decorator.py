@@ -1,15 +1,16 @@
 """Decorator utility functions."""
-from typing import Callable, TypeVar
 
-CALLABLE_T = TypeVar('CALLABLE_T', bound=Callable)  # noqa pylint: disable=invalid-name
+from collections.abc import Callable, Hashable
+from typing import Any
 
 
-class Registry(dict):
+class Registry[_KT: Hashable, _VT: Callable[..., Any]](dict[_KT, _VT]):
     """Registry of items."""
 
-    def register(self, name: str) -> Callable[[CALLABLE_T], CALLABLE_T]:
+    def register(self, name: _KT) -> Callable[[_VT], _VT]:
         """Return decorator to register item with a specific name."""
-        def decorator(func: CALLABLE_T) -> CALLABLE_T:
+
+        def decorator(func: _VT) -> _VT:
             """Register decorated function."""
             self[name] = func
             return func

@@ -1,0 +1,31 @@
+"""The INKBIRD Bluetooth integration."""
+
+from typing import Any
+
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+
+from .const import CONF_DEVICE_DATA, CONF_DEVICE_TYPE
+from .coordinator import INKBIRDActiveBluetoothProcessorCoordinator, INKBIRDConfigEntry
+
+PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: INKBIRDConfigEntry) -> None:
+    """Set up INKBIRD BLE device from a config entry."""
+    assert entry.unique_id is not None
+    device_type: str | None = entry.data.get(CONF_DEVICE_TYPE)
+    device_data: dict[str, Any] | None = entry.data.get(CONF_DEVICE_DATA)
+    coordinator = INKBIRDActiveBluetoothProcessorCoordinator(
+        hass, entry, device_type, device_data
+    )
+    await coordinator.async_init()
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # only start after all platforms have had a chance to subscribe
+    entry.async_on_unload(coordinator.async_start())
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: INKBIRDConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

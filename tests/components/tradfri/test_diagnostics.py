@@ -1,0 +1,26 @@
+"""Tests for Tradfri diagnostics."""
+
+import pytest
+from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
+from pytest_homeassistant.typing import ClientSessionGenerator
+from pytradfri.device import Device
+
+from homeassistant.core import HomeAssistant
+
+from .common import setup_integration
+
+
+@pytest.mark.parametrize("device", ["air_purifier"], indirect=True)
+async def test_diagnostics(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    device: Device,
+) -> None:
+    """Test diagnostics for config entry."""
+    config_entry = await setup_integration(hass)
+
+    result = await get_diagnostics_for_config_entry(hass, hass_client, config_entry)
+
+    assert isinstance(result, dict)
+    assert result["gateway_version"] == "1.2.1234"
+    assert result["device_data"] == ["STARKVIND Air purifier"]

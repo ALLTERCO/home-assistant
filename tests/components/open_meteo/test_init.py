@@ -1,0 +1,88 @@
+"""Tests for the Open-Meteo integration."""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from open_meteo import OpenMeteoConnectionError
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
+
+from homeassistant.components.open_meteo.const import DOMAIN
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import CONF_ZONE
+from homeassistant.core import HomeAssistant
+
+
+async def test_load_unload_config_entry(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_open_meteo: AsyncMock,
+) -> None:
+    """Test the Open-Meteo configuration entry loading/unloading."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+
+    await hass.config_entries.async_unload(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert not hass.data.get(DOMAIN)
+    assert mock_config_entry.state is ConfigEntryState.NOT_LOADED
+
+
+@patch(
+    "homeassistant.components.open_meteo.coordinator.OpenMeteo.forecast",
+    side_effect=OpenMeteoConnectionError,
+)
+async def test_config_entry_not_ready(
+    mock_forecast: MagicMock,
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the Open-Meteo configuration entry not ready."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_forecast.call_count == 1
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+    assert mock_config_entry.error_reason_translation_key == "communication_error"
+
+
+async def test_config_entry_zone_removed(hass: HomeAssistant) -> None:
+    """Test the Open-Meteo configuration entry not ready."""
+    mock_config_entry = MockConfigEntry(
+        title="My Castle",
+        domain=DOMAIN,
+        data={CONF_ZONE: "zone.castle"},
+        unique_id="zone.castle",
+    )
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+    assert mock_config_entry.error_reason_translation_key == "zone_not_found"
+    assert mock_config_entry.error_reason_translation_placeholders == {
+        "zone": "zone.castle"
+    }
+
+
+@pytest.mark.usefixtures("mock_open_meteo")
+async def test_migrate_unique_id(hass: HomeAssistant) -> None:
+    """Test the zone is removed as unique ID from an existing entry."""
+    mock_config_entry = MockConfigEntry(
+        title="Home",
+        domain=DOMAIN,
+        data={CONF_ZONE: "zone.home"},
+        unique_id="zone.home",
+        minor_version=1,
+    )
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+    assert mock_config_entry.unique_id is None
+    assert mock_config_entry.minor_version == 2
